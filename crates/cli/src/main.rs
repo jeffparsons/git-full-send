@@ -5,8 +5,10 @@
 //! wrapper that dispatches into the [`gfs_client`] / [`gfs_server`] libraries,
 //! which currently stub their work out.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// Sync a developer's Git working state to a remote workstation.
 #[derive(Debug, Parser)]
@@ -19,11 +21,18 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Synthesise the local sync state and push it to the server (client).
-    Sync,
+    Sync(SyncArgs),
     /// Run the long-running server that receives sync requests (server).
     Listen,
     /// Check the synced state out into the configured worktree (server).
     UpdateWorktree,
+}
+
+#[derive(Debug, Args)]
+struct SyncArgs {
+    /// Path to the repository to sync. Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    repo: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -38,7 +47,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Sync => gfs_client::sync().await?,
+        Command::Sync(args) => {
+            let repo = match args.repo {
+                Some(path) => path,
+                None => std::env::current_dir()?,
+            };
+            gfs_client::sync(repo).await?;
+        }
         Command::Listen => gfs_server::listen().await?,
         Command::UpdateWorktree => gfs_server::update_worktree().await?,
     }
