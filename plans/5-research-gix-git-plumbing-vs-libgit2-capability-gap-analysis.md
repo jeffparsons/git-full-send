@@ -33,6 +33,11 @@ The four operations:
   - gitoxide repository (crate boundaries: `gix`, `gix-object`, `gix-index`,
     `gix-pack`, `gix-protocol`, `gix-transport`, `gix-worktree`, …), its READMEs,
     `CHANGELOG`s, and any roadmap / `cratesio-status` style status docs.
+  - **gitoxide issue tracker** (and linked PRs / project boards) — for each gap,
+    check whether the feature is already planned, has an open tracking issue, or
+    is actively being worked on. Record the issue/PR number and its state
+    (open / in-progress / merged-but-unreleased) so the upstream-candidates
+    section reflects real upstream activity rather than a cold assessment.
   - `gix` and component-crate docs on docs.rs.
   - `git` plumbing man pages (`git-hash-object`, `git-mktree`,
     `git-commit-tree`, `git-update-index --index-info`, `git-read-tree`,
@@ -64,8 +69,9 @@ The four operations:
      recommended approach for this tool.
    - **Gaps forcing a shell-out** — consolidated list.
    - **Upstream candidates** — which gaps are worth closing in gitoxide, with a
-     rough sense of effort / existing tracking issues, and which are better left
-     as permanent shell-outs.
+     rough sense of effort, **the state of any existing gitoxide issue/PR**
+     (planned / in-progress / none), and which are better left as permanent
+     shell-outs.
    - **Bearing on ADR-0004 / ADR-0005** — short notes (not decisions; those
      remain their own tickets).
    - **Sources** — linked references.
@@ -84,7 +90,9 @@ The four operations:
 1. Enumerate the concrete sub-capabilities under each of the four operations so
    the matrix rows are precise.
 2. Research the **gix** column against primary sources; record crate + API
-   symbols and version. Capture partial/feature-gated/planned states.
+   symbols and version. Capture partial/feature-gated/planned states. For each
+   gap or partial, search the **gitoxide issue tracker / PRs** and record whether
+   it is planned, in-progress, or untracked (with issue/PR numbers and state).
 3. Research the **`git` plumbing CLI** column; name the exact commands.
 4. Research the **libgit2** column as the mature-reference baseline.
 5. Cross-check ambiguous findings against a second source; mark anything
