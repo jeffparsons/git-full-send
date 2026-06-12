@@ -21,50 +21,70 @@ diagnostics (ADR-0008 nice-to-have), stay out.
 
 ## Design
 
-### Mechanism: throwaway index → force checkout → prune (shell out to `git`)
+### Mechanism: persistent index → `read-tree --reset -u` → prune (shell out to `git`)
 
 The reassembly is a `git` plumbing pipeline, consistent with ADR-0002 /
-Research 0001 (index population and worktree checkout are the gix capability gap;
-`git checkout-index` is named directly in ADR-0004) and with the existing server
-code, which already shells out to `git receive-pack`. Using a **fresh throwaway
-index** each run (rather than a retained worktree index) is what makes the
-overwrite unconditional.
+Research 0001 (index population and worktree checkout are the gix capability gap)
+and with the existing server code, which already shells out to `git receive-pack`.
 
-Given the resolved git dir, the `code` tree, and the worktree path, with
-`GIT_INDEX_FILE` pointed at a temp index for every step:
+The driving requirement is **efficiency on a large repository**: a code tree can
+be huge, while a typical sync changes only a handful of files, so an
+`update-worktree` must do work proportional to the *delta*, not the whole tree.
+This rules out the naïve "rewrite everything" pipeline (throwaway index +
+`checkout-index -a -f`), which re-writes every file in the worktree on every run.
+Prep measured this directly on a 200-file loopback repo: a second update that
+changed one file still rewrote all 200 (every file's mtime advanced) — O(repo)
+disk writes per run.
+
+Instead the server keeps a **persistent per-worktree index** that records what it
+last checked out, and leans on Git's stat cache exactly as `git checkout` /
+`git reset --hard` do. With `GIT_INDEX_FILE` pointed at that persistent index and
+`--git-dir` / `--work-tree` set, and the resolved `code` tree `<T>`:
 
 1. **Resolve** `refs/git-full-send/code` → its tree. A missing ref is a clean
    error before any worktree mutation (`ServerError::MissingCodeRef`).
-2. **Populate the index** from the tree:
-   `git --git-dir=<dir> read-tree <tree>`.
-3. **Force-checkout** every entry into the worktree:
-   `git --git-dir=<dir> --work-tree=<wt> checkout-index -a -f`. `-f`
-   overwrites unconditionally, so a remote-side edit is stomped **even when the
-   blob is unchanged across syncs** — verified during prep on a loopback repo
-   (an edited `keep.txt` whose committed content never changed was overwritten
-   back to the synced content).
-4. **Prune** anything the synced tree no longer contains:
-   `git --git-dir=<dir> --work-tree=<wt> clean -fdx`. Against the throwaway
-   index, "untracked" == "not in the synced tree", so stale files
-   (`-f`), stale directories (`-d`), and stale ignored files (`-x`) all go.
-   Exact match for a code-only checkout means ignored files that aren't in the
-   tree are stale too; the later `extra` ticket re-introduces the
-   deliberately-force-included ignored set as a separate overlay.
+2. **Reset index + worktree to the tree, discarding local changes:**
+   `git --git-dir=<dir> --work-tree=<wt> read-tree --reset -u <T>`.
+   - `--reset` resets the index to `<T>` and **discards** worktree-local changes
+     instead of refusing on them — this is what stomps remote-side edits.
+   - `-u` updates the worktree to match, and **removes files** that were in the
+     prior index but are absent from `<T>` (files dropped between syncs).
+   - Because the index carries a stat cache, only paths that actually differ
+     (tree delta, or a file whose on-disk stat changed — i.e. a remote edit) are
+     re-hashed and re-written; unchanged files cost one `lstat` and are skipped.
+3. **Prune untracked additions:**
+   `git --git-dir=<dir> --work-tree=<wt> clean -fdx`. `read-tree` removes
+   dropped *tracked* files; `clean` removes anything never tracked — remote-added
+   files (`-f`), directories (`-d`), and ignored files (`-x`). For a code-only
+   exact match, ignored files not in the tree are stale too; the later `extra`
+   ticket re-introduces the deliberately-force-included ignored set as a separate
+   overlay (and will revisit `-x`).
 
-This **full overwrite + prune**, rather than a two-tree `read-tree -m -u` keyed
-on a retained index, is the deliberate choice: the acceptance criterion "pre-
-existing remote-local edits are stomped" includes edits to files unchanged
-*between syncs*, which a merge keyed on the previous index would skip. Verified
-in prep: with this pipeline, `keep.txt` (remote-edited, blob unchanged) is
-restored, `stale.txt` (absent from the tree) is removed, and `gone.txt`/`new`
-land correctly.
+Prep verified this pipeline end-to-end on the loopback repo across three syncs:
+a remote edit to a file whose blob is **unchanged** between syncs is restored
+(stat-dirty detection → overwrite), a file **dropped** between syncs is removed,
+an **untracked** remote addition is removed, and a file unchanged across the sync
+is **not** rewritten (its mtime is preserved) — i.e. exact match *and*
+delta-proportional work. The O(n) `lstat` scan is the same cost `git status`
+pays and is fine on large repos; the win is O(changed-files) writes.
 
-Why a throwaway index and not a persisted one: nothing here needs to remember a
-prior checkout — the tree is the whole truth, the force-checkout rewrites every
-path, and the prune is computed against the tree itself. Keeping state would add
-a failure mode (a stale or divergent index) for no benefit.
+**Why not `read-tree -m -u` (the merge form)** the pre-plan flagged: keyed on the
+prior tree, it skips any path whose blob is unchanged between syncs and so would
+*not* revert a remote edit to such a file. `--reset` is keyed on the worktree
+state via the stat cache, so it does. **Why a persistent index, not throwaway:**
+the throwaway form is what forces the O(repo) rewrite — the persistent index is
+precisely the state that lets Git skip unchanged files.
 
-The worktree root is created (`create_dir_all`) if missing; `checkout-index`
+**Persistent index location.** Stored under the git dir in a gfs-managed
+location keyed by the worktree path (e.g.
+`<git-dir>/git-full-send/worktrees/<hash>/index`), never *inside* the worktree
+(or `clean -fdx` would delete it). It is pure cache: if it is missing or stale
+(first run, or it was deleted), `read-tree --reset -u` simply has no stat cache
+to exploit and degrades to a one-time full rewrite — still producing an exact
+match — then is incremental again. Verified in prep that a deleted index still
+yields an exact-match checkout. So no integrity tracking is needed.
+
+The worktree root is created (`create_dir_all`) if missing; `read-tree -u`
 creates intermediate subdirectories itself.
 
 ### Server (`crates/server/src/lib.rs`)
@@ -82,9 +102,11 @@ is blocking `git` shell-outs; it must not run on the async executor):
   `gix::discover(repo)` (reusing `ServerError::NotARepo`, matching `bind`) and
   take its git dir for `--git-dir`, so the operation works against a bare server
   repo. Resolve the `code` tree (via `git rev-parse --verify <ref>^{tree}` or
-  gix; a missing ref → `MissingCodeRef`), create a temp index
-  (`tempfile`), then run the three `git` steps with `GIT_INDEX_FILE` set,
-  surfacing a non-zero exit (with captured stderr) as `ServerError`.
+  gix; a missing ref → `MissingCodeRef`), derive + `create_dir_all` the
+  persistent-index dir under the git dir, create the worktree dir, then run the
+  two `git` steps (`read-tree --reset -u`, `clean -fdx`) with `GIT_INDEX_FILE`
+  pointed at the persistent index, surfacing a non-zero exit (with captured
+  stderr) as `ServerError`.
 
 A small private helper runs a `git` step and converts a non-zero status into the
 error variant, draining stderr to the message (mirroring `handle_connection`'s
@@ -96,10 +118,10 @@ Add, in the existing `thiserror` style:
 
 - `MissingCodeRef` — the repo has no `refs/git-full-send/code` to check out
   (nothing has been synced yet).
-- `CreateWorktree(#[source] std::io::Error)` — the worktree dir could not be
-  created.
+- `CreateWorktree(#[source] std::io::Error)` — the worktree dir (or the
+  persistent-index dir) could not be created.
 - `Worktree { step: &'static str, stderr: String }` — a `git` step
-  (`read-tree` / `checkout-index` / `clean`) exited non-zero. `step` names which.
+  (`read-tree` / `clean`) exited non-zero. `step` names which.
 - A spawn failure reuses/extends the existing `Spawn` shape (or a sibling
   variant) so a missing `git` binary is a clear error.
 
@@ -152,8 +174,12 @@ New test `update_worktree_makes_worktree_match_code`:
 A second test `update_worktree_removes_files_dropped_between_syncs` (small, high
 value): sync a tree containing `gone.txt`, `update_worktree`, then on the client
 delete `gone.txt`, sync again, `update_worktree` again, and assert `gone.txt` is
-removed from the worktree and the surviving files match — exercising stale
-removal across two syncs, not just against pre-seeded bait.
+removed from the worktree and the surviving files match — exercising the
+persistent-index path across two `update_worktree` runs (`read-tree --reset -u`
+removing a tracked file dropped between syncs), not just removal against
+pre-seeded bait. Behavioural assertions only — both runs land an exact match;
+the test does not try to assert incrementality (mtime/write-count), which is a
+property of Git's stat cache rather than of this code.
 
 A tiny local helper walks the worktree dir into a `BTreeSet<String>` of relative
 paths for the exact-match comparison. The existing `temp_repo_is_a_git_repository`
@@ -162,14 +188,24 @@ and prior transfer tests are unchanged.
 ## Documentation
 
 Add a short **ADR-0011 — Worktree reassembly mechanics** (status `accepted`),
-recording the concrete refinement of ADR-0004/0008: a throwaway index +
-`read-tree` → `checkout-index -a -f` → `clean -fdx`, chosen as a **full
-overwrite + prune** specifically so edits to blobs unchanged between syncs are
-still stomped (why not `read-tree -m -u`), with no retained worktree index. Note
-`clean -fdx`'s `-x` is correct for a code-only exact-match checkout and will be
-revisited when the `extra` overlay re-introduces force-included ignored files.
-Keep it brief and update `docs/adr/README.md` — it refines ADR-0004, mirroring
-how #18 added ADR-0010.
+recording the concrete refinement of ADR-0004/0008: a **persistent per-worktree
+index** + `read-tree --reset -u` → `clean -fdx`. Capture the two forces and why
+they pick this point in the design space:
+
+- **Efficiency on large repos** → reuse a persistent index so Git's stat cache
+  makes the work delta-proportional (O(changed-files) writes), rather than a
+  throwaway index + `checkout-index -a -f` that rewrites the whole worktree every
+  run.
+- **Correctness (stomp remote edits, even to unchanged-blob files)** → `--reset`
+  keys on worktree stat, not on a prior-tree diff, so it reverts those edits;
+  `read-tree -m -u` (merge) would skip them.
+
+Note the persistent index is pure cache (safe to lose → degrades to a one-time
+full rewrite), lives outside the worktree, and that `clean -fdx`'s `-x` is
+correct for a code-only exact-match checkout and will be revisited when the
+`extra` overlay re-introduces force-included ignored files. Keep it brief and
+update `docs/adr/README.md` — it refines ADR-0004, mirroring how #18 added
+ADR-0010.
 
 ## Quality gates (acceptance)
 
@@ -194,6 +230,13 @@ how #18 added ADR-0010.
 - **`git clean -fdx` blast radius.** Confined to `--work-tree=<wt>` and never
   touches `--git-dir`, but it deletes; the operation assumes the worktree dir is
   a dedicated, disposable path (ADR-0008). Tests pin the exact-match outcome.
+- **Persistent index staleness.** The index is a performance cache, not a source
+  of truth — `--reset` re-stats the worktree, so a stale or missing index only
+  costs a one-time full rewrite, never a wrong result (verified in prep). Keyed
+  by worktree path and kept outside the worktree so `clean` can't eat it.
+- **O(n) `lstat` scan.** `read-tree --reset -u` stats every path to find the
+  delta — the same cost `git status` pays, fine on large repos; the optimisation
+  target is *writes*, which stay O(changed-files).
 - **Bare vs non-bare repo.** Resolving the git dir via `gix::discover` (as `bind`
   does) keeps `--git-dir` correct for both; tests use the bare server repo.
 - **Empty / unborn `code`.** A repo that has never received a sync has no
