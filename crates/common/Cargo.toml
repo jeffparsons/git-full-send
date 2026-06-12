@@ -1,0 +1,11 @@
+[package]
+name = "gfs-common"
+description = "Shared protocol types and constants for git-full-send."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

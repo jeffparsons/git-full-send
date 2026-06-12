@@ -1,0 +1,12 @@
+[package]
+name = "test-support"
+description = "Internal test helpers for git-full-send (temp git repositories). Not published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tempfile.workspace = true
