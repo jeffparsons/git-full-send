@@ -12,6 +12,7 @@ name = "git-full-send"
 path = "src/main.rs"
 
 [dependencies]
+gfs-common.workspace = true
 gfs-client.workspace = true
 gfs-server.workspace = true
 anyhow.workspace = true

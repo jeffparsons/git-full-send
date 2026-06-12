@@ -19,6 +19,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0007](0007-syncing-extra-gitignored-files.md) | Syncing extra (normally-gitignored) files | accepted |
 | [0008](0008-remote-worktree-disposability.md) | Remote worktree disposability & sync authority | accepted |
 | [0009](0009-working-tree-fidelity-for-the-code-commit.md) | Working-tree fidelity for the `code` commit | accepted |
+| [0010](0010-receive-pack-transport-wiring.md) | `receive-pack` transport wiring | accepted |
 
 ## Open research tasks
 

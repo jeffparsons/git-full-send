@@ -16,6 +16,13 @@ use thiserror::Error;
 /// it (see ADR-0004).
 pub const REF_NAMESPACE: &str = "refs/git-full-send/";
 
+/// Default address the server `listen` binds to.
+///
+/// Localhost only (ADR-0006): connectivity from a real client is via a manual
+/// SSH tunnel, so binding loopback is sufficient and keeps the receive-pack
+/// stream off the network. Overridable via the `--addr` flag.
+pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9419";
+
 /// Errors shared across the client and server boundaries.
 ///
 /// Placeholder enum establishing the `thiserror`-at-library-boundaries
