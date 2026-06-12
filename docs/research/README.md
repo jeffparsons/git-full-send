@@ -11,3 +11,4 @@ Where a report's findings settle or revise a decision, the relevant
 | --- | --- | --- | --- |
 | [0001](0001-gix-git-plumbing-vs-libgit2-capability-gap.md) | gix / `git` plumbing CLI vs libgit2 capability gap analysis | 2026-06-12 | [ADR-0002](../adr/0002-git-manipulation-strategy.md) |
 | [0002](0002-encoding-the-sync-state-in-git.md) | Encoding the sync state in Git | 2026-06-12 | [ADR-0004](../adr/0004-encoding-the-sync-state-in-git.md) |
+| [0003](0003-transfer-mechanism-and-pack-performance.md) | Transfer mechanism & pack-performance root-cause | 2026-06-12 | [ADR-0005](../adr/0005-transfer-mechanism.md) |
