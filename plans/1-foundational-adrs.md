@@ -76,10 +76,13 @@ docs/adr/0008-remote-worktree-disposability.md
 ### ADR-0003 — Client/server architecture · *accepted*
 - **Decision:** distinct client and server roles. Server runs on the remote,
   configured with a target repo + worktree directory, binds localhost only.
-- Server exposes two separate operations/subcommands: **receive sync** (accept
-  transferred objects) and **update worktree** (check out the synced state),
-  invoked independently — in practice a separate build-orchestration process
-  triggers the worktree update when ready.
+- Server exposes two separate operations/subcommands:
+  - **listen** — a long-running server that accepts and serves many sync
+    requests (receiving transferred objects), running until explicitly shut
+    down rather than handling a single transfer and exiting.
+  - **update worktree** — check out the synced state into the configured
+    worktree; invoked independently, in practice triggered by a separate
+    build-orchestration process when it is ready to use the synced tree.
 - Client never touches the user's current branch, main index, or working tree.
 
 ### ADR-0004 — Encoding the sync state in Git · *proposed*
