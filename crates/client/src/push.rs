@@ -17,12 +17,15 @@
 //! The socket is passed on dedicated file descriptors, **not** as the child's
 //! stdin/stdout: `git push` uses its own stdin/stdout, and pointing the
 //! transport at fd 0/1 wedges it before the protocol even starts. We reserve two
-//! inheritable dups of the socket in the parent (`fcntl(F_DUPFD)`, which clears
-//! `FD_CLOEXEC`) and pass their numbers as `fd::<in>,<out>`, leaving `git`'s own
-//! stdio untouched. (The server side is simpler — `git receive-pack` happily
-//! takes the raw socket as its stdin/stdout, exactly as `git daemon` feeds it.)
+//! inheritable dups of the socket in the parent — `try_clone_to_owned` for the
+//! dup, then `rustix` to clear `FD_CLOEXEC` so they survive `exec` — and pass
+//! their numbers as `fd::<in>,<out>`, leaving `git`'s own stdio untouched. (The
+//! server side is simpler — `git receive-pack` happily takes the raw socket as
+//! its stdin/stdout, exactly as `git daemon` feeds it.)
 //!
-//! This is Unix-only; the tool is Unix-first.
+//! This is Unix-only; the tool is Unix-first. A purely standalone binary could
+//! instead bridge the socket with an `ext::` "micro-utility" connector and avoid
+//! fd-passing (and `rustix`) entirely; that trade-off is recorded in ADR-0010.
 //!
 //! ## Prior-tip retention
 //!
@@ -39,7 +42,7 @@
 
 use std::io::Read;
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -111,12 +114,11 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
         source,
     })?;
 
-    // Reserve two inheritable dups of the socket (`F_DUPFD` clears `FD_CLOEXEC`)
-    // for the transport's input and output fds, and pass their numbers to the
-    // `fd::` transport. Reserving them in the parent — rather than `dup2`-ing in
-    // a `pre_exec` hook — keeps them clear of the fds `Command` uses to wire up
-    // the child's own stdio.
-    let transport = TransportFds::reserve(sock.as_raw_fd()).map_err(PushError::Io)?;
+    // Reserve two inheritable dups of the socket for the transport's input and
+    // output fds, and pass their numbers to the `fd::` transport. Reserving them
+    // in the parent — rather than `dup2`-ing in a `pre_exec` hook — keeps them
+    // clear of the fds `Command` uses to wire up the child's own stdio.
+    let transport = TransportFds::reserve(&sock).map_err(PushError::Io)?;
 
     // Force (`+`): the synthetic scratch refs are overwritten each sync, and a
     // new `code` commit is parented on HEAD rather than the previous tip, so
@@ -127,7 +129,11 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
         .arg("protocol.fd.allow=always")
         .arg("push")
         .arg("--thin")
-        .arg(format!("fd::{},{}", transport.in_fd, transport.out_fd))
+        .arg(format!(
+            "fd::{},{}",
+            transport.in_fd.as_raw_fd(),
+            transport.out_fd.as_raw_fd()
+        ))
         .arg(&refspec)
         .current_dir(workdir)
         // `git push` keeps its own stdio; the transport lives on the reserved fds.
@@ -159,44 +165,31 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
 }
 
 /// A pair of inheritable file descriptors duplicated from the connected socket,
-/// passed to `git push` as the `fd::` transport's input and output. Closed in
-/// the parent on drop (the spawned child keeps its own copies).
+/// passed to `git push` as the `fd::` transport's input and output. The owned
+/// dups close the parent's copies on drop (the spawned child keeps its own).
 struct TransportFds {
-    in_fd: i32,
-    out_fd: i32,
+    in_fd: OwnedFd,
+    out_fd: OwnedFd,
 }
 
 impl TransportFds {
-    fn reserve(socket_fd: i32) -> std::io::Result<Self> {
-        let in_fd = dup_inheritable(socket_fd)?;
-        let out_fd = match dup_inheritable(socket_fd) {
-            Ok(fd) => fd,
-            Err(e) => {
-                unsafe { libc::close(in_fd) };
-                return Err(e);
-            }
-        };
-        Ok(Self { in_fd, out_fd })
+    fn reserve(socket: impl AsFd) -> std::io::Result<Self> {
+        let socket = socket.as_fd();
+        Ok(Self {
+            in_fd: dup_inheritable(socket)?,
+            out_fd: dup_inheritable(socket)?,
+        })
     }
 }
 
-impl Drop for TransportFds {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.in_fd);
-            libc::close(self.out_fd);
-        }
-    }
-}
-
-/// Duplicate `fd` to a new descriptor (≥ 3) with `FD_CLOEXEC` cleared, so it is
-/// inherited across `exec`.
-fn dup_inheritable(fd: i32) -> std::io::Result<i32> {
-    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD, 3) };
-    if new_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(new_fd)
+/// Duplicate `fd` to a new owned descriptor with `FD_CLOEXEC` cleared, so it is
+/// inherited across `exec`. `try_clone_to_owned` dups to the lowest free fd
+/// (≥ 3 in practice, since stdio holds 0–2) but sets `FD_CLOEXEC`; `rustix`
+/// clears it. The returned `OwnedFd` closes the parent's copy on drop.
+fn dup_inheritable(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    let dup = fd.try_clone_to_owned()?;
+    rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)?;
+    Ok(dup)
 }
 
 /// Pin `commit` (the just-pushed tip) under [`SENT_REF`] so its objects survive

@@ -27,15 +27,36 @@ because the two commands treat their fds differently:
 - **Client** must *not* put the transport on fd 0/1: `git push` uses its own
   stdin/stdout, and `fd::0,1` wedges it before the protocol starts. Instead the
   client reserves two inheritable dups of the connected socket in the parent
-  (`fcntl(F_DUPFD)`, which clears `FD_CLOEXEC`) and passes their numbers as
-  `git push --thin fd::<in>,<out>`, leaving `git`'s own stdio free. Reserving in
-  the parent (vs. `dup2` in a `pre_exec` hook) keeps the transport fds clear of
-  the descriptors `Command` uses to wire up the child's stdio.
+  (`OwnedFd::try_clone_to_owned`, then `rustix` clears `FD_CLOEXEC` so they
+  survive `exec`) and passes their numbers as `git push --thin fd::<in>,<out>`,
+  leaving `git`'s own stdio free. Reserving in the parent (vs. `dup2` in a
+  `pre_exec` hook) keeps the transport fds clear of the descriptors `Command`
+  uses to wire up the child's stdio.
 
 Both invocations set `-c protocol.fd.allow=always`, since `git` blocks the
 `fd::`/`ext::` transports by default. The `ext::`-with-connector shape (e.g.
 `ext::ssh … git-receive-pack`) remains the natural fit for the eventual
 SSH-tunnel ergonomics and is a drop-in alternative to the in-process attachment.
+
+The in-process attachment keeps `gfs-client` usable as a pure library (one
+`git` subprocess, no helper binary to locate). Its only cost is the descriptor
+bookkeeping above: `std` can duplicate an fd but cannot clear `FD_CLOEXEC` or
+hand a child an fd on a chosen number, so the client leans on `rustix` for the
+flag flip (`#29` removed an earlier hand-rolled `libc::fcntl(F_DUPFD)` + `unsafe`
+in favour of `OwnedFd` + `rustix`, dropping the direct `libc` dependency).
+`rustix` may still pull `libc` transitively on some targets, so this removes our
+direct dep and all our `unsafe`, not necessarily `libc` from the tree.
+
+A **purely standalone binary** could go further and drop fd-passing entirely via
+the same `ext::`-with-connector shape: a tiny "micro-utility" subcommand that
+connects the socket and shunts bytes between its own stdin/stdout and the
+socket, which `git` wires up with ordinary pipes — no numbered fds, no
+`FD_CLOEXEC`, no `rustix`. We don't do this now because it needs a real binary on
+a known path, which the **library** embedding case can't assume. A future build
+could support **both** paths behind feature gates, with the embedder exposing
+**their own** connector that wraps a helper exported from `gfs-client` — getting
+the standalone path's zero-syscall-crate cleanliness without forcing it on
+library consumers.
 
 ### Namespace confinement: `pre-receive` hook via `core.hooksPath`
 
@@ -63,8 +84,9 @@ under `refs/namespaces/…` rather than land them where the worktree-update step
 
 - The transfer leg stays a single `git` subprocess per side; `gix`'s role
   remains object synthesis. No custom wire protocol.
-- The attachment is Unix-only (socket fds via `std::os::fd` / `libc::fcntl`);
-  the tool is Unix-first, consistent with the rest of the codebase.
+- The attachment is Unix-only (socket fds via `std::os::fd`, with `rustix`
+  clearing `FD_CLOEXEC`); the tool is Unix-first, consistent with the rest of
+  the codebase.
 - The server process spawns one `git receive-pack` per connection and must keep
   the hooks directory alive for its lifetime.
 

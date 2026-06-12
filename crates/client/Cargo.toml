@@ -12,7 +12,7 @@ gfs-common.workspace = true
 # `tree-editor` (building trees without a scratch index) is not in gix's default
 # feature set; `status`/`dirwalk`/`index` arrive via its defaults. See ADR-0002.
 gix = { workspace = true, features = ["tree-editor"] }
-libc.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
