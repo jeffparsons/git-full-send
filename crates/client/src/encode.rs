@@ -34,7 +34,10 @@ use thiserror::Error;
 
 /// The scratch ref the encoded code commit is written to (under
 /// [`gfs_common::REF_NAMESPACE`]).
-pub const CODE_REF: &str = "refs/git-full-send/code";
+///
+/// Re-exported from [`gfs_common::CODE_REF`] — the canonical definition shared
+/// with the server — so `gfs_client::CODE_REF` keeps resolving for callers.
+pub use gfs_common::CODE_REF;
 
 /// Identity stamped on the synthetic commit. It is a scratch artifact for
 /// transfer, not user-facing history, so a fixed identity is intentional.

@@ -33,6 +33,24 @@ fn tree_paths(repo: &Path, tree_ish: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// The set of file paths under `dir`, relative to it and `/`-separated.
+fn worktree_files(dir: &Path) -> BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).expect("read worktree dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).expect("under root");
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
 #[tokio::test]
 async fn push_lands_code_ref_and_objects() {
     let server = init_bare_repo();
@@ -155,5 +173,95 @@ async fn second_sync_advances_the_server() {
         ),
         "two",
         "the server has the latest content",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_makes_worktree_match_code() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "keep.txt", "v1");
+    write_file(c, "data.txt", "v1");
+    commit_all(c, "baseline");
+    // An untracked working-tree file the encode folds in.
+    write_file(c, "new.txt", "v1");
+
+    gfs_client::sync(c.to_path_buf(), addr.to_string())
+        .await
+        .expect("sync succeeds");
+
+    // A disposable worktree pre-seeded with bait: a remote-side edit to a file
+    // whose synced blob is unchanged, and a stale file absent from the tree.
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    write_file(wt, "keep.txt", "REMOTE-EDIT");
+    write_file(wt, "stale.txt", "junk");
+
+    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
+        .await
+        .expect("update-worktree succeeds");
+
+    // The worktree matches the synced tree exactly…
+    assert_eq!(
+        worktree_files(wt),
+        tree_paths(server.path(), CODE_REF),
+        "worktree contents equal the synced code tree",
+    );
+    // …the stale file is gone…
+    assert!(!wt.join("stale.txt").exists(), "stale file was removed");
+    // …and the pre-existing remote-local edit was stomped.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("keep.txt")).expect("read keep.txt"),
+        "v1",
+        "the remote-local edit was overwritten",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_removes_files_dropped_between_syncs() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "keep.txt", "v1");
+    write_file(c, "gone.txt", "v1");
+    commit_all(c, "baseline");
+
+    // First sync + checkout: the worktree gains gone.txt.
+    gfs_client::sync(c.to_path_buf(), addr.to_string())
+        .await
+        .expect("first sync");
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
+        .await
+        .expect("first update-worktree");
+    assert!(
+        wt.join("gone.txt").exists(),
+        "gone.txt is checked out first"
+    );
+
+    // Delete gone.txt on the client and sync again; the same worktree updates.
+    std::fs::remove_file(c.join("gone.txt")).expect("remove gone.txt");
+    commit_all(c, "drop gone.txt");
+    gfs_client::sync(c.to_path_buf(), addr.to_string())
+        .await
+        .expect("second sync");
+    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
+        .await
+        .expect("second update-worktree");
+
+    assert!(
+        !wt.join("gone.txt").exists(),
+        "a file dropped between syncs is removed from the worktree",
+    );
+    assert_eq!(
+        worktree_files(wt),
+        tree_paths(server.path(), CODE_REF),
+        "worktree still matches the synced tree exactly",
     );
 }

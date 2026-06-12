@@ -58,6 +58,33 @@ pub enum ServerError {
     /// Spawning `git receive-pack` failed.
     #[error("could not spawn `git receive-pack`")]
     Spawn(#[source] std::io::Error),
+    /// The repository has no `code` ref to check out — nothing has been synced
+    /// yet.
+    #[error(
+        "no `{}` to check out; nothing has been synced yet",
+        gfs_common::CODE_REF
+    )]
+    MissingCodeRef,
+    /// Creating the worktree directory (or its sidecar index directory) failed.
+    #[error("could not create the worktree directory")]
+    CreateWorktree(#[source] std::io::Error),
+    /// Running a `git` step of the worktree update failed to spawn.
+    #[error("could not run `git {step}`")]
+    RunGit {
+        /// The worktree-update step (e.g. `read-tree`, `clean`).
+        step: &'static str,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A `git` step of the worktree update exited non-zero.
+    #[error("`git {step}` failed during worktree update: {stderr}")]
+    Worktree {
+        /// The worktree-update step (e.g. `read-tree`, `clean`).
+        step: &'static str,
+        /// The trimmed stderr from the failed `git` invocation.
+        stderr: String,
+    },
     /// The blocking serve task panicked or was cancelled.
     #[error("serve task failed: {0}")]
     Join(String),
@@ -218,12 +245,132 @@ fn pre_receive_hook() -> String {
     )
 }
 
-/// Check the synced state out into the configured worktree.
+/// Check the synced `code` state out into the configured worktree.
 ///
 /// An authoritative, destructive overwrite of the remote worktree (ADR-0008),
-/// invoked independently of [`listen`]. Not implemented yet.
-pub async fn update_worktree() -> Result<(), ServerError> {
-    todo!("check the synced state out into the worktree — see ADR-0003/0008")
+/// invoked independently of [`listen`] (a build orchestrator triggers it). After
+/// it returns, `worktree` matches the synced [`gfs_common::CODE_REF`] tree
+/// *exactly*: remote-side edits are stomped (even to files whose blob is
+/// unchanged between syncs), files dropped between syncs are removed, and
+/// untracked remote additions are removed.
+///
+/// The blocking `git` work runs on a dedicated thread so it does not occupy the
+/// async executor (mirroring [`listen`]).
+pub async fn update_worktree(repo: PathBuf, worktree: PathBuf) -> Result<(), ServerError> {
+    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree))
+        .await
+        .map_err(|e| ServerError::Join(e.to_string()))?
+}
+
+/// The blocking body of [`update_worktree`].
+///
+/// Reassembles the worktree with the persistent-index pipeline of ADR-0011:
+/// resolve the `code` tree, then `read-tree --reset -u` (reset index + worktree
+/// to the tree, discarding remote-local edits and removing dropped files) and
+/// `clean -fdx` (prune untracked leftovers), keyed on a per-worktree index so
+/// Git's stat cache keeps the work proportional to the sync delta.
+fn update_worktree_blocking(repo: &Path, worktree: &Path) -> Result<(), ServerError> {
+    let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
+    let git_dir = discovered.git_dir().to_path_buf();
+
+    // Resolve the `code` tree first, so a never-synced repo fails cleanly before
+    // any worktree mutation.
+    let tree = resolve_code_tree(&git_dir)?;
+
+    // The worktree, and the per-worktree index that records what we last checked
+    // out (kept under the git dir, never inside the worktree itself — `clean`
+    // would delete it there). A missing/stale index is pure cache: the next
+    // `--reset` simply has no stat shortcut and does a one-time full rewrite.
+    std::fs::create_dir_all(worktree).map_err(ServerError::CreateWorktree)?;
+    let index = worktree_index_path(&git_dir, worktree)?;
+
+    run_git_step(
+        "read-tree",
+        &git_dir,
+        worktree,
+        &index,
+        &["read-tree", "--reset", "-u", &tree],
+    )?;
+    run_git_step(
+        "clean",
+        &git_dir,
+        worktree,
+        &index,
+        &["clean", "-d", "-f", "-x"],
+    )?;
+    Ok(())
+}
+
+/// Resolve [`gfs_common::CODE_REF`] to its tree id, or [`ServerError::MissingCodeRef`].
+///
+/// `rev-parse --verify --quiet` exits non-zero with empty output when the ref is
+/// absent, which we map to the dedicated error rather than a confusing
+/// downstream `read-tree` failure.
+fn resolve_code_tree(git_dir: &Path) -> Result<String, ServerError> {
+    let spec = format!("{}^{{tree}}", gfs_common::CODE_REF);
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(&spec)
+        .output()
+        .map_err(|source| ServerError::RunGit {
+            step: "rev-parse",
+            source,
+        })?;
+    let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || tree.is_empty() {
+        return Err(ServerError::MissingCodeRef);
+    }
+    Ok(tree)
+}
+
+/// The path of the persistent index for `worktree`, under the git dir.
+///
+/// Keyed by the canonical worktree path so distinct worktrees of one repo get
+/// distinct indexes. The parent directory is created.
+fn worktree_index_path(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
+    use std::hash::{Hash, Hasher};
+
+    // Canonicalise so the same worktree maps to the same index across runs
+    // regardless of how the path was spelled (the dir exists by now).
+    let canonical = worktree
+        .canonicalize()
+        .map_err(ServerError::CreateWorktree)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let key = format!("{:016x}", hasher.finish());
+
+    let dir = git_dir.join("git-full-send").join("worktrees").join(key);
+    std::fs::create_dir_all(&dir).map_err(ServerError::CreateWorktree)?;
+    Ok(dir.join("index"))
+}
+
+/// Run one `git` step of the worktree update with the per-worktree index, mapping
+/// a spawn failure and a non-zero exit to the matching [`ServerError`].
+fn run_git_step(
+    step: &'static str,
+    git_dir: &Path,
+    worktree: &Path,
+    index: &Path,
+    args: &[&str],
+) -> Result<(), ServerError> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(worktree)
+        .env("GIT_INDEX_FILE", index)
+        .args(args)
+        .output()
+        .map_err(|source| ServerError::RunGit { step, source })?;
+    if !output.status.success() {
+        return Err(ServerError::Worktree {
+            step,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
