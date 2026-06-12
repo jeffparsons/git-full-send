@@ -10,4 +10,4 @@ Where a report's findings settle or revise a decision, the relevant
 | Report | Title | Date | Backs |
 | --- | --- | --- | --- |
 | [0001](0001-gix-git-plumbing-vs-libgit2-capability-gap.md) | gix / `git` plumbing CLI vs libgit2 capability gap analysis | 2026-06-12 | [ADR-0002](../adr/0002-git-manipulation-strategy.md) |
-</content>
+| [0002](0002-encoding-the-sync-state-in-git.md) | Encoding the sync state in Git | 2026-06-12 | [ADR-0004](../adr/0004-encoding-the-sync-state-in-git.md) |
