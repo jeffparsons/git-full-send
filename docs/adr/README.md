@@ -24,7 +24,8 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 The `proposed` ADRs above flag research that will be split into their own
 tickets:
 
-- gix / `git` plumbing vs. libgit2 capability gap analysis ([ADR-0002](0002-git-manipulation-strategy.md)).
+- ~~gix / `git` plumbing vs. libgit2 capability gap analysis ([ADR-0002](0002-git-manipulation-strategy.md)).~~
+  **Done** — see [Research 0001](../research/0001-gix-git-plumbing-vs-libgit2-capability-gap.md).
 - Sync-state encoding in Git ([ADR-0004](0004-encoding-the-sync-state-in-git.md)).
 - Transfer mechanism + pack-performance root-cause ([ADR-0005](0005-transfer-mechanism.md)).
 - Force-include configuration mechanism ([ADR-0007](0007-syncing-extra-gitignored-files.md)).
