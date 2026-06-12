@@ -10,10 +10,10 @@ repository.workspace = true
 [dependencies]
 gfs-common.workspace = true
 gix.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 test-support.workspace = true

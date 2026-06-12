@@ -365,6 +365,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gfs-client",
+ "gfs-common",
  "gfs-server",
  "tokio",
  "tracing",
@@ -376,7 +377,9 @@ name = "gfs-client"
 version = "0.0.0"
 dependencies = [
  "gfs-common",
+ "gfs-server",
  "gix",
+ "libc",
  "tempfile",
  "test-support",
  "thiserror",

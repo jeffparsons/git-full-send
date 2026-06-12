@@ -36,6 +36,26 @@ pub fn init_temp_repo() -> TempDir {
     dir
 }
 
+/// Create a fresh temporary directory and initialise an empty **bare** Git
+/// repository in it, returning the [`TempDir`] guard.
+///
+/// Suitable as the server-side "remote" repository that `git receive-pack`
+/// writes into. Like [`init_temp_repo`], the caller must keep the returned
+/// [`TempDir`] alive for as long as the repository is needed.
+///
+/// # Panics
+///
+/// Panics if the temp dir cannot be created or `git init` fails.
+pub fn init_bare_repo() -> TempDir {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    git(
+        dir.path(),
+        &["init", "--quiet", "--bare", "--initial-branch=main"],
+    );
+
+    dir
+}
+
 /// Run `git` with `args` in `repo`, asserting it succeeds, and return its
 /// captured stdout as a `String`.
 ///
