@@ -2,8 +2,7 @@
 //!
 //! A single binary exposing every command: the client `sync`, and the server
 //! `listen` and `update-worktree` (see ADR-0003). Each subcommand is a thin
-//! wrapper that dispatches into the [`gfs_client`] / [`gfs_server`] libraries,
-//! which currently stub their work out.
+//! wrapper that dispatches into the [`gfs_client`] / [`gfs_server`] libraries.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,7 +25,7 @@ enum Command {
     /// Run the long-running server that receives sync requests (server).
     Listen(ListenArgs),
     /// Check the synced state out into the configured worktree (server).
-    UpdateWorktree,
+    UpdateWorktree(UpdateWorktreeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -49,6 +48,16 @@ struct ListenArgs {
     addr: SocketAddr,
 }
 
+#[derive(Debug, Args)]
+struct UpdateWorktreeArgs {
+    /// Path to the target Git repository holding the synced refs.
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Path to the disposable worktree directory to check the `code` tree into.
+    #[arg(long, value_name = "PATH")]
+    worktree: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -69,7 +78,9 @@ async fn main() -> Result<()> {
             gfs_client::sync(repo, args.remote).await?;
         }
         Command::Listen(args) => gfs_server::listen(args.addr, args.repo).await?,
-        Command::UpdateWorktree => gfs_server::update_worktree().await?,
+        Command::UpdateWorktree(args) => {
+            gfs_server::update_worktree(args.repo, args.worktree).await?
+        }
     }
 
     Ok(())

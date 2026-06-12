@@ -16,6 +16,14 @@ use thiserror::Error;
 /// it (see ADR-0004).
 pub const REF_NAMESPACE: &str = "refs/git-full-send/";
 
+/// Scratch ref holding the encoded `code` state (committed history plus
+/// working-tree changes; see ADR-0004).
+///
+/// The client writes the synthetic code commit here and pushes it; the server
+/// checks this ref's tree out into its worktree (ADR-0008). Shared so neither
+/// side hard-codes the string independently. Lives under [`REF_NAMESPACE`].
+pub const CODE_REF: &str = "refs/git-full-send/code";
+
 /// Default address the server `listen` binds to.
 ///
 /// Localhost only (ADR-0006): connectivity from a real client is via a manual
