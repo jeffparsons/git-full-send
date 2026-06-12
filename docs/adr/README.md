@@ -16,7 +16,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0004](0004-encoding-the-sync-state-in-git.md) | Encoding the sync state in Git | accepted |
 | [0005](0005-transfer-mechanism.md) | Transfer mechanism | accepted |
 | [0006](0006-transport-and-connectivity.md) | Transport & connectivity | accepted |
-| [0007](0007-syncing-extra-gitignored-files.md) | Syncing extra (normally-gitignored) files | proposed |
+| [0007](0007-syncing-extra-gitignored-files.md) | Syncing extra (normally-gitignored) files | accepted |
 | [0008](0008-remote-worktree-disposability.md) | Remote worktree disposability & sync authority | accepted |
 
 ## Open research tasks
@@ -30,4 +30,5 @@ tickets:
   **Done** — see [Research 0002](../research/0002-encoding-the-sync-state-in-git.md).
 - ~~Transfer mechanism + pack-performance root-cause ([ADR-0005](0005-transfer-mechanism.md)).~~
   **Done** — see [Research 0003](../research/0003-transfer-mechanism-and-pack-performance.md).
-- Force-include configuration mechanism ([ADR-0007](0007-syncing-extra-gitignored-files.md)).
+- ~~Force-include configuration mechanism ([ADR-0007](0007-syncing-extra-gitignored-files.md)).~~
+  **Done** — see [Research 0004](../research/0004-force-include-configuration-mechanism.md).
