@@ -41,44 +41,57 @@ force-includes stay out of scope (the separate `extra` ticket).
 
 ### Tree synthesis (gix tree `Editor`, no scratch index, no `git` shell-out)
 
-The resulting tree is a pure function of **(working tree) + (HEAD, for submodule
-gitlinks only)**. Chosen enumeration strategy — **overlay every on-disk path** —
-because it sidesteps the staged-vs-worktree subtlety: a file `git add`ed and not
-further edited has worktree content == index content, which an index-vs-worktree
-status diff would report as "unmodified" and we'd wrongly keep HEAD's committed
-content. Reading content straight from disk for every included path is always
-correct regardless of staging.
+**Leverage git's index instead of re-hashing the worktree.** The whole point of
+the index is that it caches, per tracked path, the blob OID *and* the stat
+(size/mtime/inode) used to decide — cheaply — whether the worktree copy is still
+that blob. So the base of our tree is the **index itself** (already the staged
+state, with OIDs known and zero hashing), and we hash only the files git's own
+stat-based status considers dirty, plus untracked files (genuinely new content,
+no cached OID exists). Unchanged tracked files are never read or hashed.
+
+This also dissolves the staging subtlety that an earlier draft worried about: the
+index *is* the staged state, so a file `git add`ed and not re-edited is already
+correct in the base with no work; a staged-then-edited file is reported
+*Modified* and re-hashed to its on-disk content; a deleted file is reported
+*Removed*. The result still equals "current on-disk contents".
+
+Crucially, we operate on an **in-memory** index snapshot and **never write it
+back** — gix's `status` does not persist the index, so the user's `.git/index`,
+branch, and worktree stay untouched.
 
 Algorithm in `encode`:
 
 1. `let repo = gix::discover(repo_dir)?;`
-2. Resolve HEAD commit: `repo.head()?` → `try_into_peeled_id()`. Handle the
-   **unborn HEAD** case (fresh repo, no commits): no parent, seed tree from the
-   empty tree.
-3. Seed the editor from HEAD's tree so submodule **gitlinks** (`160000`,
-   `EntryKind::Commit`) and any path we don't overlay survive unchanged:
-   `let mut editor = repo.edit_tree(head_tree_id_or_empty)?;`
-   Then explicitly **remove** every non-gitlink path in HEAD's tree that is a
-   *tracked* file deleted on disk (see step 6), so deletions propagate.
-4. Enumerate the **tracked** path set from the index: `repo.index()?` → iterate
-   entries. Staged deletes are already absent from the index. Submodule entries
-   (mode `160000`) are left to the HEAD-tree carry-through (skip overlay).
-5. Enumerate the **untracked, non-ignored** path set via `repo.dirwalk(...)`
-   configured to emit untracked entries while honouring `.gitignore`
-   (ignored + the `.git` dir excluded). Files and symlinks only.
-6. For the union of (4) ∪ (5), for each path:
-   - `symlink_metadata` the on-disk file.
-     - missing (a tracked file deleted on disk) → `editor.remove(path)` and skip.
-     - symlink → blob content = link target bytes (`fs::read_link`),
-       `EntryKind::Link` (`120000`).
-     - regular file → blob content = file bytes, `EntryKind::BlobExecutable`
-       (`100755`) if the owner-exec bit is set, else `EntryKind::Blob`
-       (`100644`).
-   - `let id = repo.write_blob(content)?;` then
-     `editor.upsert(path_components, kind, id.detach())?;`
-   - Mode detection is Unix-first (`std::os::unix::fs::PermissionsExt`); on
-     platforms without a meaningful exec bit / symlink, fall back to the
-     index-recorded mode. Note this as a documented limitation.
+2. Resolve HEAD commit (`repo.head()?` → peeled id) for the commit parent; handle
+   **unborn HEAD** (fresh repo, no commits) → no parent.
+3. **Base tree = the index.** `let index = repo.index()?;` (snapshot, never
+   written). Seed `let mut editor = repo.edit_tree(EMPTY_TREE)?;` and `upsert`
+   every index entry from its existing `entry.id` + mode (no hashing, no IO):
+   regular/exec blobs, symlinks (`Link`), submodule gitlinks (`Commit`, `160000`)
+   straight from the index. (Optimisation noted below: seeding from HEAD's tree
+   and applying only the index-vs-HEAD staged diff would make even this step
+   proportional to the number of staged changes; deferred — the upserts are cheap
+   relative to hashing and transfer.)
+4. **Overlay the worktree with a single index-vs-worktree status pass** —
+   `repo.status(progress)?` configured with rename tracking **off** and the
+   dirwalk set to emit untracked files but **not** ignored entries (and not the
+   `.git` dir), then `.into_index_worktree_iter(...)`. For each `Item`:
+   - `Modification { status: Removed, rela_path, .. }` → `editor.remove(rela_path)`.
+   - `Modification { status: <content/type change>, rela_path, .. }` → read the
+     on-disk file, `repo.write_blob(bytes)`, `editor.upsert(rela_path, kind, id)`
+     with the on-disk mode. Only files git's stat check already flagged dirty
+     reach this arm, so hashing is bounded by the actual worktree delta.
+   - `DirectoryContents { entry, .. }` (an untracked, non-ignored path) → read
+     on-disk file, `write_blob`, `upsert`.
+   - `Rewrite` is not expected (rename tracking disabled); if encountered, treat
+     as its delete+add components.
+5. On-disk mode detection (for the overlay arms) is Unix-first
+   (`std::os::unix::fs::PermissionsExt`): symlink → `Link` with `read_link`
+   bytes as content; regular file → `BlobExecutable` if the owner-exec bit is
+   set else `Blob`. On platforms without a meaningful exec bit / symlink, fall
+   back to the index-recorded mode. Documented limitation.
+6. Unchanged tracked files are never emitted by step 4, so they keep the index's
+   blob OID from step 3 — **zero IO/hashing**, exactly what the index is for.
 7. `let tree_id = editor.write()?;`
 8. Build the commit object by hand and write it **without moving any ref**:
    - `author = committer = SignatureRef { name: "git-full-send", email:
@@ -187,8 +200,10 @@ ADR-0004 rather than overturning it.
 
 - The `extra` (force-include) commit and any gitignored-file inclusion.
 - Any push/transfer or server-side work.
-- Performance optimisation of re-hashing unchanged tracked files (correctness
-  first; an index/stat fast-path can be a follow-up if it ever matters).
+- Seeding the base tree from HEAD + index-vs-HEAD staged diff (to make the
+  base-tree build proportional to staged changes rather than repo size). The
+  index already gives us the no-re-hash property; this is a further constant-
+  factor optimisation, deferred until profiling says it matters.
 
 ## Risks / notes
 
