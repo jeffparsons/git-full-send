@@ -1,0 +1,21 @@
+[package]
+name = "gfs-cli"
+description = "Command-line interface for git-full-send, exposing the client and server commands."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "git-full-send"
+path = "src/main.rs"
+
+[dependencies]
+gfs-client.workspace = true
+gfs-server.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

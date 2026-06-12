@@ -1,0 +1,19 @@
+[package]
+name = "gfs-client"
+description = "Client-side library for git-full-send: synthesise sync state and push it to the server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gfs-common.workspace = true
+gix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+test-support.workspace = true
