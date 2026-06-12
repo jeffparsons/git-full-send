@@ -43,11 +43,31 @@ Even though we will not use libgit2, understanding what it can do is useful for
 gap analysis against gix — libgit2 is a mature reference for the operations this
 tool needs.
 
-> ⚠ Research task needed: capability gap analysis of gix (and the `git` plumbing
-> CLI) versus libgit2 for the operations this tool requires — object/tree
-> synthesis, alternate index construction, pack generation, and
-> send/receive-pack. Identify gaps that would force shelling out, and which gaps
-> are worth closing upstream in gitoxide.
+The gap analysis is done:
+[Research 0001 — gix / `git` plumbing CLI vs libgit2 capability gap analysis](../research/0001-gix-git-plumbing-vs-libgit2-capability-gap.md)
+(pinned to gix 0.84.0, 2026-06-12). Summary of findings:
+
+- **Object / tree / commit synthesis** — native in gix; no gap, no shell-out.
+- **Alternate index construction** — *not* native in gix (`gix-index` can derive
+  an index from a tree but cannot stage entries or write-tree-from-index, gix
+  #293). Avoidable: gix's tree `Editor` builds trees directly without an index.
+  Only a forced `git` shell-out if we adopt an index-centric encoding.
+- **Pack generation** — partial in gix: it emits packs and reuses existing
+  deltas but **cannot compute new deltas and has no bitmaps** (gix #306/#2531).
+  For wire packs this forces `git pack-objects` / `git push` to avoid
+  pathological whole-object pack sizes.
+- **send / receive-pack** — **missing in gix on both sides**: no client push
+  (gix #306, explicitly outscoped from 1.0 per #470) and no server
+  receive-pack/`accept()` (gix #307). libgit2 has client push but also no server
+  side. Forces `git push` → `git receive-pack` / `git daemon`.
+
+This **confirms the gix-first + shell-out posture**: synthesise objects natively
+in gix, and shell out to `git` for the pack-and-transfer leg — a single
+`git push` → `git receive-pack` exchange covers the pack-delta, push, and
+server-receive gaps at once. The report recommends **not** pausing tool work to
+upstream anything now: the high-value gaps (delta compression, push, server) are
+large and gitoxide has deliberately sequenced them post-1.0; revisit if/when gix
+push (#306) lands or a native transfer becomes a project goal.
 
 ## Consequences
 
