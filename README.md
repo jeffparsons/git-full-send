@@ -57,3 +57,15 @@ patterns), and [`docs/adr/`](docs/adr/) for the architecture decisions.
 MVP. The transport has no built-in authentication or encryption — it leans
 entirely on the SSH tunnel for confidentiality and access control
 ([ADR-0006](docs/adr/0006-transport-and-connectivity.md)).
+
+## AI use
+
+This project is developed with **Claude Code** (Anthropic's CLI coding agent),
+driven through the [ghwf](https://github.com/jeffparsons/ghwf) GitHub workflow.
+Because of that workflow, there is natural traceability from the inputs
+(prompts) to the outputs (code, docs, and tests):
+
+- The prompts and conversations that produced the work are, for the most part,
+  captured in the **issue and pull-request comment threads** on GitHub.
+- The **implementation plans** Claude writes for each issue are committed to the
+  git tree under [`plans/`](plans/).
