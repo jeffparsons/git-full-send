@@ -376,6 +376,7 @@ dependencies = [
 name = "gfs-client"
 version = "0.0.0"
 dependencies = [
+ "getrandom",
  "gfs-common",
  "gfs-server",
  "gix",
@@ -391,6 +392,8 @@ dependencies = [
 name = "gfs-common"
 version = "0.0.0"
 dependencies = [
+ "bstr",
+ "gix-validate",
  "thiserror",
 ]
 

@@ -58,13 +58,19 @@ pub enum ServerError {
     /// Spawning `git receive-pack` failed.
     #[error("could not spawn `git receive-pack`")]
     Spawn(#[source] std::io::Error),
-    /// The repository has no `code` ref to check out — nothing has been synced
-    /// yet.
-    #[error(
-        "no `{}` to check out; nothing has been synced yet",
-        gfs_common::CODE_REF
-    )]
-    MissingCodeRef,
+    /// The repository has no `code` ref for the requested stream to check out —
+    /// nothing has been synced for it yet.
+    #[error("no `{ref_name}` to check out; nothing has been synced for this stream yet")]
+    MissingCodeRef {
+        /// The `code` ref we looked for.
+        ref_name: String,
+    },
+    /// An explicitly requested stream id was malformed.
+    #[error(transparent)]
+    StreamId(#[from] gfs_common::StreamIdError),
+    /// Listing the synced streams failed.
+    #[error("could not list streams")]
+    ListStreams(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Creating the worktree directory (or its sidecar index directory) failed.
     #[error("could not create the worktree directory")]
     CreateWorktree(#[source] std::io::Error),
@@ -245,21 +251,62 @@ fn pre_receive_hook() -> String {
     )
 }
 
-/// Check the synced `code` state out into the configured worktree.
+/// Check a stream's synced `code` state out into the given worktree.
 ///
 /// An authoritative, destructive overwrite of the remote worktree (ADR-0008),
 /// invoked independently of [`listen`] (a build orchestrator triggers it). After
-/// it returns, `worktree` matches the synced [`gfs_common::CODE_REF`] tree
-/// *exactly*: remote-side edits are stomped (even to files whose blob is
-/// unchanged between syncs), files dropped between syncs are removed, and
-/// untracked remote additions are removed.
+/// it returns, `worktree` matches `stream`'s synced `code` tree
+/// (`gfs_common::code_ref`) *exactly*: remote-side edits are stomped (even to
+/// files whose blob is unchanged between syncs), files dropped between syncs are
+/// removed, and untracked remote additions are removed.
+///
+/// `stream` and `worktree` are independent (ADR-0012): the caller decides which
+/// stream lands in which worktree — a dedicated worktree per stream, several
+/// streams taking turns in one, etc. — and this imposes no 1:1 mapping.
 ///
 /// The blocking `git` work runs on a dedicated thread so it does not occupy the
 /// async executor (mirroring [`listen`]).
-pub async fn update_worktree(repo: PathBuf, worktree: PathBuf) -> Result<(), ServerError> {
-    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree))
+pub async fn update_worktree(
+    repo: PathBuf,
+    worktree: PathBuf,
+    stream: gfs_common::StreamId,
+) -> Result<(), ServerError> {
+    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree, &stream))
         .await
         .map_err(|e| ServerError::Join(e.to_string()))?
+}
+
+/// List the streams that have a synced `code` ref in `repo`.
+///
+/// Enumerates refs under [`gfs_common::STREAMS_PREFIX`], recovering each
+/// (possibly slash-containing) stream id from the `…/streams/<id>/code` refs. An
+/// orchestrator uses this to discover which streams are available to check out.
+pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerError> {
+    let repo = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
+    let platform = repo
+        .references()
+        .map_err(|e| ServerError::ListStreams(Box::new(e)))?;
+    let iter = platform
+        .prefixed(gfs_common::STREAMS_PREFIX)
+        .map_err(|e| ServerError::ListStreams(Box::new(e)))?;
+
+    let mut streams = Vec::new();
+    for reference in iter {
+        let reference = reference.map_err(ServerError::ListStreams)?;
+        let name = reference.name().as_bstr().to_string();
+        // Recover `<id>` from `refs/git-full-send/streams/<id>/code`, leaving the
+        // companion `…/sent/code` and anything else untouched.
+        let Some(rest) = name.strip_prefix(gfs_common::STREAMS_PREFIX) else {
+            continue;
+        };
+        let Some(id) = rest.strip_suffix("/code") else {
+            continue;
+        };
+        if let Ok(stream) = gfs_common::StreamId::new(id) {
+            streams.push(stream);
+        }
+    }
+    Ok(streams)
 }
 
 /// The blocking body of [`update_worktree`].
@@ -269,13 +316,17 @@ pub async fn update_worktree(repo: PathBuf, worktree: PathBuf) -> Result<(), Ser
 /// to the tree, discarding remote-local edits and removing dropped files) and
 /// `clean -fdx` (prune untracked leftovers), keyed on a per-worktree index so
 /// Git's stat cache keeps the work proportional to the sync delta.
-fn update_worktree_blocking(repo: &Path, worktree: &Path) -> Result<(), ServerError> {
+fn update_worktree_blocking(
+    repo: &Path,
+    worktree: &Path,
+    stream: &gfs_common::StreamId,
+) -> Result<(), ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let git_dir = discovered.git_dir().to_path_buf();
 
-    // Resolve the `code` tree first, so a never-synced repo fails cleanly before
-    // any worktree mutation.
-    let tree = resolve_code_tree(&git_dir)?;
+    // Resolve the stream's `code` tree first, so a never-synced stream fails
+    // cleanly before any worktree mutation.
+    let tree = resolve_code_tree(&git_dir, stream)?;
 
     // The worktree, and the per-worktree index that records what we last checked
     // out (kept under the git dir, never inside the worktree itself — `clean`
@@ -301,13 +352,15 @@ fn update_worktree_blocking(repo: &Path, worktree: &Path) -> Result<(), ServerEr
     Ok(())
 }
 
-/// Resolve [`gfs_common::CODE_REF`] to its tree id, or [`ServerError::MissingCodeRef`].
+/// Resolve `stream`'s `code` ref (`gfs_common::code_ref`) to its tree id, or
+/// [`ServerError::MissingCodeRef`].
 ///
 /// `rev-parse --verify --quiet` exits non-zero with empty output when the ref is
 /// absent, which we map to the dedicated error rather than a confusing
 /// downstream `read-tree` failure.
-fn resolve_code_tree(git_dir: &Path) -> Result<String, ServerError> {
-    let spec = format!("{}^{{tree}}", gfs_common::CODE_REF);
+fn resolve_code_tree(git_dir: &Path, stream: &gfs_common::StreamId) -> Result<String, ServerError> {
+    let code_ref = gfs_common::code_ref(stream);
+    let spec = format!("{code_ref}^{{tree}}");
     let output = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
@@ -320,7 +373,7 @@ fn resolve_code_tree(git_dir: &Path) -> Result<String, ServerError> {
         })?;
     let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || tree.is_empty() {
-        return Err(ServerError::MissingCodeRef);
+        return Err(ServerError::MissingCodeRef { ref_name: code_ref });
     }
     Ok(tree)
 }

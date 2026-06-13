@@ -10,8 +10,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 
-use gfs_client::{CODE_REF, SENT_REF};
+use gfs_common::{StreamId, code_ref, sent_ref};
 use test_support::{commit_all, git, init_bare_repo, init_temp_repo, write_file};
+
+/// A fixed stream id for tests that only need one stream, so the produced refs
+/// are deterministic.
+fn test_stream() -> StreamId {
+    StreamId::new("test").unwrap()
+}
 
 /// Bind a listener for `repo` on an ephemeral localhost port and serve it on a
 /// background thread, returning the bound address.
@@ -64,13 +70,15 @@ async fn push_lands_code_ref_and_objects() {
     write_file(c, "committed.txt", "modified");
     write_file(c, "untracked.txt", "new");
 
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    let stream = test_stream();
+    let code = code_ref(&stream);
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("sync succeeds");
 
     // The server's `code` ref now matches the client's encoded tip…
-    let client_tip = git(c, &["rev-parse", CODE_REF]);
-    let server_tip = git(server.path(), &["rev-parse", "refs/git-full-send/code"]);
+    let client_tip = git(c, &["rev-parse", &code]);
+    let server_tip = git(server.path(), &["rev-parse", &code]);
     assert_eq!(
         server_tip.trim(),
         client_tip.trim(),
@@ -80,13 +88,13 @@ async fn push_lands_code_ref_and_objects() {
     // …and the objects landed: the tree is walkable on the server with the
     // expected working-tree contents.
     assert_eq!(
-        tree_paths(server.path(), "refs/git-full-send/code"),
+        tree_paths(server.path(), &code),
         BTreeSet::from(["committed.txt".to_string(), "untracked.txt".to_string()]),
     );
     assert_eq!(
         git(
             server.path(),
-            &["cat-file", "blob", "refs/git-full-send/code:committed.txt"]
+            &["cat-file", "blob", &format!("{code}:committed.txt")]
         ),
         "modified",
     );
@@ -102,13 +110,14 @@ async fn retains_pushed_tip_on_the_client() {
     write_file(c, "a.txt", "a");
     commit_all(c, "baseline");
 
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("sync succeeds");
 
     assert_eq!(
-        git(c, &["rev-parse", SENT_REF]).trim(),
-        git(c, &["rev-parse", CODE_REF]).trim(),
+        git(c, &["rev-parse", &sent_ref(&stream)]).trim(),
+        git(c, &["rev-parse", &code_ref(&stream)]).trim(),
         "the retention ref pins the pushed code tip",
     );
 }
@@ -123,11 +132,12 @@ async fn rejects_refs_outside_the_namespace() {
     write_file(c, "a.txt", "a");
     commit_all(c, "baseline");
     // Give the client a code ref to push (a namespaced ref that is accepted).
-    git(c, &["update-ref", CODE_REF, "HEAD"]);
+    let code = code_ref(&test_stream());
+    git(c, &["update-ref", &code, "HEAD"]);
     let remote = addr.to_string();
 
     // A namespaced ref is accepted…
-    gfs_client::push_ref(c, &remote, CODE_REF).expect("a refs/git-full-send/* push is accepted");
+    gfs_client::push_ref(c, &remote, &code).expect("a refs/git-full-send/* push is accepted");
     // …but anything outside the namespace is declined by the pre-receive hook.
     assert!(
         gfs_client::push_ref(c, &remote, "refs/heads/main").is_err(),
@@ -153,23 +163,25 @@ async fn second_sync_advances_the_server() {
     let c = client.path();
     write_file(c, "a.txt", "one");
     commit_all(c, "baseline");
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    let stream = test_stream();
+    let code = code_ref(&stream);
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("first sync");
-    let first = git(server.path(), &["rev-parse", "refs/git-full-send/code"]);
+    let first = git(server.path(), &["rev-parse", &code]);
 
     // Change the working tree and sync again (the retained tip is the base).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("second sync");
-    let second = git(server.path(), &["rev-parse", "refs/git-full-send/code"]);
+    let second = git(server.path(), &["rev-parse", &code]);
 
     assert_ne!(first.trim(), second.trim(), "the server code ref advanced");
     assert_eq!(
         git(
             server.path(),
-            &["cat-file", "blob", "refs/git-full-send/code:a.txt"]
+            &["cat-file", "blob", &format!("{code}:a.txt")]
         ),
         "two",
         "the server has the latest content",
@@ -189,7 +201,8 @@ async fn update_worktree_makes_worktree_match_code() {
     // An untracked working-tree file the encode folds in.
     write_file(c, "new.txt", "v1");
 
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("sync succeeds");
 
@@ -200,14 +213,18 @@ async fn update_worktree_makes_worktree_match_code() {
     write_file(wt, "keep.txt", "REMOTE-EDIT");
     write_file(wt, "stale.txt", "junk");
 
-    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
-        .await
-        .expect("update-worktree succeeds");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("update-worktree succeeds");
 
     // The worktree matches the synced tree exactly…
     assert_eq!(
         worktree_files(wt),
-        tree_paths(server.path(), CODE_REF),
+        tree_paths(server.path(), &code_ref(&stream)),
         "worktree contents equal the synced code tree",
     );
     // …the stale file is gone…
@@ -232,14 +249,19 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     commit_all(c, "baseline");
 
     // First sync + checkout: the worktree gains gone.txt.
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
-        .await
-        .expect("first update-worktree");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("first update-worktree");
     assert!(
         wt.join("gone.txt").exists(),
         "gone.txt is checked out first"
@@ -248,12 +270,16 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     // Delete gone.txt on the client and sync again; the same worktree updates.
     std::fs::remove_file(c.join("gone.txt")).expect("remove gone.txt");
     commit_all(c, "drop gone.txt");
-    gfs_client::sync(c.to_path_buf(), addr.to_string())
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
         .await
         .expect("second sync");
-    gfs_server::update_worktree(server.path().to_path_buf(), wt.to_path_buf())
-        .await
-        .expect("second update-worktree");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("second update-worktree");
 
     assert!(
         !wt.join("gone.txt").exists(),
@@ -261,7 +287,181 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     );
     assert_eq!(
         worktree_files(wt),
-        tree_paths(server.path(), CODE_REF),
+        tree_paths(server.path(), &code_ref(&stream)),
         "worktree still matches the synced tree exactly",
+    );
+}
+
+#[tokio::test]
+async fn two_streams_do_not_clobber_each_other() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    // Two independent clients sync different content under different streams.
+    let alice = init_temp_repo();
+    write_file(alice.path(), "who.txt", "alice");
+    commit_all(alice.path(), "alice baseline");
+    let alice_stream = StreamId::new("alice").unwrap();
+    gfs_client::sync(
+        alice.path().to_path_buf(),
+        addr.to_string(),
+        Some(alice_stream.clone()),
+    )
+    .await
+    .expect("alice sync");
+
+    let bob = init_temp_repo();
+    write_file(bob.path(), "who.txt", "bob");
+    commit_all(bob.path(), "bob baseline");
+    let bob_stream = StreamId::new("bob").unwrap();
+    gfs_client::sync(
+        bob.path().to_path_buf(),
+        addr.to_string(),
+        Some(bob_stream.clone()),
+    )
+    .await
+    .expect("bob sync");
+
+    // Both streams' code refs coexist with their own content — no clobbering.
+    assert_eq!(
+        git(
+            server.path(),
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:who.txt", code_ref(&alice_stream))
+            ]
+        ),
+        "alice",
+    );
+    assert_eq!(
+        git(
+            server.path(),
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:who.txt", code_ref(&bob_stream))
+            ]
+        ),
+        "bob",
+    );
+
+    // And each stream checks out independently into its own worktree.
+    for (stream, expected) in [(&alice_stream, "alice"), (&bob_stream, "bob")] {
+        let wt = tempfile::tempdir().expect("worktree dir");
+        gfs_server::update_worktree(
+            server.path().to_path_buf(),
+            wt.path().to_path_buf(),
+            stream.clone(),
+        )
+        .await
+        .expect("update-worktree");
+        assert_eq!(
+            std::fs::read_to_string(wt.path().join("who.txt")).unwrap(),
+            expected,
+        );
+    }
+
+    // `list_streams` reports exactly the two synced streams.
+    let mut listed: Vec<String> = gfs_server::list_streams(server.path())
+        .expect("list streams")
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    listed.sort();
+    assert_eq!(listed, vec!["alice".to_string(), "bob".to_string()]);
+}
+
+#[tokio::test]
+async fn branch_shaped_stream_id_round_trips() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "f.txt", "v1");
+    commit_all(c, "baseline");
+
+    // A slash-containing (branch-shaped) id must survive encode → push → checkout.
+    let stream = StreamId::new("feature/foo").unwrap();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
+        .await
+        .expect("sync succeeds");
+
+    let wt = tempfile::tempdir().expect("worktree dir");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.path().to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("update-worktree succeeds");
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("f.txt")).unwrap(),
+        "v1",
+    );
+    assert_eq!(
+        gfs_server::list_streams(server.path()).unwrap(),
+        vec![stream],
+        "the slash-shaped id is recovered intact",
+    );
+}
+
+#[tokio::test]
+async fn default_stream_is_generated_persisted_and_reused() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "a.txt", "one");
+    commit_all(c, "baseline");
+
+    // No explicit stream: one is generated and persisted to the repo config.
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None)
+        .await
+        .expect("first sync");
+    let id = git(
+        c,
+        &["config", "--local", "--get", "git-full-send.stream-id"],
+    )
+    .trim()
+    .to_string();
+    assert!(!id.is_empty(), "a default stream id was persisted");
+
+    let stream = StreamId::new(id).unwrap();
+    let code = code_ref(&stream);
+    let first = git(server.path(), &["rev-parse", &code]);
+
+    // A second default sync reuses the same stream (the server ref advances in
+    // place rather than spawning a second stream).
+    write_file(c, "a.txt", "two");
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None)
+        .await
+        .expect("second sync");
+    let second = git(server.path(), &["rev-parse", &code]);
+    assert_ne!(first.trim(), second.trim(), "same stream ref advanced");
+    assert_eq!(
+        gfs_server::list_streams(server.path()).unwrap(),
+        vec![stream],
+        "only one stream exists after two default syncs",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_without_a_synced_stream_errors() {
+    let server = init_bare_repo();
+
+    let wt = tempfile::tempdir().expect("worktree dir");
+    let err = gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.path().to_path_buf(),
+        StreamId::new("never-synced").unwrap(),
+    )
+    .await
+    .expect_err("checking out a never-synced stream fails");
+    assert!(
+        matches!(err, gfs_server::ServerError::MissingCodeRef { .. }),
+        "got {err:?}",
     );
 }

@@ -1,15 +1,21 @@
 //! Integration tests for the client `encode` step (issue #17).
 //!
-//! Each test builds a temp repo with the `git` CLI, runs [`gfs_client::encode`],
-//! and inspects the resulting `refs/git-full-send/code` commit — again via the
+//! Each test builds a temp repo with the `git` CLI, runs [`gfs_client::encode`]
+//! under a fixed stream, and inspects the resulting `code` commit — again via the
 //! `git` CLI, to keep the assertions independent of the implementation's own
 //! library (`gix`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use gfs_client::{CODE_REF, encode};
+use gfs_client::encode;
+use gfs_common::{StreamId, code_ref};
 use test_support::{commit_all, git, init_temp_repo, write_file};
+
+/// A fixed stream id so each test's `code` ref is deterministic.
+fn test_stream() -> StreamId {
+    StreamId::new("test").unwrap()
+}
 
 /// The recursive contents of a tree-ish, as `path -> (mode, blob contents)`.
 type TreeContents = BTreeMap<String, (String, String)>;
@@ -71,15 +77,18 @@ fn code_tree_equals_on_disk_working_state() {
     write_file(p, "untracked.txt", "new"); // untracked, not ignored
     write_file(p, "ignored.txt", "secret"); // gitignored -> excluded
 
-    let outcome = encode(p).expect("encode succeeds");
+    let stream = test_stream();
+    let code = code_ref(&stream);
+    let outcome = encode(p, &stream).expect("encode succeeds");
 
     // The ref points at the returned commit, parented on the untouched HEAD.
     assert_eq!(
-        git(p, &["rev-parse", CODE_REF]).trim(),
-        outcome.commit.to_string(),
+        git(p, &["rev-parse", &code]).trim(),
+        outcome.commit.to_string()
     );
+    assert_eq!(outcome.code_ref, code, "outcome reports the ref it wrote");
     assert_eq!(
-        git(p, &["rev-parse", &format!("{CODE_REF}^")]).trim(),
+        git(p, &["rev-parse", &format!("{code}^")]).trim(),
         git(p, &["rev-parse", "HEAD"]).trim(),
         "code commit is parented on HEAD",
     );
@@ -97,7 +106,7 @@ fn code_tree_equals_on_disk_working_state() {
     .collect();
 
     assert_eq!(
-        tree_contents(p, CODE_REF),
+        tree_contents(p, &code),
         expected,
         "the code tree must equal the on-disk state (deletions and ignores excluded)",
     );
@@ -121,7 +130,9 @@ fn leaves_user_branch_index_and_worktree_untouched() {
     let branch_before = git(p, &["rev-parse", "main"]);
     let status_before = git(p, &["status", "--porcelain=v2", "--branch"]);
 
-    encode(p).expect("encode succeeds");
+    let stream = test_stream();
+    let code = code_ref(&stream);
+    encode(p, &stream).expect("encode succeeds");
 
     assert_eq!(
         git(p, &["rev-parse", "HEAD"]),
@@ -140,8 +151,8 @@ fn leaves_user_branch_index_and_worktree_untouched() {
     );
     // The scratch ref now exists.
     assert!(
-        !git(p, &["rev-parse", CODE_REF]).trim().is_empty(),
-        "{CODE_REF} was written",
+        !git(p, &["rev-parse", &code]).trim().is_empty(),
+        "{code} was written",
     );
 }
 
@@ -152,9 +163,11 @@ fn encodes_unborn_head_with_untracked_files() {
     // No commits yet: HEAD is unborn.
     write_file(p, "fresh.txt", "hello");
 
-    let outcome = encode(p).expect("encode succeeds on an unborn HEAD");
+    let stream = test_stream();
+    let code = code_ref(&stream);
+    let outcome = encode(p, &stream).expect("encode succeeds on an unborn HEAD");
 
-    let parents = git(p, &["rev-list", "--parents", "-n", "1", CODE_REF]);
+    let parents = git(p, &["rev-list", "--parents", "-n", "1", &code]);
     assert_eq!(
         parents.split_whitespace().count(),
         1,
@@ -162,13 +175,13 @@ fn encodes_unborn_head_with_untracked_files() {
     );
     assert_eq!(
         outcome.commit.to_string(),
-        git(p, &["rev-parse", CODE_REF]).trim(),
+        git(p, &["rev-parse", &code]).trim()
     );
 
     let expected: TreeContents = [("fresh.txt".to_string(), blob("hello"))]
         .into_iter()
         .collect();
-    assert_eq!(tree_contents(p, CODE_REF), expected);
+    assert_eq!(tree_contents(p, &code), expected);
 }
 
 #[cfg(unix)]
@@ -190,8 +203,9 @@ fn preserves_executable_bit_and_symlinks() {
     write_file(p, "tool", "#!/bin/sh\n");
     std::fs::set_permissions(p.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    encode(p).expect("encode succeeds");
-    let tree = tree_contents(p, CODE_REF);
+    let stream = test_stream();
+    encode(p, &stream).expect("encode succeeds");
+    let tree = tree_contents(p, &code_ref(&stream));
 
     assert_eq!(
         tree["script.sh"].0, "100755",

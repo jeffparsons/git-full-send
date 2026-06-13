@@ -32,11 +32,12 @@
 //! `--thin` only saves bytes when the previous blob is present on **both** ends
 //! and surfaced as common by negotiation. The server retains its side
 //! automatically (the pushed ref persists and `receive.autogc=false` keeps its
-//! objects). On the client, [`encode`] force-overwrites `code` every sync,
-//! orphaning the previously-pushed commit; [`SENT_REF`] pins the
-//! last-confirmed-pushed tip so its objects survive locally as the delta base.
-//! It is advanced **only after** a push succeeds, so a failed push leaves it
-//! pointing at the state the server actually has.
+//! objects). On the client, [`encode`] force-overwrites the stream's `code` ref
+//! every sync, orphaning the previously-pushed commit; the stream's `sent` ref
+//! (`gfs_common::sent_ref`) pins the last-confirmed-pushed tip so its objects
+//! survive locally as the delta base. It is advanced **only after** a push
+//! succeeds, so a failed push leaves it pointing at the state the server
+//! actually has.
 //!
 //! [`encode`]: crate::encode
 
@@ -46,11 +47,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use gfs_common::StreamId;
 use thiserror::Error;
-
-/// The ref that retains the last-confirmed-pushed `code` tip on the client (a
-/// delta base for the next push). Under [`gfs_common::REF_NAMESPACE`].
-pub const SENT_REF: &str = "refs/git-full-send/sent/code";
 
 /// Errors returned by the transfer step.
 #[derive(Debug, Error)]
@@ -90,8 +88,14 @@ pub enum PushError {
         stderr: String,
     },
     /// Updating the retention ref failed.
-    #[error("could not update `{SENT_REF}`")]
-    RetainRef(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("could not update `{ref_name}`")]
+    RetainRef {
+        /// The ref we tried to write.
+        ref_name: String,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Push `ref_name` from the repository at `repo_dir` to `remote`
@@ -192,12 +196,17 @@ fn dup_inheritable(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
     Ok(dup)
 }
 
-/// Pin `commit` (the just-pushed tip) under [`SENT_REF`] so its objects survive
-/// locally as the delta base for the next push.
+/// Pin `commit` (the just-pushed tip) under `stream`'s `sent` ref
+/// (`gfs_common::sent_ref`) so its objects survive locally as the delta base for
+/// the next push.
 ///
 /// A force create-or-overwrite, mirroring the scratch-ref transaction `encode`
 /// uses for `code`. Called only after a successful [`push_ref`].
-pub(crate) fn retain_pushed_tip(repo_dir: &Path, commit: gix::ObjectId) -> Result<(), PushError> {
+pub(crate) fn retain_pushed_tip(
+    repo_dir: &Path,
+    stream: &StreamId,
+    commit: gix::ObjectId,
+) -> Result<(), PushError> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::{FullName, Target};
 
@@ -205,7 +214,11 @@ pub(crate) fn retain_pushed_tip(repo_dir: &Path, commit: gix::ObjectId) -> Resul
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
     })?;
-    let name = FullName::try_from(SENT_REF).map_err(|e| PushError::RetainRef(Box::new(e)))?;
+    let sent_ref = gfs_common::sent_ref(stream);
+    let name = FullName::try_from(sent_ref.as_str()).map_err(|e| PushError::RetainRef {
+        ref_name: sent_ref.clone(),
+        source: Box::new(e),
+    })?;
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -219,7 +232,10 @@ pub(crate) fn retain_pushed_tip(repo_dir: &Path, commit: gix::ObjectId) -> Resul
         name,
         deref: false,
     })
-    .map_err(|e| PushError::RetainRef(Box::new(e)))?;
+    .map_err(|e| PushError::RetainRef {
+        ref_name: sent_ref,
+        source: Box::new(e),
+    })?;
     Ok(())
 }
 
@@ -229,6 +245,7 @@ mod tests {
 
     #[test]
     fn sent_ref_is_under_the_namespace() {
-        assert!(SENT_REF.starts_with(gfs_common::REF_NAMESPACE));
+        let stream = StreamId::new("test").unwrap();
+        assert!(gfs_common::sent_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
     }
 }

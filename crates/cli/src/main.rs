@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use gfs_common::StreamId;
 
 /// Sync a developer's Git working state to a remote workstation.
 #[derive(Debug, Parser)]
@@ -26,6 +27,8 @@ enum Command {
     Listen(ListenArgs),
     /// Check the synced state out into the configured worktree (server).
     UpdateWorktree(UpdateWorktreeArgs),
+    /// List the streams that have a synced `code` ref (server).
+    ListStreams(ListStreamsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -36,6 +39,10 @@ struct SyncArgs {
     /// Server endpoint to push to (typically a tunnelled localhost port).
     #[arg(long, value_name = "HOST:PORT")]
     remote: String,
+    /// Stream to sync under. Defaults to this repo's configured
+    /// `git-full-send.stream-id`, generated and persisted on first use.
+    #[arg(long, value_name = "ID")]
+    stream_id: Option<StreamId>,
 }
 
 #[derive(Debug, Args)]
@@ -56,6 +63,17 @@ struct UpdateWorktreeArgs {
     /// Path to the disposable worktree directory to check the `code` tree into.
     #[arg(long, value_name = "PATH")]
     worktree: PathBuf,
+    /// Stream whose `code` tree to check out. Required — the server has no
+    /// repo-local default (see `list-streams` to discover synced streams).
+    #[arg(long, value_name = "ID")]
+    stream_id: StreamId,
+}
+
+#[derive(Debug, Args)]
+struct ListStreamsArgs {
+    /// Path to the target Git repository holding the synced refs.
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
 }
 
 #[tokio::main]
@@ -75,11 +93,16 @@ async fn main() -> Result<()> {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
-            gfs_client::sync(repo, args.remote).await?;
+            gfs_client::sync(repo, args.remote, args.stream_id).await?;
         }
         Command::Listen(args) => gfs_server::listen(args.addr, args.repo).await?,
         Command::UpdateWorktree(args) => {
-            gfs_server::update_worktree(args.repo, args.worktree).await?
+            gfs_server::update_worktree(args.repo, args.worktree, args.stream_id).await?
+        }
+        Command::ListStreams(args) => {
+            for stream in gfs_server::list_streams(&args.repo)? {
+                println!("{stream}");
+            }
         }
     }
 

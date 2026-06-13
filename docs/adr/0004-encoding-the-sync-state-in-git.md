@@ -48,6 +48,13 @@ or working tree. Scratch refs and an alternate index are permitted.
 These options interact with how the transfer is performed and with how the
 remote worktree is reassembled.
 
+> **Note (ADR-0012):** the `refs/git-full-send/code` and `refs/git-full-send/extra`
+> names used as examples below are now namespaced per *stream* —
+> `refs/git-full-send/streams/<stream-id>/code` (and `…/extra`) — so multiple
+> senders can coexist on one server. See
+> [ADR-0012](0012-namespacing-managed-refs-per-stream.md); the encoding decision
+> here is otherwise unchanged.
+
 ## Decision
 
 Adopt **Option 2, refined** (Separate commit/tree for the extra files):
