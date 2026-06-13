@@ -59,7 +59,7 @@ fn selects_gitignored_build_outputs_with_a_carve_out() {
     write_file(p, "src/main.rs", "fn main() {}"); // not force-included
 
     let stream = test_stream();
-    encode_extra(p, &stream).expect("encode_extra succeeds");
+    encode_extra(p, &stream, None).expect("encode_extra succeeds");
 
     assert_eq!(
         tree_paths(p, &extra_ref(&stream)),
@@ -81,7 +81,7 @@ fn empty_selection_still_produces_an_extra_commit() {
     // No include file at all: an `extra` commit is still written, with an empty
     // tree, so the chain and the push stay uniform across syncs.
     let stream = test_stream();
-    let outcome = encode_extra(p, &stream).expect("encode_extra succeeds");
+    let outcome = encode_extra(p, &stream, None).expect("encode_extra succeeds");
 
     assert_eq!(
         git(
@@ -110,7 +110,7 @@ fn first_extra_commit_is_rootless_then_chains_onto_the_retained_tip() {
     let stream = test_stream();
 
     // First sync: no retained `extra` tip yet, so the commit is rootless.
-    let first = encode_extra(p, &stream).expect("first encode_extra");
+    let first = encode_extra(p, &stream, None).expect("first encode_extra");
     assert!(
         parents(p, &extra_ref(&stream)).is_empty(),
         "the first extra commit has no parent",
@@ -129,7 +129,7 @@ fn first_extra_commit_is_rootless_then_chains_onto_the_retained_tip() {
 
     // Second sync with changed content chains onto the retained tip.
     write_file(p, "dist/app.js", "v2");
-    let second = encode_extra(p, &stream).expect("second encode_extra");
+    let second = encode_extra(p, &stream, None).expect("second encode_extra");
     assert_ne!(
         first.commit, second.commit,
         "the extra commit advanced with the new content",

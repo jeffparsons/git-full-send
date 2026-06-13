@@ -22,7 +22,7 @@ mod stream;
 pub use encode::{EncodeError, EncodeOutcome, ExtraOutcome, encode, encode_extra};
 pub use gfs_common::{StreamId, StreamIdError};
 pub use push::{PushError, push_ref, push_refs};
-pub use select::{SelectError, select_extra_paths};
+pub use select::{SelectError, select_extra_paths, select_extra_paths_with};
 pub use stream::StreamResolveError;
 
 /// Errors returned by client operations.
@@ -57,17 +57,20 @@ pub enum ClientError {
 /// `remote` is the server endpoint (`HOST:PORT`, typically a tunnelled localhost
 /// port). `stream` selects the stream: `Some` uses that id, `None` falls back to
 /// the repo's configured `git-full-send.stream-id`, generating and persisting
-/// one on first use.
+/// one on first use. `user_include` overrides the per-user force-include pattern
+/// file (the `--user-include` flag); `None` resolves it from the environment
+/// (`GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` / `$HOME`) as usual.
 pub async fn sync(
     repo_dir: PathBuf,
     remote: String,
     stream: Option<StreamId>,
+    user_include: Option<PathBuf>,
 ) -> Result<(), ClientError> {
     let stream = stream::resolve_stream(&repo_dir, stream)?;
 
     let code = encode(&repo_dir, &stream)?;
     tracing::info!(commit = %code.commit, stream = %stream, ref_ = %code.code_ref, "encoded code state");
-    let extra = encode_extra(&repo_dir, &stream)?;
+    let extra = encode_extra(&repo_dir, &stream, user_include.as_deref())?;
     tracing::info!(commit = %extra.commit, stream = %stream, ref_ = %extra.extra_ref, "encoded extra state");
 
     // Push both refs in one receive-pack exchange (ADR-0004/0005).
