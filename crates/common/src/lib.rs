@@ -10,6 +10,8 @@
 use bstr::ByteSlice;
 use thiserror::Error;
 
+pub mod metrics;
+
 /// Ref namespace that `git-full-send` confines its synced refs to.
 ///
 /// The server restricts the writable refs of each `git receive-pack` to this

@@ -165,3 +165,29 @@ The selection walk descends every non-`.git` directory that isn't carved out, so
 an unrelated large ignored tree (e.g. `node_modules`) is still traversed even
 when nothing in it is selected. This is an accepted cost for the MVP; keep the
 include set curated.
+
+## 5. Metrics
+
+Every operation appends one structured **JSON Lines** record to a per-side sink
+for retrospective analysis ([ADR-0013](adr/0013-recording-operation-metrics.md)):
+
+```text
+<git-dir>/git-full-send/metrics.jsonl
+```
+
+— on the **client** (e.g. `.git/git-full-send/metrics.jsonl`) for each `sync`,
+and on the **server** repo for each `receive` (one per `git receive-pack`
+connection) and each `update-worktree`. Each record carries a `kind` tag, a
+timestamp, phase timings (in milliseconds), and size metadata — the client's
+per-layer file/byte counts, the server's on-wire `bytes_in`/`bytes_out` and the
+refs a push updated. Writing is best-effort: if the file can't be written the
+operation still succeeds and a warning is logged.
+
+Inspect or aggregate it with any JSON tool, e.g. the slowest syncs:
+
+```sh
+jq -r 'select(.kind=="sync") | [.total_ms, .stream] | @tsv' \
+    .git/git-full-send/metrics.jsonl | sort -rn | head
+```
+
+The file grows unbounded for now (no rotation); delete it freely — it is regenerated.

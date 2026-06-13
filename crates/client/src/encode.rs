@@ -46,8 +46,27 @@ const SYNTH_EXTRA_MESSAGE: &str = "git-full-send: extra (force-included) snapsho
 pub struct EncodeOutcome {
     /// The commit the stream's `code` ref now points at.
     pub commit: gix::ObjectId,
+    /// The tree that commit holds.
+    pub tree: gix::ObjectId,
     /// The `code` ref that was written (`gfs_common::code_ref` for the stream).
     pub code_ref: String,
+    /// Size metadata for the code layer's working-tree *delta* this sync (issue
+    /// #42). It is the delta, not the whole tree: the base is the index, and only
+    /// changed/added/removed paths are walked, so the full tree size is not
+    /// cheaply available here.
+    pub stats: CodeLayerStats,
+}
+
+/// Size metadata for the code layer's index→worktree delta in one [`encode`].
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct CodeLayerStats {
+    /// Files added or modified (overlaid from disk over the index base).
+    pub files_overlaid: usize,
+    /// Total content bytes of the overlaid files.
+    pub bytes_overlaid: u64,
+    /// Files removed from the worktree since the index base.
+    pub files_removed: usize,
 }
 
 /// The result of a successful [`encode_extra`].
@@ -56,8 +75,24 @@ pub struct EncodeOutcome {
 pub struct ExtraOutcome {
     /// The commit the stream's `extra` ref now points at.
     pub commit: gix::ObjectId,
+    /// The tree that commit holds.
+    pub tree: gix::ObjectId,
     /// The `extra` ref that was written (`gfs_common::extra_ref` for the stream).
     pub extra_ref: String,
+    /// Size metadata for the extra layer (issue #42). Unlike `code`, this is the
+    /// *full* selected set each sync, since the whole force-include set is
+    /// re-encoded every time.
+    pub stats: ExtraLayerStats,
+}
+
+/// Size metadata for the full force-include set in one [`encode_extra`].
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct ExtraLayerStats {
+    /// Number of force-included files encoded.
+    pub files: usize,
+    /// Total content bytes of those files.
+    pub bytes: u64,
 }
 
 /// Errors returned by [`encode`].
@@ -167,6 +202,9 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
             .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
     }
 
+    // Accumulate the code layer's delta size as we overlay (issue #42).
+    let mut stats = CodeLayerStats::default();
+
     // Overlay the index → worktree delta in a single status pass. Rename
     // tracking is off, untracked files are emitted individually, and ignored
     // files are left out (those are the separate `extra` ticket's concern).
@@ -192,6 +230,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
                     editor
                         .remove(rela_path.as_bstr())
                         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
+                    stats.files_removed += 1;
                 }
                 // A modified submodule: keep the index's gitlink unchanged.
                 EntryStatus::Change(Change::SubmoduleModification(_)) => {}
@@ -202,7 +241,10 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
                 | EntryStatus::Change(Change::Type { .. })
                 | EntryStatus::IntentToAdd
                 | EntryStatus::Conflict { .. } => {
-                    overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
+                    let bytes =
+                        overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
+                    stats.files_overlaid += 1;
+                    stats.bytes_overlaid += bytes;
                 }
                 // Content is unchanged; the base (index) entry already holds it.
                 EntryStatus::NeedsUpdate(_) => {}
@@ -213,7 +255,10 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
                 if let Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink) =
                     entry.disk_kind
                 {
-                    overlay_from_disk(&repo, &mut editor, &workdir, entry.rela_path.as_bstr())?;
+                    let bytes =
+                        overlay_from_disk(&repo, &mut editor, &workdir, entry.rela_path.as_bstr())?;
+                    stats.files_overlaid += 1;
+                    stats.bytes_overlaid += bytes;
                 }
             }
             // Rename tracking is disabled, so rewrites are not expected; other
@@ -239,7 +284,9 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 
     Ok(EncodeOutcome {
         commit: commit_id,
+        tree: tree_id,
         code_ref,
+        stats,
     })
 }
 
@@ -299,8 +346,12 @@ pub fn encode_extra(
     let mut editor = repo
         .edit_tree(empty_tree)
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
+    let mut stats = ExtraLayerStats {
+        files: paths.len(),
+        bytes: 0,
+    };
     for rela_path in &paths {
-        overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
+        stats.bytes += overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
     }
     let tree_id = editor
         .write()
@@ -319,18 +370,24 @@ pub fn encode_extra(
 
     Ok(ExtraOutcome {
         commit: commit_id,
+        tree: tree_id,
         extra_ref,
+        stats,
     })
 }
 
 /// Read the on-disk file (or symlink) at `rela_path`, write it as a blob, and
 /// upsert it into `editor` with the mode taken from disk.
+///
+/// Returns the number of content bytes written (the file's length, or the
+/// symlink target's length), or `0` for a path skipped as not representable in a
+/// tree — so callers can sum a layer's overlaid size as they go.
 fn overlay_from_disk(
     repo: &gix::Repository,
     editor: &mut gix::object::tree::Editor<'_>,
     workdir: &Path,
     rela_path: &BStr,
-) -> Result<(), EncodeError> {
+) -> Result<u64, EncodeError> {
     let abs = workdir.join(gix::path::from_bstr(rela_path));
     let meta = std::fs::symlink_metadata(&abs).map_err(|source| EncodeError::ReadWorktree {
         path: abs.clone(),
@@ -355,9 +412,10 @@ fn overlay_from_disk(
         (blob_kind(&meta), bytes)
     } else {
         // Not representable in a tree (e.g. a FIFO or socket): skip it.
-        return Ok(());
+        return Ok(0);
     };
 
+    let bytes = content.len() as u64;
     let id = repo
         .write_blob(content)
         .map_err(|e| EncodeError::WriteObject(Box::new(e)))?
@@ -365,7 +423,7 @@ fn overlay_from_disk(
     editor
         .upsert(rela_path, kind, id)
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// Classify a regular file as an executable or plain blob.

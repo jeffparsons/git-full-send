@@ -101,6 +101,17 @@ fn expected_union(server: &Path, stream: &StreamId) -> BTreeSet<String> {
     expected
 }
 
+/// Parse the JSON Lines metrics records (issue #42) at `git_dir`'s sink.
+fn metrics_records(git_dir: &Path) -> Vec<serde_json::Value> {
+    let path = git_dir.join("git-full-send").join("metrics.jsonl");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read metrics file {}: {e}", path.display()));
+    contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("metrics line is valid JSON"))
+        .collect()
+}
+
 #[test]
 fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletions() {
     let server = init_bare_repo();
@@ -233,6 +244,97 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
         worktree_files(wt),
         expected_union(server.path(), &stream),
         "round 2: worktree still matches the code tree overlaid with the extra tree",
+    );
+}
+
+#[test]
+fn round_trip_records_metrics_on_both_sides() {
+    // A sync + checkout writes a per-operation metrics record to each side's
+    // sink (issue #42, ADR-0013): `sync` on the client, `receive` and
+    // `update_worktree` on the server.
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+    let remote = addr.to_string();
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    write_file(c, ".gitignore", "dist/\n"); // `dist/` is gitignored…
+    write_file(c, ".git-full-send-include", "dist/\n"); // …and force-included into `extra`
+    commit_all(c, "baseline");
+    write_file(c, "untracked.txt", "hello"); // 5 bytes folded into `code`
+    write_file(c, "dist/app.js", "app"); // 3 bytes into `extra` only
+
+    let stream = test_stream();
+    let stream_arg = stream.as_str();
+
+    run_cli(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &remote,
+        "--stream-id",
+        stream_arg,
+    ]);
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    run_cli(&[
+        "update-worktree",
+        "--repo",
+        server.path().to_str().unwrap(),
+        "--worktree",
+        worktree.path().to_str().unwrap(),
+        "--stream-id",
+        stream_arg,
+    ]);
+
+    // --- Client: one `sync` record with the per-layer sizes folded in.
+    let client_records = metrics_records(&c.join(".git"));
+    let sync = client_records
+        .iter()
+        .find(|r| r["kind"] == "sync")
+        .expect("a sync record");
+    assert_eq!(sync["stream"], stream_arg);
+    assert_eq!(sync["remote"], remote);
+    assert!(sync["total_ms"].as_f64().is_some(), "total_ms present");
+    // `untracked.txt` is the one overlaid code-layer file; `dist/app.js` the one
+    // extra file.
+    assert_eq!(sync["code"]["files_overlaid"], 1);
+    assert_eq!(sync["code"]["bytes_overlaid"], "hello".len() as u64);
+    assert_eq!(sync["extra"]["files"], 1);
+    assert_eq!(sync["extra"]["bytes"], "app".len() as u64);
+
+    // --- Server: a `receive` record (positive bytes, accepted refs) and an
+    // `update_worktree` record.
+    let server_records = metrics_records(server.path());
+    let receive = server_records
+        .iter()
+        .find(|r| r["kind"] == "receive")
+        .expect("a receive record");
+    assert_eq!(receive["success"], true);
+    assert!(
+        receive["bytes_in"].as_u64().unwrap_or(0) > 0,
+        "bytes were counted off the socket",
+    );
+    let refs: Vec<&str> = receive["refs_updated"]
+        .as_array()
+        .expect("refs_updated array")
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        refs.contains(&code_ref(&stream).as_str()),
+        "the code ref was recorded as updated: {refs:?}",
+    );
+
+    let update = server_records
+        .iter()
+        .find(|r| r["kind"] == "update_worktree")
+        .expect("an update_worktree record");
+    assert_eq!(update["stream"], stream_arg);
+    assert!(
+        update["total_ms"].as_f64().is_some(),
+        "update_worktree total_ms present",
     );
 }
 

@@ -22,6 +22,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0010](0010-receive-pack-transport-wiring.md) | `receive-pack` transport wiring | accepted |
 | [0011](0011-worktree-reassembly-mechanics.md) | Worktree reassembly mechanics | accepted |
 | [0012](0012-namespacing-managed-refs-per-stream.md) | Namespacing managed refs per stream | accepted |
+| [0013](0013-recording-operation-metrics.md) | Recording operation metrics | accepted |
 
 ## Open research tasks
 
