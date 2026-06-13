@@ -47,8 +47,8 @@
 //! carved out, so an unrelated large ignored tree (e.g. `node_modules`) is
 //! traversed even when nothing in it is selected. Research 0004 accepts this
 //! O(N·M)-once-per-sync cost over a curated list; pruning subtrees that cannot
-//! contain a match is tracked as a follow-up in
-//! `docs/follow-ups/prune-force-include-walk.md`.
+//! contain a match is tracked as a follow-up:
+//! <https://github.com/jeffparsons/git-full-send/issues/39>.
 
 use std::path::{Path, PathBuf};
 
