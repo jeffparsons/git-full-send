@@ -173,10 +173,10 @@ fn load_search(
     if let Some(bytes) = read_optional(&project)? {
         search.add_patterns_buffer(&bytes, project, None, parse);
     }
-    if let Some(user) = user_include {
-        if let Some(bytes) = read_optional(user)? {
-            search.add_patterns_buffer(&bytes, user, None, parse);
-        }
+    if let Some(user) = user_include
+        && let Some(bytes) = read_optional(user)?
+    {
+        search.add_patterns_buffer(&bytes, user, None, parse);
     }
     Ok(search)
 }
@@ -188,10 +188,10 @@ fn load_search(
 /// `$HOME/.config/git-full-send/include`. The returned path may not exist — a
 /// missing file is treated as an empty layer by [`select_extra_paths`].
 pub fn user_include_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os(USER_INCLUDE_ENV) {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
-        }
+    if let Some(p) = std::env::var_os(USER_INCLUDE_ENV)
+        && !p.is_empty()
+    {
+        return Some(PathBuf::from(p));
     }
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
