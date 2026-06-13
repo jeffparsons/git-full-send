@@ -259,7 +259,16 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 /// produced so the chain (and the push alongside `code`) stays uniform. The
 /// user's branch, index, and working tree are untouched; only the stream's
 /// `extra` ref (`gfs_common::extra_ref`) is created or force-updated.
-pub fn encode_extra(repo_dir: &Path, stream: &StreamId) -> Result<ExtraOutcome, EncodeError> {
+///
+/// `user_include` overrides the per-user include file (the `--user-include` CLI
+/// flag); `None` falls back to the environment-resolved path
+/// ([`crate::select::user_include_path`]). The committed project-level file
+/// ([`crate::select::PROJECT_INCLUDE_FILE`]) is always consulted regardless.
+pub fn encode_extra(
+    repo_dir: &Path,
+    stream: &StreamId,
+    user_include: Option<&Path>,
+) -> Result<ExtraOutcome, EncodeError> {
     let repo = gix::discover(repo_dir).map_err(|source| EncodeError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -285,7 +294,7 @@ pub fn encode_extra(repo_dir: &Path, stream: &StreamId) -> Result<ExtraOutcome, 
     };
 
     // Build the `extra` tree from the selected paths, seeded from the empty tree.
-    let paths = crate::select::select_extra_paths(&workdir)?;
+    let paths = crate::select::select_extra_paths_with(&workdir, user_include)?;
     let empty_tree = repo.empty_tree().id;
     let mut editor = repo
         .edit_tree(empty_tree)

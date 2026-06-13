@@ -43,6 +43,11 @@ struct SyncArgs {
     /// `git-full-send.stream-id`, generated and persisted on first use.
     #[arg(long, value_name = "ID")]
     stream_id: Option<StreamId>,
+    /// Per-user force-include pattern file. Overrides the
+    /// `GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` lookup; the committed
+    /// project file (`.git-full-send-include`) is always consulted as well.
+    #[arg(long, value_name = "PATH")]
+    user_include: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -93,7 +98,7 @@ async fn main() -> Result<()> {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
-            gfs_client::sync(repo, args.remote, args.stream_id).await?;
+            gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
         }
         Command::Listen(args) => gfs_server::listen(args.addr, args.repo).await?,
         Command::UpdateWorktree(args) => {

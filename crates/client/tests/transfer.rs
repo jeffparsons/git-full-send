@@ -72,9 +72,14 @@ async fn push_lands_code_ref_and_objects() {
 
     let stream = test_stream();
     let code = code_ref(&stream);
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     // The server's `code` ref now matches the client's encoded tip…
     let client_tip = git(c, &["rev-parse", &code]);
@@ -114,9 +119,14 @@ async fn push_lands_extra_ref_alongside_code() {
     write_file(c, "dist/app.js", "built");
 
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     // The `extra` ref landed on the server in the same exchange as `code`, with
     // the selected build output at its identity path…
@@ -157,9 +167,14 @@ async fn retains_pushed_tip_on_the_client() {
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     assert_eq!(
         git(c, &["rev-parse", &sent_ref(&stream)]).trim(),
@@ -211,16 +226,26 @@ async fn second_sync_advances_the_server() {
     commit_all(c, "baseline");
     let stream = test_stream();
     let code = code_ref(&stream);
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("first sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
     let first = git(server.path(), &["rev-parse", &code]);
 
     // Change the working tree and sync again (the retained tip is the base).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("second sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
     let second = git(server.path(), &["rev-parse", &code]);
 
     assert_ne!(first.trim(), second.trim(), "the server code ref advanced");
@@ -248,9 +273,14 @@ async fn update_worktree_makes_worktree_match_code() {
     write_file(c, "new.txt", "v1");
 
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     // A disposable worktree pre-seeded with bait: a remote-side edit to a file
     // whose synced blob is unchanged, and a stale file absent from the tree.
@@ -296,9 +326,14 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
 
     // First sync + checkout: the worktree gains gone.txt.
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("first sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
     gfs_server::update_worktree(
@@ -316,9 +351,14 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     // Delete gone.txt on the client and sync again; the same worktree updates.
     std::fs::remove_file(c.join("gone.txt")).expect("remove gone.txt");
     commit_all(c, "drop gone.txt");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("second sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
     gfs_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
@@ -353,9 +393,14 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
     write_file(c, "dist/app.js", "built");
 
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
@@ -401,9 +446,14 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
 
     // First sync + checkout: both force-included files land in the worktree.
     let stream = test_stream();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("first sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
     gfs_server::update_worktree(
@@ -421,9 +471,14 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
 
     // Drop one force-included file from the selection and re-sync the same worktree.
     std::fs::remove_file(c.join("dist/vendor.js")).expect("remove vendor.js");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("second sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
     gfs_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
@@ -472,6 +527,7 @@ async fn two_streams_do_not_clobber_each_other() {
         alice.path().to_path_buf(),
         addr.to_string(),
         Some(alice_stream.clone()),
+        None,
     )
     .await
     .expect("alice sync");
@@ -484,6 +540,7 @@ async fn two_streams_do_not_clobber_each_other() {
         bob.path().to_path_buf(),
         addr.to_string(),
         Some(bob_stream.clone()),
+        None,
     )
     .await
     .expect("bob sync");
@@ -550,9 +607,14 @@ async fn branch_shaped_stream_id_round_trips() {
 
     // A slash-containing (branch-shaped) id must survive encode → push → checkout.
     let stream = StreamId::new("feature/foo").unwrap();
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
 
     let wt = tempfile::tempdir().expect("worktree dir");
     gfs_server::update_worktree(
@@ -584,7 +646,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     commit_all(c, "baseline");
 
     // No explicit stream: one is generated and persisted to the repo config.
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None)
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None)
         .await
         .expect("first sync");
     let id = git(
@@ -602,7 +664,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     // A second default sync reuses the same stream (the server ref advances in
     // place rather than spawning a second stream).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None)
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None)
         .await
         .expect("second sync");
     let second = git(server.path(), &["rev-parse", &code]);

@@ -367,6 +367,8 @@ dependencies = [
  "gfs-client",
  "gfs-common",
  "gfs-server",
+ "tempfile",
+ "test-support",
  "tokio",
  "tracing",
  "tracing-subscriber",

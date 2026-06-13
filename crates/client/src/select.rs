@@ -108,7 +108,25 @@ pub enum SelectError {
 /// working tree to enumerate the matches. With no pattern files present the
 /// result is empty (the caller still writes an empty `extra` tree).
 pub fn select_extra_paths(workdir: &Path) -> Result<Vec<BString>, SelectError> {
-    select_in(workdir, user_include_path().as_deref())
+    select_extra_paths_with(workdir, None)
+}
+
+/// As [`select_extra_paths`], but with the per-user include file chosen
+/// explicitly.
+///
+/// `user_include_override` takes precedence when `Some` (the `--user-include`
+/// CLI flag); when `None` the per-user file is resolved from the environment via
+/// [`user_include_path`] exactly as [`select_extra_paths`] does. A `Some` path
+/// that does not exist is treated as an empty layer, like any other missing
+/// pattern file.
+pub fn select_extra_paths_with(
+    workdir: &Path,
+    user_include_override: Option<&Path>,
+) -> Result<Vec<BString>, SelectError> {
+    match user_include_override {
+        Some(path) => select_in(workdir, Some(path)),
+        None => select_in(workdir, user_include_path().as_deref()),
+    }
 }
 
 /// The core of [`select_extra_paths`] with the per-user file path supplied
