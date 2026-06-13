@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. a new push to a PR).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The quality bar held by hand until now: fmt, clippy, and the test suite,
+  # on the stable toolchain pinned by rust-toolchain.toml (which also installs
+  # the rustfmt + clippy components). `git` is preinstalled on the runner, which
+  # the tool and integration tests shell out to (ADR-0002).
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo test --all
+        run: cargo test --all
+
+  # Keep the declared MSRV honest by building on exactly that toolchain. The
+  # repo's rust-toolchain.toml pins `stable`, which would otherwise override the
+  # toolchain selected below, so remove it first.
+  msrv:
+    name: build on MSRV (1.94)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove rust-toolchain.toml so it can't override the MSRV toolchain
+        run: rm rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV
+        run: cargo check --workspace --all-targets --all-features
