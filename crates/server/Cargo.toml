@@ -9,7 +9,10 @@ repository.workspace = true
 
 [dependencies]
 gfs-common.workspace = true
-gix.workspace = true
+# `tree-editor` (overlaying the `extra` tree onto `code` without a scratch index)
+# is not in gix's default feature set; object access arrives via its defaults.
+# See ADR-0002.
+gix = { workspace = true, features = ["tree-editor"] }
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }

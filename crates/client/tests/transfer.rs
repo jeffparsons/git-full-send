@@ -339,6 +339,126 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
 }
 
 #[tokio::test]
+async fn update_worktree_overlays_extra_at_identity_paths() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    // Committed code plus a gitignored build output force-included into `extra`.
+    write_file(c, "src/main.rs", "fn main() {}");
+    write_file(c, ".gitignore", "dist/\n");
+    write_file(c, ".git-full-send-include", "dist/\n");
+    commit_all(c, "baseline");
+    write_file(c, "dist/app.js", "built");
+
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
+        .await
+        .expect("sync succeeds");
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("update-worktree succeeds");
+
+    // The force-included build output lands over the code checkout at its
+    // identity path, with its content intact…
+    assert_eq!(
+        std::fs::read_to_string(wt.join("dist/app.js")).expect("read dist/app.js"),
+        "built",
+        "the force-included file lands at its identity path",
+    );
+    // …and the worktree is exactly the union of the code and extra trees (the
+    // overlay added the extra file without disturbing the code checkout).
+    let mut expected = tree_paths(server.path(), &code_ref(&stream));
+    expected.extend(tree_paths(server.path(), &extra_ref(&stream)));
+    assert_eq!(
+        worktree_files(wt),
+        expected,
+        "worktree equals the code tree overlaid with the extra tree",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_removes_extra_dropped_between_syncs() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "keep.txt", "code");
+    write_file(c, ".gitignore", "dist/\n");
+    write_file(c, ".git-full-send-include", "dist/\n");
+    commit_all(c, "baseline");
+    write_file(c, "dist/app.js", "built");
+    write_file(c, "dist/vendor.js", "vendored");
+
+    // First sync + checkout: both force-included files land in the worktree.
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
+        .await
+        .expect("first sync");
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("first update-worktree");
+    assert!(wt.join("dist/app.js").exists(), "app.js checked out first");
+    assert!(
+        wt.join("dist/vendor.js").exists(),
+        "vendor.js checked out first"
+    );
+
+    // Drop one force-included file from the selection and re-sync the same worktree.
+    std::fs::remove_file(c.join("dist/vendor.js")).expect("remove vendor.js");
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
+        .await
+        .expect("second sync");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+    )
+    .await
+    .expect("second update-worktree");
+
+    // The dropped extra file is gone…
+    assert!(
+        !wt.join("dist/vendor.js").exists(),
+        "an extra file dropped between syncs is removed from the worktree",
+    );
+    // …while the surviving extra file and the code-tree file are untouched.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("dist/app.js")).expect("read app.js"),
+        "built",
+        "the surviving extra file remains",
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("keep.txt")).expect("read keep.txt"),
+        "code",
+        "the code-tree file is unaffected",
+    );
+    // The worktree is exactly the union of the (now smaller) code and extra trees.
+    let mut expected = tree_paths(server.path(), &code_ref(&stream));
+    expected.extend(tree_paths(server.path(), &extra_ref(&stream)));
+    assert_eq!(
+        worktree_files(wt),
+        expected,
+        "worktree matches the code tree overlaid with the extra tree",
+    );
+}
+
+#[tokio::test]
 async fn two_streams_do_not_clobber_each_other() {
     let server = init_bare_repo();
     let addr = start_server(server.path());

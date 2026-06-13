@@ -65,6 +65,12 @@ pub enum ServerError {
         /// The `code` ref we looked for.
         ref_name: String,
     },
+    /// Resolving the stream's `extra` tree (when present) failed.
+    #[error("could not resolve the `extra` tree")]
+    ResolveExtra(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Building the combined `code`+`extra` tree to check out failed.
+    #[error("could not build the combined worktree tree")]
+    BuildTree(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An explicitly requested stream id was malformed.
     #[error(transparent)]
     StreamId(#[from] gfs_common::StreamIdError),
@@ -311,11 +317,20 @@ pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerErro
 
 /// The blocking body of [`update_worktree`].
 ///
-/// Reassembles the worktree with the persistent-index pipeline of ADR-0011:
-/// resolve the `code` tree, then `read-tree --reset -u` (reset index + worktree
-/// to the tree, discarding remote-local edits and removing dropped files) and
-/// `clean -fdx` (prune untracked leftovers), keyed on a per-worktree index so
-/// Git's stat cache keeps the work proportional to the sync delta.
+/// Reassembles the worktree with the persistent-index pipeline of ADR-0011.
+/// First resolve the `code` tree and overlay the stream's `extra` tree
+/// (force-included, normally-gitignored files — ADR-0007) onto it at identity
+/// paths, producing a single **combined** tree; then `read-tree --reset -u`
+/// (reset index + worktree to that tree, discarding remote-local edits and
+/// removing files dropped since the last sync) and `clean -fdx` (prune untracked
+/// leftovers), keyed on a per-worktree index so Git's stat cache keeps the work
+/// proportional to the sync delta.
+///
+/// Folding `extra` into the checked-out tree makes the volatile force-include set
+/// fall out of the same machinery as `code`: dropped `extra` files were in the
+/// prior combined index and are removed by `--reset -u`, while surviving `extra`
+/// files are index-tracked so `clean -fdx`'s `-x` leaves them untouched and only
+/// prunes genuine remote-local junk.
 fn update_worktree_blocking(
     repo: &Path,
     worktree: &Path,
@@ -325,8 +340,11 @@ fn update_worktree_blocking(
     let git_dir = discovered.git_dir().to_path_buf();
 
     // Resolve the stream's `code` tree first, so a never-synced stream fails
-    // cleanly before any worktree mutation.
-    let tree = resolve_code_tree(&git_dir, stream)?;
+    // cleanly before any worktree mutation. Then overlay `extra` (absent ⇒
+    // nothing to overlay) onto it at identity paths to get the tree to check out.
+    let code_tree = resolve_code_tree(&git_dir, stream)?;
+    let extra_tree = resolve_extra_tree(&git_dir, stream)?;
+    let tree = overlay_extra_onto_code(&discovered, &code_tree, extra_tree.as_deref())?;
 
     // The worktree, and the per-worktree index that records what we last checked
     // out (kept under the git dir, never inside the worktree itself — `clean`
@@ -376,6 +394,96 @@ fn resolve_code_tree(git_dir: &Path, stream: &gfs_common::StreamId) -> Result<St
         return Err(ServerError::MissingCodeRef { ref_name: code_ref });
     }
     Ok(tree)
+}
+
+/// Resolve `stream`'s `extra` ref (`gfs_common::extra_ref`) to its tree id, or
+/// `None` when the ref is absent.
+///
+/// Unlike the `code` ref, a missing `extra` ref is **not** an error: it means
+/// this stream has never carried force-included files (the client always pushes
+/// `extra` alongside `code`, but we stay robust if it hasn't), so there is simply
+/// nothing to overlay. `rev-parse --verify --quiet` exits non-zero with empty
+/// output when the ref is absent.
+fn resolve_extra_tree(
+    git_dir: &Path,
+    stream: &gfs_common::StreamId,
+) -> Result<Option<String>, ServerError> {
+    let extra_ref = gfs_common::extra_ref(stream);
+    let spec = format!("{extra_ref}^{{tree}}");
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(&spec)
+        .output()
+        .map_err(|source| ServerError::RunGit {
+            step: "rev-parse",
+            source,
+        })?;
+    let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() || tree.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(tree))
+}
+
+/// Overlay the `extra` tree onto the `code` tree at identity paths and return the
+/// id of the resulting combined tree.
+///
+/// Seeds a gix tree `Editor` with `code` and upserts every `extra` leaf (blob,
+/// executable, or symlink) at its full repo-relative path, so `extra` wins on any
+/// path collision (ADR-0007's same-path overlay). With no `extra` tree there is
+/// nothing to overlay and the `code` tree id is returned unchanged. The combined
+/// tree's objects are written to the repo's object database so the subsequent
+/// `git read-tree` (a separate process) can resolve it.
+fn overlay_extra_onto_code(
+    repo: &gix::Repository,
+    code_tree: &str,
+    extra_tree: Option<&str>,
+) -> Result<String, ServerError> {
+    let Some(extra_tree) = extra_tree else {
+        return Ok(code_tree.to_string());
+    };
+
+    let code_id = gix::ObjectId::from_hex(code_tree.as_bytes())
+        .map_err(|e| ServerError::BuildTree(Box::new(e)))?;
+    let extra_id = gix::ObjectId::from_hex(extra_tree.as_bytes())
+        .map_err(|e| ServerError::ResolveExtra(Box::new(e)))?;
+
+    let mut editor = repo
+        .edit_tree(code_id)
+        .map_err(|e| ServerError::BuildTree(Box::new(e)))?;
+    let extra = repo
+        .find_tree(extra_id)
+        .map_err(|e| ServerError::ResolveExtra(Box::new(e)))?;
+
+    // Record every entry of the `extra` tree with its full path, then upsert the
+    // leaves onto the `code`-seeded editor (the editor recreates the intermediate
+    // trees from the slash-separated paths). Tree entries are skipped: they are
+    // implied by their leaves.
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    extra
+        .traverse()
+        .breadthfirst(&mut recorder)
+        .map_err(|e| ServerError::ResolveExtra(Box::new(e)))?;
+    for entry in &recorder.records {
+        if entry.mode.is_tree() {
+            continue;
+        }
+        editor
+            .upsert(
+                gix::bstr::BStr::new(&entry.filepath),
+                entry.mode.kind(),
+                entry.oid,
+            )
+            .map_err(|e| ServerError::BuildTree(Box::new(e)))?;
+    }
+
+    let combined = editor
+        .write()
+        .map_err(|e| ServerError::BuildTree(Box::new(e)))?
+        .detach();
+    Ok(combined.to_string())
 }
 
 /// The path of the persistent index for `worktree`, under the git dir.
