@@ -10,4 +10,12 @@ repository.workspace = true
 [dependencies]
 bstr.workspace = true
 gix-validate.workspace = true
+# Metrics records serialised as JSON Lines, written best-effort to a per-side
+# sink (issue #42, ADR-0013); `tracing` carries the warning when a write fails.
+serde = { workspace = true }
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

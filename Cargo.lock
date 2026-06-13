@@ -367,6 +367,7 @@ dependencies = [
  "gfs-client",
  "gfs-common",
  "gfs-server",
+ "serde_json",
  "tempfile",
  "test-support",
  "tokio",
@@ -383,6 +384,7 @@ dependencies = [
  "gfs-server",
  "gix",
  "rustix",
+ "serde",
  "tempfile",
  "test-support",
  "thiserror",
@@ -396,7 +398,11 @@ version = "0.0.0"
 dependencies = [
  "bstr",
  "gix-validate",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -405,6 +411,7 @@ version = "0.0.0"
 dependencies = [
  "gfs-common",
  "gix",
+ "serde",
  "tempfile",
  "test-support",
  "thiserror",
@@ -1744,6 +1751,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

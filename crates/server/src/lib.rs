@@ -23,13 +23,25 @@
 //!
 //! [ADR-0006]: https://github.com/jeffparsons/git-full-send/blob/main/docs/adr/0006-transport-and-connectivity.md
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::OwnedFd;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use tempfile::TempDir;
 use thiserror::Error;
+
+mod metrics;
+
+/// Environment variable naming the file the `pre-receive` hook appends accepted
+/// ref names to, so [`handle_connection`] can record which refs a push updated
+/// (issue #42). Set per connection to a unique path.
+const ACCEPTED_REFS_ENV: &str = "GFS_ACCEPTED_REFS_FILE";
+
+/// Milliseconds elapsed since `start`, for a metrics timing field.
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
 
 /// Errors returned by server operations.
 #[derive(Debug, Error)]
@@ -111,6 +123,9 @@ pub enum ServerError {
 pub struct Listener {
     listener: TcpListener,
     repo: PathBuf,
+    /// The repository's git dir, resolved once at bind time, where the metrics
+    /// sink lives (`<git-dir>/git-full-send/metrics.jsonl` — issue #42).
+    git_dir: PathBuf,
     /// The gfs-managed hooks directory; kept alive for the listener's lifetime
     /// so the `pre-receive` hook persists for every connection.
     hooks: TempDir,
@@ -130,12 +145,16 @@ impl Listener {
 /// Validates that `repo` is a Git repository and materialises the namespace
 /// `pre-receive` hook, but does not yet accept connections — call [`serve`].
 pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
-    gix::discover(&repo).map_err(|_| ServerError::NotARepo(repo.clone()))?;
+    let git_dir = gix::discover(&repo)
+        .map_err(|_| ServerError::NotARepo(repo.clone()))?
+        .git_dir()
+        .to_path_buf();
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind { addr, source })?;
     let hooks = install_hooks()?;
     Ok(Listener {
         listener,
         repo,
+        git_dir,
         hooks,
     })
 }
@@ -149,6 +168,7 @@ pub fn serve(listener: Listener) -> Result<(), ServerError> {
     let Listener {
         listener,
         repo,
+        git_dir,
         hooks,
     } = listener;
     let hooks_dir = hooks.path().to_path_buf();
@@ -157,9 +177,10 @@ pub fn serve(listener: Listener) -> Result<(), ServerError> {
         match stream {
             Ok(sock) => {
                 let repo = repo.clone();
+                let git_dir = git_dir.clone();
                 let hooks_dir = hooks_dir.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(sock, &repo, &hooks_dir) {
+                    if let Err(error) = handle_connection(sock, &repo, &git_dir, &hooks_dir) {
                         tracing::warn!(%error, "connection handler failed");
                     }
                 });
@@ -184,33 +205,82 @@ pub async fn listen(addr: SocketAddr, repo: PathBuf) -> Result<(), ServerError> 
         .map_err(|e| ServerError::Join(e.to_string()))?
 }
 
-/// Handle one connection: spawn `git receive-pack` with the socket as its
-/// stdin/stdout, confining writes to the namespace and disabling autogc.
-fn handle_connection(sock: TcpStream, repo: &Path, hooks_dir: &Path) -> Result<(), ServerError> {
-    let out = sock.try_clone().map_err(ServerError::Io)?;
+/// Handle one connection: spawn `git receive-pack` and pump the raw
+/// receive-pack stream between the socket and the child, confining writes to the
+/// namespace and disabling autogc.
+///
+/// Unlike the obvious "hand the socket straight to the child as its stdin/stdout"
+/// wiring, we copy the bytes through two threads so we can *count* them for the
+/// metrics record (issue #42): the bytes seen are exactly the same raw stream
+/// (no framing — ADR-0005 is unchanged), just observed in transit. The added
+/// localhost-bandwidth copy is negligible against git's own pack work.
+fn handle_connection(
+    sock: TcpStream,
+    repo: &Path,
+    git_dir: &Path,
+    hooks_dir: &Path,
+) -> Result<(), ServerError> {
+    use std::io::Read;
+
     let hooks_path = format!("core.hooksPath={}", hooks_dir.display());
 
-    let mut child = Command::new("git")
+    // A unique per-connection file the hook appends accepted ref names to.
+    // Best-effort: if it can't be created we simply record no refs.
+    let accepted_refs = tempfile::NamedTempFile::new().ok();
+
+    let started = Instant::now();
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg("receive.autogc=false")
         .arg("-c")
         .arg(&hooks_path)
         .arg("receive-pack")
         .arg(repo)
-        .stdin(Stdio::from(OwnedFd::from(sock)))
-        .stdout(Stdio::from(OwnedFd::from(out)))
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ServerError::Spawn)?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(file) = &accepted_refs {
+        command.env(ACCEPTED_REFS_ENV, file.path());
+    }
+    let mut child = command.spawn().map_err(ServerError::Spawn)?;
+
+    let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let mut child_stdout = child.stdout.take().expect("piped stdout");
+
+    // Two clones drive the pumps; a third stays here so we can shut the socket
+    // down after `receive-pack` exits, sending the client its FIN and unblocking
+    // the inbound pump's blocking read.
+    let mut sock_in = sock.try_clone().map_err(ServerError::Io)?;
+    let mut sock_out = sock.try_clone().map_err(ServerError::Io)?;
+
+    // Inbound: socket → child stdin (the pushed pack). A broken-pipe error once
+    // the child has exited is expected, not a failure; we keep the byte count.
+    let in_pump = std::thread::spawn(move || {
+        let n = std::io::copy(&mut sock_in, &mut child_stdin).unwrap_or(0);
+        drop(child_stdin); // close the child's stdin
+        n
+    });
+    // Outbound: child stdout → socket (the report-status).
+    let out_pump =
+        std::thread::spawn(move || std::io::copy(&mut child_stdout, &mut sock_out).unwrap_or(0));
 
     // Drain receive-pack's stderr (progress, hook rejections) to the log.
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
-        use std::io::Read;
         let _ = pipe.read_to_string(&mut stderr);
     }
     let status = child.wait().map_err(ServerError::Io)?;
+
+    // The child has exited, so its stdout has hit EOF; join the outbound pump to
+    // be sure the whole report-status reached the socket, then shut the socket
+    // down to send the client its FIN and unblock the inbound pump.
+    let bytes_out = out_pump.join().unwrap_or(0);
+    let _ = sock.shutdown(Shutdown::Both);
+    let bytes_in = in_pump.join().unwrap_or(0);
+
     let stderr = stderr.trim();
+    let refs_updated = accepted_refs.map(read_accepted_refs).unwrap_or_default();
 
     // A non-zero exit (e.g. the namespace hook declining a push) is the
     // per-connection outcome, not a server fault: log it and keep serving.
@@ -221,7 +291,43 @@ fn handle_connection(sock: TcpStream, repo: &Path, hooks_dir: &Path) -> Result<(
     } else {
         tracing::warn!(?status, %stderr, "receive-pack exited non-zero");
     }
+    tracing::info!(
+        success = status.success(),
+        bytes_in,
+        bytes_out,
+        refs = refs_updated.len(),
+        duration_ms = elapsed_ms(started),
+        "received git push"
+    );
+
+    // Best-effort metrics record (ADR-0013), even on a failed receive.
+    metrics::record(
+        git_dir,
+        &metrics::ReceiveRecord::new(
+            elapsed_ms(started),
+            status.success(),
+            status.code(),
+            bytes_in,
+            bytes_out,
+            refs_updated,
+        ),
+    );
     Ok(())
+}
+
+/// Read the hook's accepted-ref file into a deduplicated, order-preserving list
+/// of ref names (one per line). A missing/unreadable file yields no refs.
+fn read_accepted_refs(file: tempfile::NamedTempFile) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Ok(contents) = std::fs::read_to_string(file.path()) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !refs.iter().any(|r| r == line) {
+                refs.push(line.to_string());
+            }
+        }
+    }
+    refs
 }
 
 /// Materialise the namespace-confining `pre-receive` hook into a fresh
@@ -243,14 +349,18 @@ fn install_hooks() -> Result<TempDir, ServerError> {
 }
 
 /// The `pre-receive` hook body: reject any updated ref outside the
-/// [`gfs_common::REF_NAMESPACE`] namespace (ADR-0005).
+/// [`gfs_common::REF_NAMESPACE`] namespace (ADR-0005), and append each accepted
+/// ref to the file named by [`ACCEPTED_REFS_ENV`] so the connection handler can
+/// record which refs the push updated (issue #42).
 fn pre_receive_hook() -> String {
     let ns = gfs_common::REF_NAMESPACE;
+    let refs_env = ACCEPTED_REFS_ENV;
     format!(
         "#!/bin/sh\n\
          while read -r old new ref; do\n\
          \tcase \"$ref\" in\n\
-         \t{ns}*) ;;\n\
+         \t{ns}*)\n\
+         \t\t[ -n \"${refs_env}\" ] && printf '%s\\n' \"$ref\" >> \"${refs_env}\" ;;\n\
          \t*) echo \"git-full-send: refusing ref outside {ns}: $ref\" >&2; exit 1 ;;\n\
          \tesac\n\
          done\n",
@@ -339,12 +449,17 @@ fn update_worktree_blocking(
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let git_dir = discovered.git_dir().to_path_buf();
 
+    // Time each phase for the per-checkout metrics record (issue #42, ADR-0013).
+    let t_total = Instant::now();
+
     // Resolve the stream's `code` tree first, so a never-synced stream fails
     // cleanly before any worktree mutation. Then overlay `extra` (absent ⇒
     // nothing to overlay) onto it at identity paths to get the tree to check out.
+    let t = Instant::now();
     let code_tree = resolve_code_tree(&git_dir, stream)?;
     let extra_tree = resolve_extra_tree(&git_dir, stream)?;
     let tree = overlay_extra_onto_code(&discovered, &code_tree, extra_tree.as_deref())?;
+    let resolve_ms = elapsed_ms(t);
 
     // The worktree, and the per-worktree index that records what we last checked
     // out (kept under the git dir, never inside the worktree itself — `clean`
@@ -353,6 +468,7 @@ fn update_worktree_blocking(
     std::fs::create_dir_all(worktree).map_err(ServerError::CreateWorktree)?;
     let index = worktree_index_path(&git_dir, worktree)?;
 
+    let t = Instant::now();
     run_git_step(
         "read-tree",
         &git_dir,
@@ -360,6 +476,9 @@ fn update_worktree_blocking(
         &index,
         &["read-tree", "--reset", "-u", &tree],
     )?;
+    let read_tree_ms = elapsed_ms(t);
+
+    let t = Instant::now();
     run_git_step(
         "clean",
         &git_dir,
@@ -367,6 +486,28 @@ fn update_worktree_blocking(
         &index,
         &["clean", "-d", "-f", "-x"],
     )?;
+    let clean_ms = elapsed_ms(t);
+
+    let total_ms = elapsed_ms(t_total);
+    tracing::info!(
+        stream = %stream, worktree = %worktree.display(),
+        total_ms, resolve_ms, read_tree_ms, clean_ms,
+        "updated worktree"
+    );
+
+    // Best-effort metrics record (ADR-0013).
+    metrics::record(
+        &git_dir,
+        &metrics::UpdateWorktreeRecord::new(
+            stream.to_string(),
+            worktree.display().to_string(),
+            total_ms,
+            resolve_ms,
+            read_tree_ms,
+            clean_ms,
+            tree,
+        ),
+    );
     Ok(())
 }
 
@@ -543,5 +684,13 @@ mod tests {
         let hook = pre_receive_hook();
         assert!(hook.contains(gfs_common::REF_NAMESPACE));
         assert!(hook.starts_with("#!/bin/sh"));
+    }
+
+    #[test]
+    fn hook_records_accepted_refs_to_the_env_file() {
+        let hook = pre_receive_hook();
+        // Accepted refs are appended to the file named by the env var so the
+        // connection handler can report which refs a push updated (issue #42).
+        assert!(hook.contains(ACCEPTED_REFS_ENV));
     }
 }

@@ -25,5 +25,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # The end-to-end test stands up an in-process server and temp repos, then drives
 # the built `git-full-send` binary as a subprocess.
 gfs-server.workspace = true
+# Parse the per-operation metrics records the round-trip writes (issue #42).
+serde_json.workspace = true
 tempfile.workspace = true
 test-support.workspace = true

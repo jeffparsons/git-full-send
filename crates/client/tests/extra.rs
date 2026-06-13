@@ -72,6 +72,41 @@ fn selects_gitignored_build_outputs_with_a_carve_out() {
 }
 
 #[test]
+fn extra_layer_stats_count_the_full_selected_set() {
+    // The metrics record (issue #42) reports the extra layer's full selected
+    // set: number of files and their summed bytes.
+    let repo = init_temp_repo();
+    let p = repo.path();
+
+    write_file(p, ".gitignore", "dist/\n");
+    write_file(p, ".git-full-send-include", "dist/\n");
+    commit_all(p, "baseline");
+    write_file(p, "dist/app.js", "js!"); // 3 bytes
+    write_file(p, "dist/app.wasm", "wasm"); // 4 bytes
+
+    let outcome = encode_extra(p, &test_stream(), None).expect("encode_extra succeeds");
+
+    assert_eq!(outcome.stats.files, 2, "both selected files counted");
+    assert_eq!(
+        outcome.stats.bytes,
+        ("js!".len() + "wasm".len()) as u64,
+        "summed bytes of the selected files",
+    );
+    assert_eq!(
+        git(
+            p,
+            &[
+                "rev-parse",
+                &format!("{}^{{tree}}", extra_ref(&test_stream()))
+            ]
+        )
+        .trim(),
+        outcome.tree.to_string(),
+        "the record's tree id matches the written ref",
+    );
+}
+
+#[test]
 fn empty_selection_still_produces_an_extra_commit() {
     let repo = init_temp_repo();
     let p = repo.path();

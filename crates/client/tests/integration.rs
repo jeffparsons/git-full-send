@@ -223,3 +223,43 @@ fn preserves_executable_bit_and_symlinks() {
         "untracked symlink preserved as its target",
     );
 }
+
+#[test]
+fn code_layer_stats_count_the_working_tree_delta() {
+    // The metrics record (issue #42) reports the code layer's index→worktree
+    // delta: files overlaid + their bytes, and files removed. Unchanged tracked
+    // files (the index base) are not counted.
+    let repo = init_temp_repo();
+    let p = repo.path();
+
+    write_file(p, "unchanged.txt", "stays the same");
+    write_file(p, "modify.txt", "orig");
+    write_file(p, "delete.txt", "bye");
+    commit_all(p, "baseline");
+
+    write_file(p, "modify.txt", "edited!"); // 7 bytes overlaid
+    std::fs::remove_file(p.join("delete.txt")).unwrap(); // 1 removed
+    write_file(p, "added.txt", "fresh"); // 5 bytes overlaid, untracked
+
+    let outcome = encode(p, &test_stream()).expect("encode succeeds");
+
+    assert_eq!(outcome.stats.files_overlaid, 2, "modify + added");
+    assert_eq!(outcome.stats.files_removed, 1, "delete");
+    assert_eq!(
+        outcome.stats.bytes_overlaid,
+        ("edited!".len() + "fresh".len()) as u64,
+        "summed bytes of the overlaid files only",
+    );
+    // The tree/commit ids the record carries match the written ref.
+    assert_eq!(
+        git(
+            p,
+            &[
+                "rev-parse",
+                &format!("{}^{{tree}}", code_ref(&test_stream()))
+            ]
+        )
+        .trim(),
+        outcome.tree.to_string(),
+    );
+}
