@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 
-use gfs_common::{StreamId, code_ref, sent_ref};
+use gfs_common::{StreamId, code_ref, extra_ref, sent_extra_ref, sent_ref};
 use test_support::{commit_all, git, init_bare_repo, init_temp_repo, write_file};
 
 /// A fixed stream id for tests that only need one stream, so the produced refs
@@ -97,6 +97,52 @@ async fn push_lands_code_ref_and_objects() {
             &["cat-file", "blob", &format!("{code}:committed.txt")]
         ),
         "modified",
+    );
+}
+
+#[tokio::test]
+async fn push_lands_extra_ref_alongside_code() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    // A force-include set pulling a gitignored build output into `extra`.
+    write_file(c, ".gitignore", "dist/\n");
+    write_file(c, ".git-full-send-include", "dist/\n");
+    commit_all(c, "baseline");
+    write_file(c, "dist/app.js", "built");
+
+    let stream = test_stream();
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(stream.clone()))
+        .await
+        .expect("sync succeeds");
+
+    // The `extra` ref landed on the server in the same exchange as `code`, with
+    // the selected build output at its identity path…
+    let extra = extra_ref(&stream);
+    assert_eq!(
+        tree_paths(server.path(), &extra),
+        BTreeSet::from(["dist/app.js".to_string()]),
+        "the server has the extra tree",
+    );
+    assert_eq!(
+        git(
+            server.path(),
+            &["cat-file", "blob", &format!("{extra}:dist/app.js")]
+        ),
+        "built",
+    );
+    // …the server `code` ref does not carry the gitignored output…
+    assert!(
+        !tree_paths(server.path(), &code_ref(&stream)).contains("dist/app.js"),
+        "the gitignored output rides in `extra`, not `code`",
+    );
+    // …and the client retained the pushed `extra` tip as the next delta base.
+    assert_eq!(
+        git(c, &["rev-parse", &sent_extra_ref(&stream)]).trim(),
+        git(c, &["rev-parse", &extra]).trim(),
+        "the retention ref pins the pushed extra tip",
     );
 }
 

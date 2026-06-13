@@ -38,6 +38,7 @@ use thiserror::Error;
 const SYNTH_NAME: &str = "git-full-send";
 const SYNTH_EMAIL: &str = "git-full-send@localhost";
 const SYNTH_MESSAGE: &str = "git-full-send: working-tree snapshot";
+const SYNTH_EXTRA_MESSAGE: &str = "git-full-send: extra (force-included) snapshot";
 
 /// The result of a successful [`encode`].
 #[derive(Debug, Clone)]
@@ -47,6 +48,16 @@ pub struct EncodeOutcome {
     pub commit: gix::ObjectId,
     /// The `code` ref that was written (`gfs_common::code_ref` for the stream).
     pub code_ref: String,
+}
+
+/// The result of a successful [`encode_extra`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ExtraOutcome {
+    /// The commit the stream's `extra` ref now points at.
+    pub commit: gix::ObjectId,
+    /// The `extra` ref that was written (`gfs_common::extra_ref` for the stream).
+    pub extra_ref: String,
 }
 
 /// Errors returned by [`encode`].
@@ -68,6 +79,13 @@ pub enum EncodeError {
     /// Resolving `HEAD` failed.
     #[error("could not resolve HEAD")]
     Head(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Resolving the previous `extra` tip (the parent of the new `extra`
+    /// commit) failed.
+    #[error("could not resolve the previous `extra` tip")]
+    ExtraParent(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Selecting the force-included files failed.
+    #[error(transparent)]
+    Select(#[from] crate::select::SelectError),
     /// Opening the index failed.
     #[error("could not open the repository index")]
     OpenIndex(#[source] Box<gix::worktree::open_index::Error>),
@@ -209,31 +227,90 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?
         .detach();
 
-    let signature = gix::actor::Signature {
-        name: SYNTH_NAME.into(),
-        email: SYNTH_EMAIL.into(),
-        time: gix::date::Time::now_local_or_utc(),
-    };
-    let commit = gix::objs::Commit {
-        tree: tree_id,
-        parents: parent.into_iter().collect(),
-        author: signature.clone(),
-        committer: signature,
-        encoding: None,
-        message: SYNTH_MESSAGE.into(),
-        extra_headers: Vec::new(),
-    };
-    let commit_id = repo
-        .write_object(&commit)
-        .map_err(|e| EncodeError::WriteObject(Box::new(e)))?
-        .detach();
+    let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_MESSAGE)?;
 
     let code_ref = gfs_common::code_ref(stream);
-    update_code_ref(&repo, &code_ref, commit_id)?;
+    update_ref(
+        &repo,
+        &code_ref,
+        commit_id,
+        "git-full-send: encode code state",
+    )?;
 
     Ok(EncodeOutcome {
         commit: commit_id,
         code_ref,
+    })
+}
+
+/// Encode the force-included (normally-gitignored) files of the repository
+/// discovered from `repo_dir` into a commit under `stream`'s `extra` ref,
+/// returning the commit id.
+///
+/// The selected set (ADR-0007, [`crate::select`]) becomes the `extra` tree built
+/// with the gix `Editor`; the commit is **parented on the previous sync's
+/// retained `extra` tip** (`gfs_common::sent_extra_ref`) so the prior, often
+/// large, build outputs stay available as delta bases (ADR-0004/ADR-0005), or is
+/// rootless on the first sync. Parenting on the *retained* tip — what the server
+/// is known to have — rather than the local `extra` ref means a failed push never
+/// leaves a later commit parented on something the server lacks.
+///
+/// With no patterns / no matches the `extra` tree is empty, but a commit is still
+/// produced so the chain (and the push alongside `code`) stays uniform. The
+/// user's branch, index, and working tree are untouched; only the stream's
+/// `extra` ref (`gfs_common::extra_ref`) is created or force-updated.
+pub fn encode_extra(repo_dir: &Path, stream: &StreamId) -> Result<ExtraOutcome, EncodeError> {
+    let repo = gix::discover(repo_dir).map_err(|source| EncodeError::OpenRepo {
+        path: repo_dir.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| EncodeError::NoWorktree(repo_dir.to_path_buf()))?
+        .to_path_buf();
+
+    // Parent on the previously-pushed `extra` tip if we have one, else rootless.
+    let sent_extra = gfs_common::sent_extra_ref(stream);
+    let parent = match repo
+        .try_find_reference(sent_extra.as_str())
+        .map_err(|e| EncodeError::ExtraParent(Box::new(e)))?
+    {
+        Some(mut reference) => Some(
+            reference
+                .peel_to_id()
+                .map_err(|e| EncodeError::ExtraParent(Box::new(e)))?
+                .detach(),
+        ),
+        None => None,
+    };
+
+    // Build the `extra` tree from the selected paths, seeded from the empty tree.
+    let paths = crate::select::select_extra_paths(&workdir)?;
+    let empty_tree = repo.empty_tree().id;
+    let mut editor = repo
+        .edit_tree(empty_tree)
+        .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
+    for rela_path in &paths {
+        overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
+    }
+    let tree_id = editor
+        .write()
+        .map_err(|e| EncodeError::BuildTree(Box::new(e)))?
+        .detach();
+
+    let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_EXTRA_MESSAGE)?;
+
+    let extra_ref = gfs_common::extra_ref(stream);
+    update_ref(
+        &repo,
+        &extra_ref,
+        commit_id,
+        "git-full-send: encode extra state",
+    )?;
+
+    Ok(ExtraOutcome {
+        commit: commit_id,
+        extra_ref,
     })
 }
 
@@ -301,22 +378,53 @@ fn blob_kind(_meta: &std::fs::Metadata) -> EntryKind {
     EntryKind::Blob
 }
 
-/// Create or force-update the `code` ref (`code_ref`) to point at `commit_id`.
+/// Write a synthetic commit holding `tree_id` with the fixed `git-full-send`
+/// identity, the given `parents`, and `message`. Shared by [`encode`] and
+/// [`encode_extra`].
+fn write_synth_commit(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    parents: impl IntoIterator<Item = gix::ObjectId>,
+    message: &str,
+) -> Result<gix::ObjectId, EncodeError> {
+    let signature = gix::actor::Signature {
+        name: SYNTH_NAME.into(),
+        email: SYNTH_EMAIL.into(),
+        time: gix::date::Time::now_local_or_utc(),
+    };
+    let commit = gix::objs::Commit {
+        tree: tree_id,
+        parents: parents.into_iter().collect(),
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    Ok(repo
+        .write_object(&commit)
+        .map_err(|e| EncodeError::WriteObject(Box::new(e)))?
+        .detach())
+}
+
+/// Create or force-update `ref_name` to point at `commit_id`, recording
+/// `reflog_message` in the reflog.
 ///
 /// We deliberately use a raw ref transaction with [`PreviousValue::Any`] rather
 /// than [`gix::Repository::commit_as`], whose precondition is tied to the
 /// commit's first parent and would reject both first-run creation and a scratch
 /// ref pointing at a previous synthetic commit.
-fn update_code_ref(
+fn update_ref(
     repo: &gix::Repository,
-    code_ref: &str,
+    ref_name: &str,
     commit_id: gix::ObjectId,
+    reflog_message: &str,
 ) -> Result<(), EncodeError> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::{FullName, Target};
 
-    let name = FullName::try_from(code_ref).map_err(|e| EncodeError::UpdateRef {
-        ref_name: code_ref.to_string(),
+    let name = FullName::try_from(ref_name).map_err(|e| EncodeError::UpdateRef {
+        ref_name: ref_name.to_string(),
         source: Box::new(e),
     })?;
     repo.edit_reference(RefEdit {
@@ -324,7 +432,7 @@ fn update_code_ref(
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: "git-full-send: encode code state".into(),
+                message: reflog_message.into(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(commit_id),
@@ -333,7 +441,7 @@ fn update_code_ref(
         deref: false,
     })
     .map_err(|e| EncodeError::UpdateRef {
-        ref_name: code_ref.to_string(),
+        ref_name: ref_name.to_string(),
         source: Box::new(e),
     })?;
     Ok(())
@@ -347,5 +455,11 @@ mod tests {
     fn code_ref_is_under_the_namespace() {
         let stream = StreamId::new("test").unwrap();
         assert!(gfs_common::code_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
+    }
+
+    #[test]
+    fn extra_ref_is_under_the_namespace() {
+        let stream = StreamId::new("test").unwrap();
+        assert!(gfs_common::extra_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
     }
 }

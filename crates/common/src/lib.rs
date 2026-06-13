@@ -112,6 +112,24 @@ pub fn sent_ref(stream: &StreamId) -> String {
     format!("{STREAMS_PREFIX}{}/sent/code", stream.as_str())
 }
 
+/// The ref holding `stream`'s encoded `extra` state — the force-included,
+/// normally-gitignored files (ADR-0004/ADR-0007): `…/streams/<id>/extra`.
+///
+/// The client writes the synthetic `extra` commit here (parented on the prior
+/// sync's `extra` tip so the volatile build outputs keep a delta-base chain) and
+/// pushes it alongside [`code_ref`] in the same exchange. Built from
+/// [`STREAMS_PREFIX`] so neither side hard-codes the layout.
+pub fn extra_ref(stream: &StreamId) -> String {
+    format!("{STREAMS_PREFIX}{}/extra", stream.as_str())
+}
+
+/// The client-local ref pinning `stream`'s last-confirmed-pushed `extra` tip as
+/// the next delta base, and as the parent of the next `extra` commit (ADR-0005):
+/// `…/streams/<id>/sent/extra`.
+pub fn sent_extra_ref(stream: &StreamId) -> String {
+    format!("{STREAMS_PREFIX}{}/sent/extra", stream.as_str())
+}
+
 /// Default address the server `listen` binds to.
 ///
 /// Localhost only (ADR-0006): connectivity from a real client is via a manual
@@ -141,9 +159,16 @@ mod tests {
         let id = StreamId::new("laptop").unwrap();
         assert!(code_ref(&id).starts_with(STREAMS_PREFIX));
         assert!(sent_ref(&id).starts_with(STREAMS_PREFIX));
+        assert!(extra_ref(&id).starts_with(STREAMS_PREFIX));
+        assert!(sent_extra_ref(&id).starts_with(STREAMS_PREFIX));
         assert!(STREAMS_PREFIX.starts_with(REF_NAMESPACE));
         assert_eq!(code_ref(&id), "refs/git-full-send/streams/laptop/code");
         assert_eq!(sent_ref(&id), "refs/git-full-send/streams/laptop/sent/code");
+        assert_eq!(extra_ref(&id), "refs/git-full-send/streams/laptop/extra");
+        assert_eq!(
+            sent_extra_ref(&id),
+            "refs/git-full-send/streams/laptop/sent/extra"
+        );
     }
 
     #[test]

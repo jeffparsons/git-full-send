@@ -47,7 +47,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use gfs_common::StreamId;
 use thiserror::Error;
 
 /// Errors returned by the transfer step.
@@ -99,12 +98,28 @@ pub enum PushError {
 }
 
 /// Push `ref_name` from the repository at `repo_dir` to `remote`
-/// (`HOST:PORT`) via the server's `git receive-pack`.
-///
-/// On success the ref (and its objects) are on the server. `sync` calls this for
-/// the `code` ref and then [`retain_pushed_tip`] to pin the delta base; it is
-/// also the seam tests use to exercise the server's ref-namespace policy.
+/// (`HOST:PORT`) via the server's `git receive-pack`. A thin wrapper over
+/// [`push_refs`] for a single ref; the seam tests use it to exercise the
+/// server's ref-namespace policy.
 pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), PushError> {
+    push_refs(repo_dir, remote, &[ref_name])
+}
+
+/// Push `ref_names` from the repository at `repo_dir` to `remote` (`HOST:PORT`)
+/// via the server's `git receive-pack`, all in **one** `git push` exchange.
+///
+/// `sync` pushes the `code` and `extra` refs together here (ADR-0004/0005), then
+/// pins their delta bases with [`retain_pushed_tip`]. On success every ref (and
+/// its objects) is on the server.
+///
+/// ## Delta policy (deferred)
+///
+/// A single `git push` applies one global delta policy. ADR-0005 wants `--thin`
+/// deltas for the `code` chain but a *predictable whole-object send* for the
+/// volatile `extra` chain; reconciling that per chain (e.g. a second push or pack
+/// config) is left as a follow-up. For now both travel in the one `--thin`
+/// exchange.
+pub fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<(), PushError> {
     let repo = gix::discover(repo_dir).map_err(|source| PushError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -127,7 +142,7 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
     // Force (`+`): the synthetic scratch refs are overwritten each sync, and a
     // new `code` commit is parented on HEAD rather than the previous tip, so
     // successive pushes are deliberately non-fast-forward (ADR-0004/0005).
-    let refspec = format!("+{ref_name}:{ref_name}");
+    let refspecs: Vec<String> = ref_names.iter().map(|r| format!("+{r}:{r}")).collect();
     let status = Command::new("git")
         .arg("-c")
         .arg("protocol.fd.allow=always")
@@ -138,7 +153,7 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
             transport.in_fd.as_raw_fd(),
             transport.out_fd.as_raw_fd()
         ))
-        .arg(&refspec)
+        .args(&refspecs)
         .current_dir(workdir)
         // `git push` keeps its own stdio; the transport lives on the reserved fds.
         .stdin(Stdio::null())
@@ -196,15 +211,15 @@ fn dup_inheritable(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
     Ok(dup)
 }
 
-/// Pin `commit` (the just-pushed tip) under `stream`'s `sent` ref
-/// (`gfs_common::sent_ref`) so its objects survive locally as the delta base for
-/// the next push.
+/// Pin `commit` (a just-pushed tip) under `sent_ref` so its objects survive
+/// locally as the delta base — and, for `extra`, the parent — of the next push.
 ///
 /// A force create-or-overwrite, mirroring the scratch-ref transaction `encode`
-/// uses for `code`. Called only after a successful [`push_ref`].
+/// uses for `code`. Called once per chain (`gfs_common::sent_ref` /
+/// `gfs_common::sent_extra_ref`) only after a successful [`push_refs`].
 pub(crate) fn retain_pushed_tip(
     repo_dir: &Path,
-    stream: &StreamId,
+    sent_ref: &str,
     commit: gix::ObjectId,
 ) -> Result<(), PushError> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
@@ -214,9 +229,8 @@ pub(crate) fn retain_pushed_tip(
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
     })?;
-    let sent_ref = gfs_common::sent_ref(stream);
-    let name = FullName::try_from(sent_ref.as_str()).map_err(|e| PushError::RetainRef {
-        ref_name: sent_ref.clone(),
+    let name = FullName::try_from(sent_ref).map_err(|e| PushError::RetainRef {
+        ref_name: sent_ref.to_string(),
         source: Box::new(e),
     })?;
     repo.edit_reference(RefEdit {
@@ -233,7 +247,7 @@ pub(crate) fn retain_pushed_tip(
         deref: false,
     })
     .map_err(|e| PushError::RetainRef {
-        ref_name: sent_ref,
+        ref_name: sent_ref.to_string(),
         source: Box::new(e),
     })?;
     Ok(())
@@ -241,7 +255,7 @@ pub(crate) fn retain_pushed_tip(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use gfs_common::StreamId;
 
     #[test]
     fn sent_ref_is_under_the_namespace() {
