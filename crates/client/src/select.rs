@@ -43,12 +43,19 @@
 //!   carves one file back out. This reproduces gitignore's directory-level
 //!   semantics, which matching leaf paths alone would miss.
 //!
-//! **Performance note.** The walk descends every non-`.git` directory that is not
-//! carved out, so an unrelated large ignored tree (e.g. `node_modules`) is
-//! traversed even when nothing in it is selected. Research 0004 accepts this
-//! O(N·M)-once-per-sync cost over a curated list; pruning subtrees that cannot
-//! contain a match is tracked as a follow-up:
-//! <https://github.com/jeffparsons/git-full-send/issues/39>.
+//! **Performance — pruning the walk.** Descending every non-`.git` directory would
+//! traverse an unrelated large ignored tree (e.g. `node_modules`) even when nothing
+//! in it is selected. To avoid that, we skip a directory unless it is already inside
+//! an included subtree *or* some include pattern could still match beneath it. The
+//! test is derived from each positive pattern's *anchoring*: a pattern with a leading
+//! `/` or an interior `/` (e.g. `/dist/`, `web-client/dist/`, `target/release/**`)
+//! has a literal directory prefix we can compare against, so a directory off that
+//! prefix is pruned. A pattern with no anchor — a bare basename or `basename/`
+//! (`dist/`, `*.wasm`), or a leading `**`/wildcard — can match at *any* depth, so it
+//! forces the full exhaustive walk, and we warn about it (such a pattern is most
+//! often an accidental include). The prune is a deliberate over-approximation: it
+//! never skips a directory the exhaustive walk would have selected from. See
+//! Research 0004 for the original O(N·M)-once-per-sync accounting.
 
 use std::path::{Path, PathBuf};
 
@@ -134,9 +141,17 @@ pub fn select_extra_paths_with(
 /// the two-layer semantics without mutating process-global environment.
 fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Vec<BString>, SelectError> {
     let search = load_search(workdir, user_include)?;
+    let prune = build_prune_info(&search);
 
-    let mut selected = Vec::new();
-    walk_dir(workdir, BString::default(), false, &search, &mut selected)?;
+    let mut walk = Walk {
+        search: &search,
+        prune: &prune,
+        out: Vec::new(),
+        #[cfg(test)]
+        entered: Vec::new(),
+    };
+    walk.run(workdir, BString::default(), false)?;
+    let mut selected = walk.out;
     selected.sort();
     selected.dedup();
     Ok(selected)
@@ -197,55 +212,203 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SelectError> {
     }
 }
 
-/// Recursively walk `dir` (at repo-relative `rel_prefix`), appending the
-/// repo-relative paths of selected files to `out`. `inherited` is the
-/// included/excluded state propagated from the nearest matched ancestor.
-fn walk_dir(
-    dir: &Path,
-    rel_prefix: BString,
-    inherited: bool,
-    search: &gix::ignore::Search,
-    out: &mut Vec<BString>,
-) -> Result<(), SelectError> {
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(|source| SelectError::ReadDir {
-            path: dir.to_path_buf(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| SelectError::ReadDir {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-    // Deterministic order so the resulting tree is reproducible.
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+/// State threaded through the recursive worktree walk: the allow-list, the
+/// derived prune information, and the accumulating list of selected paths.
+struct Walk<'a> {
+    search: &'a gix::ignore::Search,
+    prune: &'a PruneInfo,
+    out: Vec<BString>,
+    /// Repo-relative prefixes of every directory the walk descended into,
+    /// recorded so tests can assert the prune actually skipped a subtree rather
+    /// than merely failing to match anything inside it.
+    #[cfg(test)]
+    entered: Vec<BString>,
+}
 
-    for entry in entries {
-        let name_os = entry.file_name();
-        // Never descend into a Git directory (our own or a submodule's).
-        if name_os.as_os_str() == std::ffi::OsStr::new(".git") {
-            continue;
+impl Walk<'_> {
+    /// Recursively walk `dir` (at repo-relative `rel_prefix`), appending the
+    /// repo-relative paths of selected files to `self.out`. `inherited` is the
+    /// included/excluded state propagated from the nearest matched ancestor.
+    fn run(&mut self, dir: &Path, rel_prefix: BString, inherited: bool) -> Result<(), SelectError> {
+        #[cfg(test)]
+        self.entered.push(rel_prefix.clone());
+
+        let mut entries = std::fs::read_dir(dir)
+            .map_err(|source| SelectError::ReadDir {
+                path: dir.to_path_buf(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| SelectError::ReadDir {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+        // Deterministic order so the resulting tree is reproducible.
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let name_os = entry.file_name();
+            // Never descend into a Git directory (our own or a submodule's).
+            if name_os.as_os_str() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            let name = gix::path::os_str_into_bstr(&name_os)
+                .map_err(|_| SelectError::NonUnicodePath(entry.path()))?;
+            let rel = join_rel(rel_prefix.as_bstr(), name);
+
+            let file_type = entry.file_type().map_err(|source| SelectError::Metadata {
+                path: entry.path(),
+                source,
+            })?;
+
+            if file_type.is_dir() {
+                let state = classify(self.search, rel.as_bstr(), true).unwrap_or(inherited);
+                // Descend only if the subtree is already included or some include
+                // pattern could still match beneath it; otherwise prune it.
+                if state || self.prune.can_contain_match(rel.as_bstr()) {
+                    self.run(&entry.path(), rel, state)?;
+                }
+            } else if (file_type.is_file() || file_type.is_symlink())
+                && classify(self.search, rel.as_bstr(), false).unwrap_or(inherited)
+            {
+                self.out.push(rel);
+            }
+            // Anything else (FIFO, socket, …) is not representable in a tree; skip it.
         }
-        let name = gix::path::os_str_into_bstr(&name_os)
-            .map_err(|_| SelectError::NonUnicodePath(entry.path()))?;
-        let rel = join_rel(rel_prefix.as_bstr(), name);
-
-        let file_type = entry.file_type().map_err(|source| SelectError::Metadata {
-            path: entry.path(),
-            source,
-        })?;
-
-        if file_type.is_dir() {
-            let state = classify(search, rel.as_bstr(), true).unwrap_or(inherited);
-            walk_dir(&entry.path(), rel, state, search, out)?;
-        } else if (file_type.is_file() || file_type.is_symlink())
-            && classify(search, rel.as_bstr(), false).unwrap_or(inherited)
-        {
-            out.push(rel);
-        }
-        // Anything else (FIFO, socket, …) is not representable in a tree; skip it.
+        Ok(())
     }
-    Ok(())
+}
+
+/// Which directories the walk may safely skip, derived once from the allow-list.
+///
+/// Built from the **positive** (include) patterns only: negative `!` carve-outs
+/// can never *add* a selection, so a directory with no possible positive match is
+/// safe to prune regardless of any `!` inside it.
+struct PruneInfo {
+    /// At least one positive pattern is unanchored (matches at any depth), so no
+    /// directory can be pruned — fall back to the exhaustive walk.
+    any_unanchored: bool,
+    /// Literal leading directory prefixes of the anchored positive patterns, each
+    /// as a list of path segments (e.g. `web-client/dist/` → `["web-client", "dist"]`).
+    prefixes: Vec<Vec<BString>>,
+}
+
+impl PruneInfo {
+    /// Whether a directory at repo-relative `rel` could contain a file matching
+    /// some positive include pattern, and so must be descended into.
+    ///
+    /// True if any positive pattern is unanchored, or if some anchored prefix is
+    /// *path-compatible* with `rel` — i.e. the shorter of the two is a segment-wise
+    /// prefix of the longer, so the prefix lies on, at, or under `rel` (or vice
+    /// versa). This over-approximates: it may descend a little more than strictly
+    /// necessary, but never prunes a directory the exhaustive walk would select from.
+    fn can_contain_match(&self, rel: &BStr) -> bool {
+        if self.any_unanchored {
+            return true;
+        }
+        let dir: Vec<&[u8]> = rel.split(|&b| b == b'/').collect();
+        self.prefixes.iter().any(|prefix| {
+            let common = prefix.len().min(dir.len());
+            (0..common).all(|i| prefix[i].as_slice() == dir[i])
+        })
+    }
+}
+
+/// Inspect the allow-list and derive its [`PruneInfo`], warning about any positive
+/// pattern that is completely unanchored (and so forces a full working-tree scan).
+fn build_prune_info(search: &gix::ignore::Search) -> PruneInfo {
+    let mut any_unanchored = false;
+    let mut prefixes = Vec::new();
+    // Deduplicated display forms of unanchored positive patterns, for one warning.
+    let mut unanchored: Vec<(String, Option<PathBuf>)> = Vec::new();
+
+    for list in &search.patterns {
+        for mapping in &list.patterns {
+            let pattern = &mapping.pattern;
+            // Negative carve-outs never force descent: they only shrink the result.
+            if pattern.is_negative() {
+                continue;
+            }
+            match prunable_prefix(pattern) {
+                Some(segments) => prefixes.push(segments),
+                None => {
+                    any_unanchored = true;
+                    let display = pattern.to_string();
+                    if !unanchored.iter().any(|(text, _)| *text == display) {
+                        unanchored.push((display, list.source.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    for (pattern, source) in &unanchored {
+        match source {
+            Some(path) => tracing::warn!(
+                pattern = %pattern,
+                file = %path.display(),
+                "force-include pattern is unanchored: it matches at any directory \
+                 depth and forces a full working-tree scan. Anchor it with a leading \
+                 `/` or a path prefix (e.g. `/dist/` or `web-client/dist/`) if you \
+                 meant a specific location.",
+            ),
+            None => tracing::warn!(
+                pattern = %pattern,
+                "force-include pattern is unanchored: it matches at any directory \
+                 depth and forces a full working-tree scan. Anchor it with a leading \
+                 `/` or a path prefix (e.g. `/dist/` or `web-client/dist/`) if you \
+                 meant a specific location.",
+            ),
+        }
+    }
+
+    PruneInfo {
+        any_unanchored,
+        prefixes,
+    }
+}
+
+/// The literal leading directory prefix an anchored positive pattern requires its
+/// matches to start with, as a list of path segments — or `None` if the pattern is
+/// **unanchored** (matches at any depth) and so cannot prune any directory.
+///
+/// A pattern is unanchored when it has neither a leading `/` nor an interior `/`
+/// (gitignore matches such a pattern against the basename at any depth: `dist/`,
+/// `*.wasm`, `foo`), or when its literal prefix is empty because a wildcard leads
+/// (`**/foo`, `/*.wasm`). Otherwise the prefix is the complete leading segments up
+/// to the first wildcard, dropping the partial segment that holds it (`dist*/app`
+/// → no complete segment → `None`).
+fn prunable_prefix(pattern: &gix::glob::Pattern) -> Option<Vec<BString>> {
+    use gix::glob::pattern::Mode;
+
+    // No leading `/` and no interior `/`: matched against the basename anywhere.
+    if pattern.mode.contains(Mode::NO_SUB_DIR) && !pattern.mode.contains(Mode::ABSOLUTE) {
+        return None;
+    }
+
+    // `first_wildcard_pos` indexes into `text` (already stripped of any leading
+    // `!`/`/` and trailing `/`). Take the literal head, then keep only whole
+    // segments — the segment containing the first wildcard is partial.
+    let text: &[u8] = pattern.text.as_ref();
+    let literal: &[u8] = match pattern.first_wildcard_pos {
+        Some(pos) => match text[..pos].rfind_byte(b'/') {
+            Some(slash) => &text[..slash],
+            None => &[],
+        },
+        None => text,
+    };
+
+    let segments: Vec<BString> = literal
+        .split(|&b| b == b'/')
+        .filter(|segment| !segment.is_empty())
+        .map(BString::from)
+        .collect();
+
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
 }
 
 /// Match `rel` against the allow-list, returning `Some(true)` for an include,
@@ -288,6 +451,26 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    /// As [`select`], but also return the repo-relative prefixes of every directory
+    /// the walk descended into, so a test can assert the prune skipped a subtree
+    /// rather than merely failing to match anything inside it.
+    fn select_recording(root: &Path, user: Option<&Path>) -> (Vec<String>, Vec<String>) {
+        let search = load_search(root, user).unwrap();
+        let prune = build_prune_info(&search);
+        let mut walk = Walk {
+            search: &search,
+            prune: &prune,
+            out: Vec::new(),
+            entered: Vec::new(),
+        };
+        walk.run(root, BString::default(), false).unwrap();
+        let mut selected: Vec<String> = walk.out.iter().map(ToString::to_string).collect();
+        selected.sort();
+        selected.dedup();
+        let entered: Vec<String> = walk.entered.iter().map(ToString::to_string).collect();
+        (selected, entered)
     }
 
     #[test]
@@ -362,6 +545,117 @@ mod tests {
         assert_eq!(
             select(dir.path(), Some(&user)),
             ["config/local.toml", "dist/app.js"],
+        );
+    }
+
+    #[test]
+    fn anchored_pattern_does_not_descend_unrelated_tree() {
+        // An anchored include (`web-client/dist/`) must reach its match without
+        // traversing a large, unrelated ignored tree like `node_modules`.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), PROJECT_INCLUDE_FILE, "web-client/dist/\n");
+        write(dir.path(), "web-client/dist/app.js", "j");
+        write(dir.path(), "node_modules/pkg/index.js", "x");
+        write(dir.path(), "node_modules/pkg/deep/more.js", "y");
+
+        let (selected, entered) = select_recording(dir.path(), None);
+        assert_eq!(selected, ["web-client/dist/app.js"]);
+        // The prune skipped `node_modules` entirely — its contents were never read.
+        assert!(
+            !entered
+                .iter()
+                .any(|d| d == "node_modules" || d.starts_with("node_modules/")),
+            "walk descended into node_modules: {entered:?}",
+        );
+        // Sanity: it did descend toward the anchored match.
+        assert!(entered.iter().any(|d| d == "web-client/dist"));
+    }
+
+    #[test]
+    fn unanchored_pattern_still_matches_anywhere() {
+        // A bare-basename pattern (`*.wasm`) is unanchored: it must keep finding
+        // matches at any depth, including under an otherwise-prunable tree.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), PROJECT_INCLUDE_FILE, "*.wasm\n");
+        write(dir.path(), "node_modules/pkg/thing.wasm", "w");
+        write(dir.path(), "src/main.rs", "m");
+
+        let (selected, entered) = select_recording(dir.path(), None);
+        assert_eq!(selected, ["node_modules/pkg/thing.wasm"]);
+        // Unanchored => exhaustive fallback: node_modules was descended.
+        assert!(entered.iter().any(|d| d == "node_modules/pkg"));
+    }
+
+    #[test]
+    fn prunable_prefix_classifies_anchoring() {
+        fn prefix(pattern: &str) -> Option<Vec<String>> {
+            let parsed = gix::glob::Pattern::from_bytes(pattern.as_bytes()).unwrap();
+            super::prunable_prefix(&parsed)
+                .map(|segments| segments.iter().map(ToString::to_string).collect())
+        }
+        let segs = |s: &[&str]| Some(s.iter().map(ToString::to_string).collect::<Vec<_>>());
+
+        // Anchored — leading `/` or interior `/` gives a literal directory prefix.
+        assert_eq!(prefix("web-client/dist/"), segs(&["web-client", "dist"]));
+        assert_eq!(prefix("target/release/**"), segs(&["target", "release"]));
+        assert_eq!(prefix("/dist/"), segs(&["dist"]));
+        assert_eq!(prefix("/a/b/c"), segs(&["a", "b", "c"]));
+        // Unanchored — bare basename, basename-dir, or a leading/partial wildcard.
+        assert_eq!(prefix("dist/"), None);
+        assert_eq!(prefix("*.wasm"), None);
+        assert_eq!(prefix("**/foo"), None);
+        assert_eq!(prefix("dist*/app"), None);
+        assert_eq!(prefix("foo"), None);
+        // Root-anchored-only patterns are safe-but-unoptimised: treated as full walk.
+        assert_eq!(prefix("/*.wasm"), None);
+    }
+
+    #[test]
+    fn can_contain_match_compatibility() {
+        let prune = PruneInfo {
+            any_unanchored: false,
+            prefixes: vec![vec!["web-client".into(), "dist".into()]],
+        };
+        let can = |s: &str| prune.can_contain_match(BStr::new(s));
+        assert!(can("web-client")); // ancestor of the prefix → descend toward it
+        assert!(can("web-client/dist")); // equals the prefix
+        assert!(can("web-client/dist/sub")); // under the prefix
+        assert!(!can("node_modules")); // unrelated
+        assert!(!can("web-client/other")); // diverges below the first segment
+
+        // An unanchored set short-circuits to always-descend.
+        let exhaustive = PruneInfo {
+            any_unanchored: true,
+            prefixes: vec![],
+        };
+        assert!(exhaustive.can_contain_match(BStr::new("anything/at/all")));
+    }
+
+    #[test]
+    fn build_prune_info_flags_unanchored_and_ignores_negatives() {
+        let mut search = gix::ignore::Search::default();
+        let parse = gix::ignore::search::Ignore::default();
+        // One anchored positive, one unanchored positive, one negative carve-out.
+        search.add_patterns_buffer(
+            b"web-client/dist/\n*.wasm\n!web-client/dist/secret\n",
+            PathBuf::from(PROJECT_INCLUDE_FILE),
+            None,
+            parse,
+        );
+
+        let prune = build_prune_info(&search);
+        assert!(
+            prune.any_unanchored,
+            "`*.wasm` should mark the set unanchored"
+        );
+        // Only the anchored positive contributes a prefix; the negative is ignored.
+        assert_eq!(prune.prefixes.len(), 1);
+        assert_eq!(
+            prune.prefixes[0]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["web-client", "dist"],
         );
     }
 
