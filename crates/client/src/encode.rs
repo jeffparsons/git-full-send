@@ -23,21 +23,15 @@
 //! Unchanged tracked files are never touched; hashing is bounded by the actual
 //! working-tree delta, not the repository size. The index snapshot is read
 //! only and never written back, so the user's `.git/index`, branch, and
-//! worktree are left exactly as they were — the only ref we move is
-//! [`CODE_REF`].
+//! worktree are left exactly as they were — the only ref we move is the
+//! stream's `code` ref (`gfs_common::code_ref`).
 
 use std::path::{Path, PathBuf};
 
+use gfs_common::StreamId;
 use gix::bstr::{BStr, ByteSlice};
 use gix::objs::tree::EntryKind;
 use thiserror::Error;
-
-/// The scratch ref the encoded code commit is written to (under
-/// [`gfs_common::REF_NAMESPACE`]).
-///
-/// Re-exported from [`gfs_common::CODE_REF`] — the canonical definition shared
-/// with the server — so `gfs_client::CODE_REF` keeps resolving for callers.
-pub use gfs_common::CODE_REF;
 
 /// Identity stamped on the synthetic commit. It is a scratch artifact for
 /// transfer, not user-facing history, so a fixed identity is intentional.
@@ -49,8 +43,10 @@ const SYNTH_MESSAGE: &str = "git-full-send: working-tree snapshot";
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EncodeOutcome {
-    /// The commit [`CODE_REF`] now points at.
+    /// The commit the stream's `code` ref now points at.
     pub commit: gix::ObjectId,
+    /// The `code` ref that was written (`gfs_common::code_ref` for the stream).
+    pub code_ref: String,
 }
 
 /// Errors returned by [`encode`].
@@ -93,16 +89,22 @@ pub enum EncodeError {
     #[error("could not write a Git object")]
     WriteObject(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Updating the scratch ref failed.
-    #[error("could not update `{CODE_REF}`")]
-    UpdateRef(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("could not update `{ref_name}`")]
+    UpdateRef {
+        /// The ref we tried to write.
+        ref_name: String,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Encode the current code state of the repository discovered from `repo_dir`
-/// into a commit under [`CODE_REF`], returning the commit id.
+/// into a commit under `stream`'s `code` ref, returning the commit id.
 ///
-/// The user's branch, index, and working tree are left untouched; only
-/// [`CODE_REF`] is created or force-updated.
-pub fn encode(repo_dir: &Path) -> Result<EncodeOutcome, EncodeError> {
+/// The user's branch, index, and working tree are left untouched; only the
+/// stream's `code` ref (`gfs_common::code_ref`) is created or force-updated.
+pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, EncodeError> {
     let repo = gix::discover(repo_dir).map_err(|source| EncodeError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -226,9 +228,13 @@ pub fn encode(repo_dir: &Path) -> Result<EncodeOutcome, EncodeError> {
         .map_err(|e| EncodeError::WriteObject(Box::new(e)))?
         .detach();
 
-    update_code_ref(&repo, commit_id)?;
+    let code_ref = gfs_common::code_ref(stream);
+    update_code_ref(&repo, &code_ref, commit_id)?;
 
-    Ok(EncodeOutcome { commit: commit_id })
+    Ok(EncodeOutcome {
+        commit: commit_id,
+        code_ref,
+    })
 }
 
 /// Read the on-disk file (or symlink) at `rela_path`, write it as a blob, and
@@ -295,17 +301,24 @@ fn blob_kind(_meta: &std::fs::Metadata) -> EntryKind {
     EntryKind::Blob
 }
 
-/// Create or force-update [`CODE_REF`] to point at `commit_id`.
+/// Create or force-update the `code` ref (`code_ref`) to point at `commit_id`.
 ///
 /// We deliberately use a raw ref transaction with [`PreviousValue::Any`] rather
 /// than [`gix::Repository::commit_as`], whose precondition is tied to the
 /// commit's first parent and would reject both first-run creation and a scratch
 /// ref pointing at a previous synthetic commit.
-fn update_code_ref(repo: &gix::Repository, commit_id: gix::ObjectId) -> Result<(), EncodeError> {
+fn update_code_ref(
+    repo: &gix::Repository,
+    code_ref: &str,
+    commit_id: gix::ObjectId,
+) -> Result<(), EncodeError> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
     use gix::refs::{FullName, Target};
 
-    let name = FullName::try_from(CODE_REF).map_err(|e| EncodeError::UpdateRef(Box::new(e)))?;
+    let name = FullName::try_from(code_ref).map_err(|e| EncodeError::UpdateRef {
+        ref_name: code_ref.to_string(),
+        source: Box::new(e),
+    })?;
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -319,7 +332,10 @@ fn update_code_ref(repo: &gix::Repository, commit_id: gix::ObjectId) -> Result<(
         name,
         deref: false,
     })
-    .map_err(|e| EncodeError::UpdateRef(Box::new(e)))?;
+    .map_err(|e| EncodeError::UpdateRef {
+        ref_name: code_ref.to_string(),
+        source: Box::new(e),
+    })?;
     Ok(())
 }
 
@@ -329,6 +345,7 @@ mod tests {
 
     #[test]
     fn code_ref_is_under_the_namespace() {
-        assert!(CODE_REF.starts_with(gfs_common::REF_NAMESPACE));
+        let stream = StreamId::new("test").unwrap();
+        assert!(gfs_common::code_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
     }
 }
