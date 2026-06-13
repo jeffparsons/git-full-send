@@ -94,6 +94,9 @@ check — is in
 - Because the set is volatile, the remote update must **remove** force-included
   files from a prior sync that are no longer selected — latitude provided by
   [ADR-0008](0008-remote-worktree-disposability.md)'s disposable/authoritative
-  worktree; the exact removal mechanism is ADR-0004/0008's reassembly detail.
+  worktree. [ADR-0011](0011-worktree-reassembly-mechanics.md) realises this by
+  **folding `extra` into the combined tree** that the reassembly checks out, so a
+  no-longer-selected file is dropped by the same `read-tree --reset -u` that
+  removes dropped `code` files — no separate removal pass.
 - The exact pattern-file name/location and any future folding into a central
   project config are low-stakes, revisable details left to implementation.
