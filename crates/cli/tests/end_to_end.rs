@@ -353,8 +353,21 @@ fn command_line_surface_is_wired_up() {
     };
 
     let top = help(&["--help"]);
-    for sub in ["sync", "listen", "update-worktree", "list-streams"] {
+    for sub in [
+        "sync",
+        "listen",
+        "update-worktree",
+        "list-streams",
+        "forget-stream",
+    ] {
         assert!(top.contains(sub), "top-level help lists `{sub}`:\n{top}");
+    }
+    let forget_help = help(&["forget-stream", "--help"]);
+    for flag in ["--repo", "--stream-id"] {
+        assert!(
+            forget_help.contains(flag),
+            "forget-stream exposes {flag}:\n{forget_help}",
+        );
     }
     assert!(
         help(&["sync", "--help"]).contains("--user-include"),

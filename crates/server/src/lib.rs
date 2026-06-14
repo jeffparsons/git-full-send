@@ -101,6 +101,9 @@ pub enum ServerError {
     /// Listing the synced streams failed.
     #[error("could not list streams")]
     ListStreams(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Deleting a stream's refs failed.
+    #[error("could not forget stream")]
+    ForgetStream(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Creating the worktree directory (or its sidecar index directory) failed.
     #[error("could not create the worktree directory")]
     CreateWorktree(#[source] std::io::Error),
@@ -657,6 +660,58 @@ pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerErro
         }
     }
     Ok(streams)
+}
+
+/// Delete every ref of `stream` from `repo`, returning how many were removed.
+///
+/// Removes everything under [`gfs_common::stream_prefix`] in one transaction —
+/// the explicit "forget this stream" path ADR-0012 deferred (issue #48). The
+/// command is **symmetric**: run against the server repo it drops the stream's
+/// `code`/`extra`; run against the client repo it drops the local `sent/*`
+/// delta-base pins. After it returns the stream no longer appears in
+/// [`list_streams`].
+///
+/// Idempotent: a stream with no refs (never synced, or already forgotten) yields
+/// `Ok(0)` rather than an error. Streams and worktrees are orthogonal (ADR-0012),
+/// so the per-worktree index dir is deliberately *not* touched — it is keyed by
+/// worktree path, not stream id, and the worktree is disposable anyway
+/// (ADR-0008). The client's `git-full-send.stream-id` config key is likewise left
+/// alone (see `docs/operating.md`).
+pub fn forget_stream(repo: &Path, stream: &gfs_common::StreamId) -> Result<usize, ServerError> {
+    use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+
+    let repo = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
+    let prefix = gfs_common::stream_prefix(stream);
+
+    // Snapshot the matching ref names into owned edits before mutating, so we are
+    // not deleting out from under a live iterator borrow.
+    let platform = repo
+        .references()
+        .map_err(|e| ServerError::ForgetStream(Box::new(e)))?;
+    let iter = platform
+        .prefixed(prefix.as_str())
+        .map_err(|e| ServerError::ForgetStream(Box::new(e)))?;
+    let mut edits = Vec::new();
+    for reference in iter {
+        let reference = reference.map_err(ServerError::ForgetStream)?;
+        edits.push(RefEdit {
+            change: Change::Delete {
+                // Unconditional: we are forgetting the stream, not guarding
+                // against a concurrent update (mirrors `retain_pushed_tip`).
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name: reference.name().to_owned(),
+            deref: false,
+        });
+    }
+    if edits.is_empty() {
+        return Ok(0);
+    }
+    let applied = repo
+        .edit_references(edits)
+        .map_err(|e| ServerError::ForgetStream(Box::new(e)))?;
+    Ok(applied.len())
 }
 
 /// The blocking body of [`update_worktree`].

@@ -91,6 +91,30 @@ git-full-send list-streams --repo /path/to/target-repo
 Prints the stream ids that have a synced `code` ref — useful for finding what is
 available to check out.
 
+### `forget-stream` — retire a stream
+
+```sh
+git-full-send forget-stream --repo /path/to/target-repo --stream-id my-laptop
+```
+
+Deletes every ref of a stream
+(`refs/git-full-send/streams/<id>/…`) from `--repo`, so it no longer appears in
+`list-streams`. `git-full-send` otherwise keeps a stream's refs forever — stable
+ids keep the set bounded, but nothing reclaims a stream you are done with
+([ADR-0012](adr/0012-namespacing-managed-refs-per-stream.md),
+[ADR-0014](adr/0014-forgetting-a-stream.md)); this is the explicit way to drop
+one.
+
+- It removes only refs. It does **not** delete the worktree a stream was checked
+  out into, nor its per-worktree index dir — those are keyed by worktree path,
+  not stream id (a stream and a worktree are independent — ADR-0012), and the
+  worktree is disposable anyway ([ADR-0008](adr/0008-remote-worktree-disposability.md)).
+  Remove the worktree directory yourself if you no longer want it.
+- **Idempotent:** forgetting a stream that has no refs (never synced, or already
+  forgotten) succeeds and reports that there was nothing to forget.
+- The command is **symmetric** — see "Retiring a stream" below for cleaning up
+  the client side as well.
+
 ## 3. Stream ids
 
 A **stream** is an independent, reusable slot of synced state. Refs are
@@ -105,6 +129,24 @@ namespaced per stream so concurrent senders don't clobber each other
 - Ids may be branch-shaped (contain slashes), e.g. `feature/foo`; they are
   validated to form well-formed Git ref names.
 - On the **server**, pass the matching `--stream-id` to `update-worktree`.
+
+### Retiring a stream
+
+`forget-stream` deletes a stream's refs in whichever repo you point it at, so a
+stream has two sides to clean up:
+
+- On the **server**, `forget-stream --repo <server-repo>` drops the synced
+  `code`/`extra` refs (this is what removes it from `list-streams`).
+- On the **client**, the repo also keeps the stream's local refs — the scratch
+  `code`/`extra` refs a sync pushes from and the `sent/*` delta-base pins — plus
+  the `git-full-send.stream-id` config key if this stream is the repo's default.
+  Run `forget-stream --repo <client-repo> --stream-id <id>` to drop the refs, and
+  `git config --unset git-full-send.stream-id` if you also want to stop this repo
+  defaulting to that id (otherwise the next bare `sync` regenerates the stream
+  under the same id).
+
+Forgetting a stream that is still in use is safe: a later `sync` simply
+re-creates its refs from scratch (without a delta base for that first push).
 
 ## 4. Force-include pattern files
 

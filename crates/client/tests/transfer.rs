@@ -595,6 +595,123 @@ async fn two_streams_do_not_clobber_each_other() {
     assert_eq!(listed, vec!["alice".to_string(), "bob".to_string()]);
 }
 
+/// Whether `ref_name` resolves in `repo` (a non-asserting `git rev-parse`).
+fn ref_exists(repo: &Path, ref_name: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .output()
+        .expect("run git rev-parse")
+        .status
+        .success()
+}
+
+#[tokio::test]
+async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    // Two streams synced from independent clients.
+    for who in ["alice", "bob"] {
+        let client = init_temp_repo();
+        write_file(client.path(), "who.txt", who);
+        commit_all(client.path(), "baseline");
+        gfs_client::sync(
+            client.path().to_path_buf(),
+            addr.to_string(),
+            Some(StreamId::new(who).unwrap()),
+            None,
+        )
+        .await
+        .expect("sync");
+    }
+    let alice = StreamId::new("alice").unwrap();
+    let bob = StreamId::new("bob").unwrap();
+
+    // Forgetting `alice` removes its `code` and `extra` refs (2) and nothing else.
+    let removed = gfs_server::forget_stream(server.path(), &alice).expect("forget alice");
+    assert_eq!(removed, 2, "alice's code + extra refs were removed");
+    assert!(!ref_exists(server.path(), &code_ref(&alice)));
+    assert!(!ref_exists(server.path(), &extra_ref(&alice)));
+
+    // `bob` is untouched and is now the only stream the server lists.
+    assert!(ref_exists(server.path(), &code_ref(&bob)));
+    assert_eq!(
+        gfs_server::list_streams(server.path()).unwrap(),
+        vec![bob],
+        "only bob remains after forgetting alice",
+    );
+}
+
+#[tokio::test]
+async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "f.txt", "v1");
+    commit_all(c, "baseline");
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
+
+    // After a sync the client holds the stream's local refs: the scratch
+    // `code`/`extra` refs `encode` pushes from, plus the `sent/*` delta-base pins.
+    for r in [
+        code_ref(&stream),
+        extra_ref(&stream),
+        sent_ref(&stream),
+        sent_extra_ref(&stream),
+    ] {
+        assert!(ref_exists(c, &r), "`{r}` exists after sync");
+    }
+
+    // Forgetting the stream *in the client repo* drops all of them — there is no
+    // local footprint of the stream left behind.
+    let removed = gfs_server::forget_stream(c, &stream).expect("forget on client");
+    assert_eq!(
+        removed, 4,
+        "code + extra + sent/code + sent/extra were removed"
+    );
+    for r in [
+        code_ref(&stream),
+        extra_ref(&stream),
+        sent_ref(&stream),
+        sent_extra_ref(&stream),
+    ] {
+        assert!(!ref_exists(c, &r), "`{r}` is gone after forget");
+    }
+
+    // Forgetting locally is safe: a subsequent sync regenerates them and succeeds.
+    write_file(c, "f.txt", "v2");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync after local forget");
+    assert!(ref_exists(c, &sent_ref(&stream)), "sent/code regenerated");
+}
+
+#[tokio::test]
+async fn forget_stream_is_idempotent_for_an_unknown_stream(/* issue #48 */) {
+    let server = init_bare_repo();
+    // Never synced: forgetting it removes nothing and is not an error.
+    let removed = gfs_server::forget_stream(server.path(), &StreamId::new("ghost").unwrap())
+        .expect("forget unknown stream");
+    assert_eq!(removed, 0);
+}
+
 #[tokio::test]
 async fn branch_shaped_stream_id_round_trips() {
     let server = init_bare_repo();
