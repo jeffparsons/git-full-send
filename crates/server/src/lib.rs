@@ -237,6 +237,13 @@ fn handle_connection(
         .arg(&hooks_path)
         .arg("receive-pack")
         .arg(repo)
+        // Pipe receive-pack's stdio so the two pump threads below can *count* the
+        // bytes in each direction for the metrics record (issue #42). The pumps
+        // use an explicit read/write loop ([`pump_counting`]) rather than
+        // `std::io::copy`: on Linux the latter takes a `splice`/`sendfile`
+        // zero-copy fast path between the socket and the pipe that deadlocked the
+        // bidirectional receive-pack exchange (issue #44) — a plain byte loop
+        // both avoids it and yields the count for free.
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -257,13 +264,12 @@ fn handle_connection(
     // Inbound: socket → child stdin (the pushed pack). A broken-pipe error once
     // the child has exited is expected, not a failure; we keep the byte count.
     let in_pump = std::thread::spawn(move || {
-        let n = std::io::copy(&mut sock_in, &mut child_stdin).unwrap_or(0);
+        let n = pump_counting(&mut sock_in, &mut child_stdin);
         drop(child_stdin); // close the child's stdin
         n
     });
     // Outbound: child stdout → socket (the report-status).
-    let out_pump =
-        std::thread::spawn(move || std::io::copy(&mut child_stdout, &mut sock_out).unwrap_or(0));
+    let out_pump = std::thread::spawn(move || pump_counting(&mut child_stdout, &mut sock_out));
 
     // Drain receive-pack's stderr (progress, hook rejections) to the log.
     let mut stderr = String::new();
@@ -313,6 +319,36 @@ fn handle_connection(
         ),
     );
     Ok(())
+}
+
+/// Copy `reader` → `writer` to EOF with an explicit read/write loop, returning
+/// the number of bytes moved.
+///
+/// Deliberately *not* `std::io::copy`: between a socket and a pipe on Linux that
+/// function takes a `splice`/`sendfile` zero-copy fast path, which deadlocked
+/// the bidirectional `receive-pack` exchange (issue #44) while passing on macOS,
+/// where no such fast path exists. A plain buffered loop behaves identically on
+/// both platforms and produces the byte count the metrics record needs (#42).
+/// Errors (e.g. a broken pipe once the child has exited) end the copy and return
+/// the bytes moved so far, matching the previous best-effort behaviour.
+fn pump_counting(reader: &mut impl std::io::Read, writer: &mut impl std::io::Write) -> u64 {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if writer.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                total += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = writer.flush();
+    total
 }
 
 /// Read the hook's accepted-ref file into a deduplicated, order-preserving list
