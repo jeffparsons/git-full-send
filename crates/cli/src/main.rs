@@ -58,6 +58,14 @@ struct ListenArgs {
     /// Address to bind. Localhost only by default (ADR-0006).
     #[arg(long, value_name = "IP:PORT", default_value = gfs_common::DEFAULT_LISTEN_ADDR)]
     addr: SocketAddr,
+    /// Maximum number of connections served concurrently; further connections
+    /// wait for a slot (issue #47).
+    #[arg(long, value_name = "N", default_value_t = gfs_common::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
+    /// Per-connection wall-clock timeout in seconds; a handler that overruns it
+    /// is aborted so a stuck client can't pin a slot (issue #47).
+    #[arg(long, value_name = "SECS", default_value_t = gfs_common::DEFAULT_CONNECTION_TIMEOUT_SECS)]
+    connection_timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -100,7 +108,13 @@ async fn main() -> Result<()> {
             };
             gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
         }
-        Command::Listen(args) => gfs_server::listen(args.addr, args.repo).await?,
+        Command::Listen(args) => {
+            let config = gfs_server::ListenConfig {
+                max_connections: args.max_connections,
+                connection_timeout: std::time::Duration::from_secs(args.connection_timeout),
+            };
+            gfs_server::listen(args.addr, args.repo, config).await?
+        }
         Command::UpdateWorktree(args) => {
             gfs_server::update_worktree(args.repo, args.worktree, args.stream_id).await?
         }

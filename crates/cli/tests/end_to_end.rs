@@ -360,8 +360,11 @@ fn command_line_surface_is_wired_up() {
         help(&["sync", "--help"]).contains("--user-include"),
         "sync exposes --user-include",
     );
-    assert!(
-        help(&["listen", "--help"]).contains("--addr"),
-        "listen exposes --addr",
-    );
+    let listen_help = help(&["listen", "--help"]);
+    for flag in ["--addr", "--max-connections", "--connection-timeout"] {
+        assert!(
+            listen_help.contains(flag),
+            "listen exposes {flag}:\n{listen_help}",
+        );
+    }
 }
