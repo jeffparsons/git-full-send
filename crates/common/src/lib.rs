@@ -139,6 +139,20 @@ pub fn sent_extra_ref(stream: &StreamId) -> String {
 /// stream off the network. Overridable via the `--addr` flag.
 pub const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9419";
 
+/// Default cap on concurrently-served `git receive-pack` handlers (issue #47).
+///
+/// Bounds in-flight connections so a burst can't exhaust threads; further
+/// connections wait for a slot rather than each spawning unconditionally.
+/// Overridable via the `listen --max-connections` flag.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
+
+/// Default per-connection wall-clock timeout, in seconds (issue #47).
+///
+/// A handler that runs longer than this is aborted (its socket is shut down) so a
+/// stuck client can't pin a concurrency slot indefinitely. Overridable via the
+/// `listen --connection-timeout` flag.
+pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 300;
+
 /// Errors shared across the client and server boundaries.
 ///
 /// Placeholder enum establishing the `thiserror`-at-library-boundaries

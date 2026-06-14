@@ -17,19 +17,31 @@
 //! post-receive gc cannot prune the delta bases a subsequent push needs
 //! (Research 0003).
 //!
+//! The accept loop is async (tokio) and bounded (issue #47): a
+//! [`Semaphore`]-gated cap means at most `max_connections` handlers run at once,
+//! so a burst can't exhaust threads — further connections wait for a slot. Each
+//! accepted socket is served by the blocking [`handle_connection`] on a
+//! `spawn_blocking` thread, with a per-connection wall-clock timeout that aborts
+//! a stuck client rather than letting it pin a slot. A SIGTERM/SIGINT stops the
+//! accept loop, drains the in-flight handlers, and returns cleanly so the
+//! `hooks` [`TempDir`] is dropped.
+//!
 //! The socket-as-stdio plumbing is Unix-only; the tool is Unix-first (see
 //! [ADR-0006] and the client's `encode`). Windows transport support is out of
 //! scope.
 //!
 //! [ADR-0006]: https://github.com/jeffparsons/git-full-send/blob/main/docs/adr/0006-transport-and-connectivity.md
 
+use std::future::Future;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 mod metrics;
 
@@ -140,10 +152,34 @@ impl Listener {
     }
 }
 
+/// Tunables for the [`listen`]/[`serve_async`] accept loop (issue #47).
+///
+/// [`Default`] sources the `gfs_common::DEFAULT_*` constants; the CLI overrides
+/// them from `listen --max-connections` / `--connection-timeout`.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenConfig {
+    /// Maximum number of `git receive-pack` handlers in flight at once. Further
+    /// accepted connections wait for a slot.
+    pub max_connections: usize,
+    /// Per-connection wall-clock budget; a handler that overruns it is aborted
+    /// (its socket is shut down) so a stuck client can't pin a slot.
+    pub connection_timeout: Duration,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: gfs_common::DEFAULT_MAX_CONNECTIONS,
+            connection_timeout: Duration::from_secs(gfs_common::DEFAULT_CONNECTION_TIMEOUT_SECS),
+        }
+    }
+}
+
 /// Bind a localhost TCP listener for `addr` that will serve `repo`.
 ///
 /// Validates that `repo` is a Git repository and materialises the namespace
-/// `pre-receive` hook, but does not yet accept connections — call [`serve`].
+/// `pre-receive` hook, but does not yet accept connections — call [`serve`] or
+/// [`serve_async`].
 pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
     let git_dir = gix::discover(&repo)
         .map_err(|_| ServerError::NotARepo(repo.clone()))?
@@ -159,12 +195,42 @@ pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
     })
 }
 
-/// Serve connections until the listener is shut down.
+/// Serve connections until the process is killed, with default tunables.
 ///
-/// Blocking: loops over accepted connections, handling each on its own thread by
-/// spawning `git receive-pack`. A connection that fails is logged and skipped;
-/// it never brings the loop down.
+/// A synchronous convenience wrapper around [`serve_async`]: it builds a
+/// current-thread runtime, serves with [`ListenConfig::default`], and never
+/// shuts down (no signal handling). Handy for tests that stand the server up on
+/// a `std::thread` and stop it by exiting the process. Production code uses
+/// [`listen`], which wires SIGTERM/SIGINT to a graceful shutdown.
+//
+// NOTE (issue raised in #47 review): this sync shim exists only to keep the
+// transport tests off an ambient runtime; a follow-up consolidates everything
+// on async/tokio and removes it.
 pub fn serve(listener: Listener) -> Result<(), ServerError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(ServerError::Io)?;
+    runtime.block_on(serve_async(
+        listener,
+        ListenConfig::default(),
+        std::future::pending::<()>(),
+    ))
+}
+
+/// Serve connections asynchronously until `shutdown` resolves, then drain.
+///
+/// Bounds concurrency to `config.max_connections` via a [`Semaphore`] (a burst
+/// can't exhaust threads — excess connections wait for a slot) and serves each
+/// accepted socket with the blocking [`handle_connection`] on a `spawn_blocking`
+/// thread, under a per-connection wall-clock timeout. When `shutdown` resolves,
+/// the accept loop stops, in-flight handlers are drained, and the `hooks`
+/// [`TempDir`] is dropped — the clean stop the old unbounded loop never reached.
+pub async fn serve_async(
+    listener: Listener,
+    config: ListenConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServerError> {
     let Listener {
         listener,
         repo,
@@ -172,37 +238,134 @@ pub fn serve(listener: Listener) -> Result<(), ServerError> {
         hooks,
     } = listener;
     let hooks_dir = hooks.path().to_path_buf();
-    tracing::info!(repo = %repo.display(), "serving git receive-pack");
-    for stream in listener.incoming() {
-        match stream {
-            Ok(sock) => {
-                let repo = repo.clone();
-                let git_dir = git_dir.clone();
-                let hooks_dir = hooks_dir.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(sock, &repo, &git_dir, &hooks_dir) {
-                        tracing::warn!(%error, "connection handler failed");
-                    }
-                });
+
+    // Re-home the std listener onto the tokio reactor (it must be non-blocking
+    // for `from_std`). `bind` keeps producing a std listener so `local_addr`
+    // works without an ambient runtime.
+    listener.set_nonblocking(true).map_err(ServerError::Io)?;
+    let listener = tokio::net::TcpListener::from_std(listener).map_err(ServerError::Io)?;
+
+    tracing::info!(
+        repo = %repo.display(),
+        max_connections = config.max_connections,
+        "serving git receive-pack",
+    );
+
+    let timeout = config.connection_timeout;
+    accept_loop(listener, config.max_connections, shutdown, move |sock| {
+        let repo = repo.clone();
+        let git_dir = git_dir.clone();
+        let hooks_dir = hooks_dir.clone();
+        async move {
+            // Hand the socket to the blocking handler as a plain blocking std
+            // socket (`into_std` leaves it non-blocking, which the byte-pump
+            // loop in `handle_connection` does not expect).
+            let sock = match sock.into_std().and_then(|s| {
+                s.set_nonblocking(false)?;
+                Ok(s)
+            }) {
+                Ok(sock) => sock,
+                Err(error) => {
+                    tracing::warn!(%error, "could not prepare accepted socket");
+                    return;
+                }
+            };
+            match tokio::task::spawn_blocking(move || {
+                handle_connection(sock, &repo, &git_dir, &hooks_dir, timeout)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "connection handler failed"),
+                Err(error) => tracing::warn!(%error, "connection task panicked"),
             }
-            Err(error) => tracing::warn!(%error, "accept failed"),
         }
-    }
-    // `hooks` is intentionally held until here so the hook files outlive every
-    // connection; `incoming()` only ends if the listener itself errors.
+    })
+    .await;
+
+    // The accept loop has drained every in-flight handler, so the hook files are
+    // no longer needed by any connection: drop the dir. Reaching this on
+    // shutdown is the point of issue #47 — the old loop only ended on a listener
+    // error, leaving this unreachable.
     drop(hooks);
     Ok(())
 }
 
+/// The bounded, drained accept loop shared by [`serve_async`].
+///
+/// Accepts at most `max_connections` connections concurrently: a permit is taken
+/// before each accept, and released when the spawned handler finishes. When
+/// `shutdown` resolves the loop stops accepting and awaits the in-flight
+/// handlers before returning. Factored out (and generic over `handle`) so a unit
+/// test can drive it with a stub handler and assert the cap holds.
+async fn accept_loop<F, Fut>(
+    listener: tokio::net::TcpListener,
+    max_connections: usize,
+    shutdown: impl Future<Output = ()>,
+    mut handle: F,
+) where
+    F: FnMut(tokio::net::TcpStream) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let sem = Arc::new(Semaphore::new(max_connections));
+    let mut handlers = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+
+    loop {
+        // Acquire a slot first, but inside the `select!` so a shutdown at the cap
+        // is still observed promptly rather than parking on the permit.
+        let permit = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            permit = sem.clone().acquire_owned() => permit.expect("semaphore is never closed"),
+        };
+        // With a slot in hand, wait for a connection — still racing shutdown.
+        let sock = tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok((sock, _)) => sock,
+                Err(error) => {
+                    tracing::warn!(%error, "accept failed");
+                    continue;
+                }
+            },
+        };
+        let fut = handle(sock);
+        handlers.spawn(async move {
+            fut.await;
+            drop(permit);
+        });
+    }
+
+    // Drain: let every in-flight handler run to completion before returning.
+    while handlers.join_next().await.is_some() {}
+}
+
 /// Run the long-running listener that accepts sync requests.
 ///
-/// CLI entry point: binds `addr` (localhost only, ADR-0006), then serves until
-/// shut down. The blocking accept loop runs on a dedicated thread so it does not
-/// occupy the async executor.
-pub async fn listen(addr: SocketAddr, repo: PathBuf) -> Result<(), ServerError> {
-    tokio::task::spawn_blocking(move || serve(bind(addr, repo)?))
-        .await
-        .map_err(|e| ServerError::Join(e.to_string()))?
+/// CLI entry point: binds `addr` (localhost only, ADR-0006), then serves with
+/// `config`'s concurrency cap and per-connection timeout until a SIGTERM/SIGINT
+/// triggers a graceful, draining shutdown.
+pub async fn listen(
+    addr: SocketAddr,
+    repo: PathBuf,
+    config: ListenConfig,
+) -> Result<(), ServerError> {
+    let listener = bind(addr, repo)?;
+    serve_async(listener, config, shutdown_signal()).await
+}
+
+/// Resolve when the process receives SIGTERM or SIGINT — the graceful-shutdown
+/// trigger for [`listen`].
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("received SIGTERM; draining and shutting down"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT; draining and shutting down"),
+    }
 }
 
 /// Handle one connection: spawn `git receive-pack` and pump the raw
@@ -214,11 +377,18 @@ pub async fn listen(addr: SocketAddr, repo: PathBuf) -> Result<(), ServerError> 
 /// metrics record (issue #42): the bytes seen are exactly the same raw stream
 /// (no framing — ADR-0005 is unchanged), just observed in transit. The added
 /// localhost-bandwidth copy is negligible against git's own pack work.
+///
+/// A `timeout` watchdog bounds the whole exchange (issue #47): if the handler
+/// runs longer than `timeout`, the watchdog shuts the socket down, which forces
+/// the pumps to EOF and makes `git receive-pack` exit — so a stuck client can't
+/// pin a concurrency slot. A blocking `spawn_blocking` task can't be cancelled
+/// from the outside, so the budget is enforced here, where we own the socket.
 fn handle_connection(
     sock: TcpStream,
     repo: &Path,
     git_dir: &Path,
     hooks_dir: &Path,
+    timeout: Duration,
 ) -> Result<(), ServerError> {
     use std::io::Read;
 
@@ -261,6 +431,29 @@ fn handle_connection(
     let mut sock_in = sock.try_clone().map_err(ServerError::Io)?;
     let mut sock_out = sock.try_clone().map_err(ServerError::Io)?;
 
+    // Per-connection timeout watchdog (issue #47): a fourth clone for a thread
+    // that, if the handler hasn't finished within `timeout`, shuts the socket
+    // down. That unblocks both pumps and gives `receive-pack` EOF on stdin / a
+    // broken stdout, so it exits and `child.wait()` returns — the same teardown
+    // the normal path performs, just triggered early. The handler signals the
+    // watchdog to stand down (by dropping `done_tx`) before it returns.
+    let watchdog_sock = sock.try_clone().map_err(ServerError::Io)?;
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        use std::sync::mpsc::RecvTimeoutError;
+        match done_rx.recv_timeout(timeout) {
+            // Handler finished (sender dropped) within the budget: nothing to do.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "connection exceeded its timeout; aborting"
+                );
+                let _ = watchdog_sock.shutdown(Shutdown::Both);
+            }
+        }
+    });
+
     // Inbound: socket → child stdin (the pushed pack). A broken-pipe error once
     // the child has exited is expected, not a failure; we keep the byte count.
     let in_pump = std::thread::spawn(move || {
@@ -284,6 +477,11 @@ fn handle_connection(
     let bytes_out = out_pump.join().unwrap_or(0);
     let _ = sock.shutdown(Shutdown::Both);
     let bytes_in = in_pump.join().unwrap_or(0);
+
+    // Stand the watchdog down (dropping the sender wakes its `recv_timeout`) and
+    // join it, so a fired-or-not watchdog never outlives the connection.
+    drop(done_tx);
+    let _ = watchdog.join();
 
     let stderr = stderr.trim();
     let refs_updated = accepted_refs.map(read_accepted_refs).unwrap_or_default();
@@ -728,5 +926,100 @@ mod tests {
         // Accepted refs are appended to the file named by the env var so the
         // connection handler can report which refs a push updated (issue #42).
         assert!(hook.contains(ACCEPTED_REFS_ENV));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The bounded accept loop never runs more than `max_connections` handlers at
+    /// once, even when more connections arrive than there are slots (issue #47).
+    #[tokio::test]
+    async fn accept_loop_respects_the_concurrency_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        const MAX: usize = 2;
+        const CONNS: usize = 6;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let live_h = live.clone();
+        let peak_h = peak.clone();
+        let server = tokio::spawn(async move {
+            accept_loop(
+                listener,
+                MAX,
+                async {
+                    let _ = shutdown_rx.await;
+                },
+                move |sock| {
+                    let live = live_h.clone();
+                    let peak = peak_h.clone();
+                    async move {
+                        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Hold the slot long enough that, were the cap not
+                        // enforced, all `CONNS` handlers would overlap.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        drop(sock);
+                    }
+                },
+            )
+            .await;
+        });
+
+        // Open more connections than slots; the loop must serialise them.
+        let mut conns = Vec::new();
+        for _ in 0..CONNS {
+            conns.push(tokio::net::TcpStream::connect(addr).await.expect("connect"));
+        }
+        // Long enough for every connection to have been served in waves of MAX.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        shutdown_tx.send(()).expect("send shutdown");
+        server.await.expect("server task");
+
+        let observed_peak = peak.load(Ordering::SeqCst);
+        assert!(
+            observed_peak <= MAX,
+            "peak concurrency {observed_peak} exceeded the cap {MAX}",
+        );
+        assert!(observed_peak >= 1, "the loop never served a connection");
+    }
+
+    /// A shutdown signal stops the accept loop and lets `serve_async` return
+    /// cleanly, dropping the hooks `TempDir` — the path the old unbounded loop
+    /// never reached (issue #47).
+    #[tokio::test]
+    async fn serve_async_shuts_down_cleanly_and_drops_the_hooks_dir() {
+        let repo = test_support::init_bare_repo();
+        let listener =
+            bind("127.0.0.1:0".parse().unwrap(), repo.path().to_path_buf()).expect("bind listener");
+        let hooks_dir = listener.hooks.path().to_path_buf();
+        assert!(hooks_dir.exists(), "hooks dir exists while serving");
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve_async(listener, ListenConfig::default(), async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        // Let the loop reach its accept point, then ask it to stop.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).expect("send shutdown");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve_async returns promptly after shutdown")
+            .expect("server task");
+        assert!(result.is_ok(), "serve_async returned an error: {result:?}");
+        assert!(
+            !hooks_dir.exists(),
+            "hooks dir should be removed once serve_async drains and returns",
+        );
     }
 }

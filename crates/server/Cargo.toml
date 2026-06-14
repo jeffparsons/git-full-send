@@ -17,7 +17,17 @@ gix = { workspace = true, features = ["tree-editor"] }
 serde = { workspace = true }
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+# `net`/`signal`/`sync`/`time`/`macros` back the bounded, signal-driven accept
+# loop (issue #47): tokio `TcpListener`, Unix signal streams, `Semaphore`,
+# per-connection timeout, and `tokio::select!`.
+tokio = { workspace = true, features = [
+    "rt",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "macros",
+] }
 tracing.workspace = true
 
 [dev-dependencies]
