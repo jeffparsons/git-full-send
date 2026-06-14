@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Daily, so a new advisory landing against an unchanged dependency tree is
+    # caught promptly rather than waiting for the next unrelated PR. Only the
+    # supply-chain job runs on this trigger (see the `if:` guards below).
+    - cron: "0 6 * * *"
 
 # Cancel superseded runs on the same ref (e.g. a new push to a PR).
 concurrency:
@@ -20,6 +25,8 @@ jobs:
   # the tool and integration tests shell out to (ADR-0002).
   check:
     name: fmt + clippy + test
+    # Gates code, not the advisory DB — skip on the daily cron.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -37,6 +44,8 @@ jobs:
   # toolchain selected below, so remove it first.
   msrv:
     name: build on MSRV (1.94)
+    # Gates code, not the advisory DB — skip on the daily cron.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -47,3 +56,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV
         run: cargo check --workspace --all-targets --all-features
+
+  # Supply-chain gate (issue #45): fail on a security advisory in the dependency
+  # tree or a disallowed/unknown license, and surface duplicate versions. Policy
+  # lives in the committed deny.toml; the action ships its own cargo-deny binary,
+  # so no Rust toolchain or cache step is needed. Runs on PRs, pushes to main,
+  # and the daily schedule (to catch advisories against an unchanged tree).
+  supply-chain:
+    name: cargo-deny (advisories + licenses + bans + sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

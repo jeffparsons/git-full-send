@@ -1,0 +1,61 @@
+# Supply-chain policy for `cargo deny` (see issue #45). Enforced in CI by the
+# `supply-chain` job in .github/workflows/ci.yml. Run locally with:
+#   cargo deny check
+#
+# Config schema: cargo-deny 0.19.x.
+
+[graph]
+# Match the rest of CI, which builds with --all-features.
+all-features = true
+
+[advisories]
+# Vulnerabilities and unmaintained crates are denied by default in this
+# cargo-deny version; a fresh advisory in the tree fails the check. List
+# deliberate, documented exceptions here when (and only when) we accept one,
+# e.g.:
+#   ignore = [
+#     { id = "RUSTSEC-0000-0000", reason = "why we accept this, and the plan to remove it" },
+#   ]
+ignore = []
+
+[licenses]
+# The workspace is `MIT OR Apache-2.0`; we accept permissive (and permissive-
+# equivalent) licenses from dependencies. Anything not listed here fails the
+# check. The set below is exactly what the current tree resolves to, plus `ISC`
+# (ubiquitous in the Rust ecosystem) to avoid a spurious failure the first time
+# a routine `cargo update` pulls an ISC-licensed crate.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # Weak, file-level copyleft. Pulled transitively by `gix` (the `uluru` LRU
+    # cache). MPL-2.0 obligations apply only to MPL-licensed files, not to our
+    # own code, and the dep isn't under our control — so we accept it.
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are reported but don't fail CI: the only duplicates come
+# from the gix/wasi transitive tree and aren't fixable from our side.
+multiple-versions = "warn"
+# Wildcard (`*`) version requirements are allowed: the only ones in this
+# workspace are the internal crate-to-crate `{ path = ... }` dependencies, which
+# carry no version requirement by design. Every *external* dependency is pinned
+# to an exact-ish version centrally in `[workspace.dependencies]`, so denying
+# wildcards here would only produce false positives on our own crates.
+wildcards = "allow"
+
+[sources]
+# Only the public crates.io registry is allowed; an unknown registry or any git
+# dependency fails the check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
