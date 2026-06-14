@@ -247,11 +247,6 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
     );
 }
 
-// EXPERIMENT (temporary, #44): the server's byte counts are stubbed to 0 while
-// we confirm the byte-counting pumps cause the Linux deadlock, so this test's
-// non-zero-bytes assertion can't hold. Re-enabled when deadlock-free metrics
-// land.
-#[ignore = "experiment: server byte metrics temporarily stubbed (#44)"]
 #[test]
 fn round_trip_records_metrics_on_both_sides() {
     // A sync + checkout writes a per-operation metrics record to each side's
