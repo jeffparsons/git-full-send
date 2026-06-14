@@ -23,7 +23,8 @@
 //!
 //! [ADR-0006]: https://github.com/jeffparsons/git-full-send/blob/main/docs/adr/0006-transport-and-connectivity.md
 
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -237,33 +238,20 @@ fn handle_connection(
         .arg(&hooks_path)
         .arg("receive-pack")
         .arg(repo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        // EXPERIMENT (temporary, #44): hand `receive-pack` the socket directly as
+        // its stdin/stdout — the pre-#55 wiring `git daemon` uses — to confirm
+        // the byte-counting pump threads are the source of the Linux deadlock.
+        // Byte metrics are stubbed to 0 while we confirm; a deadlock-free way to
+        // keep them follows once this is green.
+        .stdin(Stdio::from(OwnedFd::from(
+            sock.try_clone().map_err(ServerError::Io)?,
+        )))
+        .stdout(Stdio::from(OwnedFd::from(sock)))
         .stderr(Stdio::piped());
     if let Some(file) = &accepted_refs {
         command.env(ACCEPTED_REFS_ENV, file.path());
     }
     let mut child = command.spawn().map_err(ServerError::Spawn)?;
-
-    let mut child_stdin = child.stdin.take().expect("piped stdin");
-    let mut child_stdout = child.stdout.take().expect("piped stdout");
-
-    // Two clones drive the pumps; a third stays here so we can shut the socket
-    // down after `receive-pack` exits, sending the client its FIN and unblocking
-    // the inbound pump's blocking read.
-    let mut sock_in = sock.try_clone().map_err(ServerError::Io)?;
-    let mut sock_out = sock.try_clone().map_err(ServerError::Io)?;
-
-    // Inbound: socket → child stdin (the pushed pack). A broken-pipe error once
-    // the child has exited is expected, not a failure; we keep the byte count.
-    let in_pump = std::thread::spawn(move || {
-        let n = std::io::copy(&mut sock_in, &mut child_stdin).unwrap_or(0);
-        drop(child_stdin); // close the child's stdin
-        n
-    });
-    // Outbound: child stdout → socket (the report-status).
-    let out_pump =
-        std::thread::spawn(move || std::io::copy(&mut child_stdout, &mut sock_out).unwrap_or(0));
 
     // Drain receive-pack's stderr (progress, hook rejections) to the log.
     let mut stderr = String::new();
@@ -271,13 +259,7 @@ fn handle_connection(
         let _ = pipe.read_to_string(&mut stderr);
     }
     let status = child.wait().map_err(ServerError::Io)?;
-
-    // The child has exited, so its stdout has hit EOF; join the outbound pump to
-    // be sure the whole report-status reached the socket, then shut the socket
-    // down to send the client its FIN and unblock the inbound pump.
-    let bytes_out = out_pump.join().unwrap_or(0);
-    let _ = sock.shutdown(Shutdown::Both);
-    let bytes_in = in_pump.join().unwrap_or(0);
+    let (bytes_in, bytes_out) = (0u64, 0u64);
 
     let stderr = stderr.trim();
     let refs_updated = accepted_refs.map(read_accepted_refs).unwrap_or_default();
