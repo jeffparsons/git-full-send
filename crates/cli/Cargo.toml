@@ -29,3 +29,6 @@ gfs-server.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 test-support.workspace = true
+# `#[tokio::test]` runs the in-process server (`serve_async`) as a task on the
+# test runtime and drives the binary via async `tokio::process` (issue #61).
+tokio = { workspace = true, features = ["macros", "rt", "process"] }

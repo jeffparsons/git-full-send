@@ -131,9 +131,9 @@ pub enum ServerError {
 
 /// A bound, ready-to-serve listener.
 ///
-/// Produced by [`bind`] and consumed by [`serve`]. Splitting bind from serve
-/// lets a caller (notably tests) bind an ephemeral port, read it back via
-/// [`Listener::local_addr`], and serve on a background thread.
+/// Produced by [`bind`] and consumed by [`serve_async`]. Splitting bind from
+/// serve lets a caller (notably tests) bind an ephemeral port, read it back via
+/// [`Listener::local_addr`], and serve it as a task on its own runtime.
 #[derive(Debug)]
 pub struct Listener {
     listener: TcpListener,
@@ -181,8 +181,8 @@ impl Default for ListenConfig {
 /// Bind a localhost TCP listener for `addr` that will serve `repo`.
 ///
 /// Validates that `repo` is a Git repository and materialises the namespace
-/// `pre-receive` hook, but does not yet accept connections — call [`serve`] or
-/// [`serve_async`].
+/// `pre-receive` hook, but does not yet accept connections — call [`serve_async`]
+/// (or [`listen`], which binds and serves with signal-driven shutdown).
 pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
     let git_dir = gix::discover(&repo)
         .map_err(|_| ServerError::NotARepo(repo.clone()))?
@@ -196,29 +196,6 @@ pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
         git_dir,
         hooks,
     })
-}
-
-/// Serve connections until the process is killed, with default tunables.
-///
-/// A synchronous convenience wrapper around [`serve_async`]: it builds a
-/// current-thread runtime, serves with [`ListenConfig::default`], and never
-/// shuts down (no signal handling). Handy for tests that stand the server up on
-/// a `std::thread` and stop it by exiting the process. Production code uses
-/// [`listen`], which wires SIGTERM/SIGINT to a graceful shutdown.
-//
-// NOTE (issue raised in #47 review): this sync shim exists only to keep the
-// transport tests off an ambient runtime; a follow-up consolidates everything
-// on async/tokio and removes it.
-pub fn serve(listener: Listener) -> Result<(), ServerError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(ServerError::Io)?;
-    runtime.block_on(serve_async(
-        listener,
-        ListenConfig::default(),
-        std::future::pending::<()>(),
-    ))
 }
 
 /// Serve connections asynchronously until `shutdown` resolves, then drain.

@@ -33,30 +33,46 @@ fn test_stream() -> StreamId {
 }
 
 /// Bind an in-process listener for `repo` on an ephemeral localhost port and
-/// serve it on a background thread, returning the bound address.
+/// serve it as a task on the caller's Tokio runtime, returning the bound address.
+///
+/// The server shares the test's runtime with the binary's driver: `run_cli`
+/// awaits the subprocess via `tokio::process`, so the current-thread runtime
+/// stays live to poll this accept loop. The task is detached and stops when the
+/// test process exits (the same fire-and-forget lifecycle the old `std::thread`
+/// helper had).
 fn start_server(repo: &Path) -> SocketAddr {
     let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
-    std::thread::spawn(move || {
-        let _ = gfs_server::serve(listener);
+    tokio::spawn(async move {
+        let _ = gfs_server::serve_async(
+            listener,
+            gfs_server::ListenConfig::default(),
+            std::future::pending::<()>(),
+        )
+        .await;
     });
     addr
 }
 
 /// Run the `git-full-send` binary with `args`, asserting it exits zero.
 ///
+/// Async (`tokio::process`) so awaiting the subprocess keeps the test's
+/// current-thread runtime live for the co-located server task spawned by
+/// [`start_server`].
+///
 /// `GIT_FULL_SEND_USER_INCLUDE` is pointed at a non-existent path so the test is
 /// hermetic from any real per-user include file on the developer's machine (a
 /// missing file is treated as an empty layer).
-fn run_cli(args: &[&str]) {
-    let output = Command::new(BIN)
+async fn run_cli(args: &[&str]) {
+    let output = tokio::process::Command::new(BIN)
         .args(args)
         .env(
             "GIT_FULL_SEND_USER_INCLUDE",
             "/nonexistent/git-full-send-include",
         )
         .output()
+        .await
         .unwrap_or_else(|e| panic!("spawn `git-full-send {}`: {e}", args.join(" ")));
     assert!(
         output.status.success(),
@@ -112,8 +128,8 @@ fn metrics_records(git_dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-#[test]
-fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletions() {
+#[tokio::test]
+async fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletions() {
     let server = init_bare_repo();
     let addr = start_server(server.path());
     let remote = addr.to_string();
@@ -155,7 +171,8 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
         &remote,
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
 
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
@@ -167,7 +184,8 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
         wt.to_str().unwrap(),
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
 
     // The worktree is exactly the union of the synced `code` and `extra` trees.
     assert_eq!(
@@ -212,7 +230,8 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
         &remote,
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
     run_cli(&[
         "update-worktree",
         "--repo",
@@ -221,7 +240,8 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
         wt.to_str().unwrap(),
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
 
     // Both the dropped code file and the dropped force-include are gone…
     assert!(
@@ -247,8 +267,8 @@ fn full_round_trip_through_the_cli_matches_exactly_including_extras_and_deletion
     );
 }
 
-#[test]
-fn round_trip_records_metrics_on_both_sides() {
+#[tokio::test]
+async fn round_trip_records_metrics_on_both_sides() {
     // A sync + checkout writes a per-operation metrics record to each side's
     // sink (issue #42, ADR-0013): `sync` on the client, `receive` and
     // `update_worktree` on the server.
@@ -276,7 +296,8 @@ fn round_trip_records_metrics_on_both_sides() {
         &remote,
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
     let worktree = tempfile::tempdir().expect("worktree dir");
     run_cli(&[
         "update-worktree",
@@ -286,7 +307,8 @@ fn round_trip_records_metrics_on_both_sides() {
         worktree.path().to_str().unwrap(),
         "--stream-id",
         stream_arg,
-    ]);
+    ])
+    .await;
 
     // --- Client: one `sync` record with the per-layer sizes folded in.
     let client_records = metrics_records(&c.join(".git"));

@@ -41,13 +41,13 @@
 //!
 //! [`encode`]: crate::encode
 
-use std::io::Read;
 use std::net::TcpStream;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 
 use thiserror::Error;
+use tokio::process::Command;
 
 /// Errors returned by the transfer step.
 #[derive(Debug, Error)]
@@ -101,8 +101,8 @@ pub enum PushError {
 /// (`HOST:PORT`) via the server's `git receive-pack`. A thin wrapper over
 /// [`push_refs`] for a single ref; the seam tests use it to exercise the
 /// server's ref-namespace policy.
-pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), PushError> {
-    push_refs(repo_dir, remote, &[ref_name])
+pub async fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), PushError> {
+    push_refs(repo_dir, remote, &[ref_name]).await
 }
 
 /// Push `ref_names` from the repository at `repo_dir` to `remote` (`HOST:PORT`)
@@ -119,7 +119,7 @@ pub fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), Pus
 /// volatile `extra` chain; reconciling that per chain (e.g. a second push or pack
 /// config) is left as a follow-up. For now both travel in the one `--thin`
 /// exchange.
-pub fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<(), PushError> {
+pub async fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<(), PushError> {
     let repo = gix::discover(repo_dir).map_err(|source| PushError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -143,7 +143,7 @@ pub fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<()
     // new `code` commit is parented on HEAD rather than the previous tip, so
     // successive pushes are deliberately non-fast-forward (ADR-0004/0005).
     let refspecs: Vec<String> = ref_names.iter().map(|r| format!("+{r}:{r}")).collect();
-    let status = Command::new("git")
+    let child = Command::new("git")
         .arg("-c")
         .arg("protocol.fd.allow=always")
         .arg("push")
@@ -160,24 +160,22 @@ pub fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<()
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            // The child now holds its own copies of the transport fds; drop the
-            // parent's so the connection closes cleanly once the push completes.
-            drop(transport);
-            drop(sock);
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
-            }
-            child.wait().map(|status| (status, stderr))
-        })
         .map_err(PushError::Spawn)?;
 
-    let (status, stderr) = status;
-    if !status.success() {
+    // The child now holds its own copies of the transport fds; drop the parent's
+    // so the connection closes cleanly once the push completes. `tokio::process`
+    // is built on `std::process`, so the reserved inheritable dups pass to the
+    // child exactly as before — but `child.wait_with_output().await` now yields
+    // for the duration of the receive-pack exchange instead of blocking the
+    // runtime thread (so a co-located server task can make progress).
+    drop(transport);
+    drop(sock);
+    let output = child.wait_with_output().await.map_err(PushError::Spawn)?;
+
+    if !output.status.success() {
         return Err(PushError::PushFailed {
-            status,
-            stderr: stderr.trim().to_string(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
     Ok(())

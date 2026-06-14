@@ -18,7 +18,10 @@ rustix.workspace = true
 # Derive `Serialize` for the per-sync metrics record (issue #42, ADR-0013).
 serde = { workspace = true }
 thiserror.workspace = true
-tokio.workspace = true
+# `process` backs the async `git push` spawn in the transfer step (`push_refs`):
+# `tokio::process::Command` + `wait_with_output().await` yields during the
+# receive-pack exchange instead of blocking the runtime thread (issue #61).
+tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 
 [dev-dependencies]
