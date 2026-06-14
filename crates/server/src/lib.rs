@@ -787,7 +787,7 @@ fn update_worktree_blocking(
     // `clean` window. `_lock` releases on drop at the end of this function (or on
     // process exit, since the OS owns the `flock`). The read-only tree
     // resolution above deliberately runs unlocked.
-    let lock_path = worktree_lock_path(&git_dir, worktree)?;
+    let lock_path = worktree_state_dir(&git_dir, worktree)?.join("lock");
     let _lock = acquire_worktree_lock(&lock_path, worktree, mode)?;
 
     let t = Instant::now();
