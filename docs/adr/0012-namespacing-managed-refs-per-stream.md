@@ -97,7 +97,9 @@ covers them.
 
 - **Cleanup / reaping of unused streams.** Because stable ids keep the ref set
   bounded, this is not urgent; an explicit "forget this stream" path and/or
-  TTL-based reaping are left to a follow-up ticket.
+  TTL-based reaping are left to a follow-up ticket. *(Update: the explicit
+  forget path now exists — see [ADR-0014](0014-forgetting-a-stream.md). TTL-based
+  reaping remains deferred.)*
 - **Cross-stream isolation / authentication.** The transport authenticates no
   one (localhost + manual SSH tunnel, single trusted user;
   [ADR-0006](0006-transport-and-connectivity.md)). Namespacing here is

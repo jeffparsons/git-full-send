@@ -29,6 +29,8 @@ enum Command {
     UpdateWorktree(UpdateWorktreeArgs),
     /// List the streams that have a synced `code` ref (server).
     ListStreams(ListStreamsArgs),
+    /// Delete a stream's refs so it no longer appears in `list-streams`.
+    ForgetStream(ForgetStreamArgs),
 }
 
 #[derive(Debug, Args)]
@@ -89,6 +91,18 @@ struct ListStreamsArgs {
     repo: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct ForgetStreamArgs {
+    /// Path to the repository holding the stream's refs. Point it at the server
+    /// repo to drop the stream's `code`/`extra`, or at a client repo to drop its
+    /// local `sent/*` delta-base pins (see `docs/operating.md`).
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Stream whose refs to delete.
+    #[arg(long, value_name = "ID")]
+    stream_id: StreamId,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -121,6 +135,17 @@ async fn main() -> Result<()> {
         Command::ListStreams(args) => {
             for stream in gfs_server::list_streams(&args.repo)? {
                 println!("{stream}");
+            }
+        }
+        Command::ForgetStream(args) => {
+            let removed = gfs_server::forget_stream(&args.repo, &args.stream_id)?;
+            if removed == 0 {
+                println!("no refs for stream `{}`; nothing to forget", args.stream_id);
+            } else {
+                println!(
+                    "forgot stream `{}` ({removed} ref(s) removed)",
+                    args.stream_id
+                );
             }
         }
     }

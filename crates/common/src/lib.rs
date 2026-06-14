@@ -132,6 +132,18 @@ pub fn sent_extra_ref(stream: &StreamId) -> String {
     format!("{STREAMS_PREFIX}{}/sent/extra", stream.as_str())
 }
 
+/// The ref-name prefix under which *every* ref of `stream` lives:
+/// `…/streams/<id>/`.
+///
+/// The trailing slash is significant — it bounds the prefix at a path segment so
+/// stream `foo` does not match a `foobar` ref. Used to enumerate and delete a
+/// stream's refs wholesale when forgetting it (issue #48): `code`, `extra`, and
+/// the client-local `sent/*` pins all sit beneath it. Built from
+/// [`STREAMS_PREFIX`] so neither side hard-codes the layout (ADR-0012).
+pub fn stream_prefix(stream: &StreamId) -> String {
+    format!("{STREAMS_PREFIX}{}/", stream.as_str())
+}
+
 /// Default address the server `listen` binds to.
 ///
 /// Localhost only (ADR-0006): connectivity from a real client is via a manual
@@ -185,6 +197,28 @@ mod tests {
             sent_extra_ref(&id),
             "refs/git-full-send/streams/laptop/sent/extra"
         );
+    }
+
+    #[test]
+    fn stream_prefix_bounds_every_ref_at_a_path_segment() {
+        let id = StreamId::new("laptop").unwrap();
+        let prefix = stream_prefix(&id);
+        assert_eq!(prefix, "refs/git-full-send/streams/laptop/");
+        // The trailing slash is load-bearing for prefix deletion (issue #48).
+        assert!(prefix.ends_with('/'));
+        // Every per-stream ref sits beneath the prefix...
+        for r in [
+            code_ref(&id),
+            sent_ref(&id),
+            extra_ref(&id),
+            sent_extra_ref(&id),
+        ] {
+            assert!(r.starts_with(&prefix), "`{r}` is under `{prefix}`");
+        }
+        // ...while a *different* stream that shares a name prefix is not, because
+        // the trailing slash stops `laptop` matching `laptop-2`'s refs.
+        let sibling = StreamId::new("laptop-2").unwrap();
+        assert!(!code_ref(&sibling).starts_with(&prefix));
     }
 
     #[test]
