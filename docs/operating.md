@@ -81,6 +81,13 @@ git-full-send update-worktree \
   turns in one — [ADR-0012](adr/0012-namespacing-managed-refs-per-stream.md)).
 - Run it whenever you want the remote to reflect the latest `sync` (e.g. from a
   build orchestrator).
+- **Concurrency:** updates of the *same* worktree are serialised by a
+  per-worktree advisory lock, so two runs can't interleave their checkout steps
+  (issue #49). By default a run whose worktree is already being updated **fails
+  fast** with a non-zero exit and an "update already in progress" error. Pass
+  `--wait` to block until the in-progress run finishes instead, and
+  `--wait --timeout <secs>` to give up after a bounded wait. Distinct worktrees
+  never contend.
 
 ### `list-streams` — discover synced streams
 

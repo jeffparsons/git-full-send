@@ -307,6 +307,7 @@ async fn update_worktree_makes_worktree_match_code() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -354,6 +355,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -377,6 +379,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -422,6 +425,7 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -474,6 +478,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -497,6 +502,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -590,6 +596,7 @@ async fn two_streams_do_not_clobber_each_other() {
             server.path().to_path_buf(),
             wt.path().to_path_buf(),
             stream.clone(),
+            gfs_server::LockMode::default(),
         )
         .await
         .expect("update-worktree");
@@ -752,6 +759,7 @@ async fn branch_shaped_stream_id_round_trips() {
         server.path().to_path_buf(),
         wt.path().to_path_buf(),
         stream.clone(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -816,11 +824,182 @@ async fn update_worktree_without_a_synced_stream_errors() {
         server.path().to_path_buf(),
         wt.path().to_path_buf(),
         StreamId::new("never-synced").unwrap(),
+        gfs_server::LockMode::default(),
     )
     .await
     .expect_err("checking out a never-synced stream fails");
     assert!(
         matches!(err, gfs_server::ServerError::MissingCodeRef { .. }),
         "got {err:?}",
+    );
+}
+
+// --- Per-worktree locking (issue #49) -------------------------------------
+
+/// Stand up a server with one synced stream, returning the server repo guard,
+/// its address, and the stream id. The shared preamble for the locking tests.
+async fn server_with_synced_stream() -> (tempfile::TempDir, SocketAddr, StreamId) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "data.txt", "v1");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
+
+    (server, addr, stream)
+}
+
+/// Open and exclusively `flock` `worktree`'s lock file, returning the guard so
+/// the caller can simulate a concurrent `update-worktree` holding it. Dropping
+/// (or `unlock`ing) the returned handle releases the lock.
+fn hold_worktree_lock(repo: &Path, worktree: &Path) -> std::fs::File {
+    let path = gfs_server::worktree_lock_path(repo, worktree).expect("lock path");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("open lock file");
+    file.try_lock().expect("acquire the test-side lock");
+    file
+}
+
+#[tokio::test]
+async fn update_worktree_fails_fast_when_locked() {
+    let (server, _addr, stream) = server_with_synced_stream().await;
+
+    // A first update establishes the worktree (and its lock file).
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::FailFast,
+    )
+    .await
+    .expect("first update succeeds");
+
+    // Simulate a concurrent run by holding the lock, then a default (fail-fast)
+    // update must bounce off it rather than interleave its git steps.
+    let _held = hold_worktree_lock(server.path(), wt);
+    let err = gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::FailFast,
+    )
+    .await
+    .expect_err("a busy worktree fails fast");
+    assert!(
+        matches!(err, gfs_server::ServerError::WorktreeBusy { .. }),
+        "got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_wait_times_out_when_held() {
+    let (server, _addr, stream) = server_with_synced_stream().await;
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    let _held = hold_worktree_lock(server.path(), wt);
+
+    let timeout = std::time::Duration::from_millis(250);
+    let start = std::time::Instant::now();
+    let err = gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::Wait {
+            timeout: Some(timeout),
+        },
+    )
+    .await
+    .expect_err("waiting past the deadline fails");
+    assert!(
+        matches!(err, gfs_server::ServerError::LockTimeout { .. }),
+        "got {err:?}",
+    );
+    assert!(
+        start.elapsed() >= timeout,
+        "it should have waited at least the timeout, waited {:?}",
+        start.elapsed(),
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_wait_proceeds_once_lock_is_released() {
+    let (server, _addr, stream) = server_with_synced_stream().await;
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path().to_path_buf();
+    // Hold the lock, then launch a `--wait` (no timeout) update that must block
+    // on it rather than proceed.
+    let held = hold_worktree_lock(server.path(), &wt);
+
+    let repo = server.path().to_path_buf();
+    let wt_for_update = wt.clone();
+    let stream_for_update = stream.clone();
+    let update = tokio::spawn(async move {
+        gfs_server::update_worktree(
+            repo,
+            wt_for_update,
+            stream_for_update,
+            gfs_server::LockMode::Wait { timeout: None },
+        )
+        .await
+    });
+
+    // Give the update a moment to reach the blocking `lock()`, then release; it
+    // should now acquire the lock and complete.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(held);
+
+    update
+        .await
+        .expect("update task joins")
+        .expect("update succeeds once the lock frees");
+    assert_eq!(
+        worktree_files(&wt),
+        tree_paths(server.path(), &code_ref(&stream)),
+        "the waited-for update checked the tree out",
+    );
+}
+
+#[tokio::test]
+async fn distinct_worktrees_do_not_contend() {
+    let (server, _addr, stream) = server_with_synced_stream().await;
+
+    // Hold worktree A's lock…
+    let a = tempfile::tempdir().expect("worktree A");
+    let _held_a = hold_worktree_lock(server.path(), a.path());
+
+    // …a fail-fast update of a *different* worktree B is unaffected.
+    let b = tempfile::tempdir().expect("worktree B");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        b.path().to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::FailFast,
+    )
+    .await
+    .expect("a distinct worktree is independent of A's lock");
+    assert_eq!(
+        worktree_files(b.path()),
+        tree_paths(server.path(), &code_ref(&stream)),
+        "worktree B was checked out",
     );
 }

@@ -82,6 +82,15 @@ struct UpdateWorktreeArgs {
     /// repo-local default (see `list-streams` to discover synced streams).
     #[arg(long, value_name = "ID")]
     stream_id: StreamId,
+    /// Wait for an in-progress update of the same worktree instead of failing
+    /// fast. Without this, a checkout of a worktree already being updated exits
+    /// non-zero with an "update already in progress" error.
+    #[arg(long)]
+    wait: bool,
+    /// With `--wait`, give up after this many seconds rather than waiting
+    /// indefinitely. Has no effect without `--wait`.
+    #[arg(long, value_name = "SECS", requires = "wait")]
+    timeout: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -130,7 +139,16 @@ async fn main() -> Result<()> {
             gfs_server::listen(args.addr, args.repo, config).await?
         }
         Command::UpdateWorktree(args) => {
-            gfs_server::update_worktree(args.repo, args.worktree, args.stream_id).await?
+            // `--timeout` is gated on `--wait` by clap (`requires = "wait"`), so
+            // a timeout only ever reaches the `Wait` arm.
+            let mode = if args.wait {
+                gfs_server::LockMode::Wait {
+                    timeout: args.timeout.map(std::time::Duration::from_secs),
+                }
+            } else {
+                gfs_server::LockMode::FailFast
+            };
+            gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, mode).await?
         }
         Command::ListStreams(args) => {
             for stream in gfs_server::list_streams(&args.repo)? {
