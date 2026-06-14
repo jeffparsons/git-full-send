@@ -21,9 +21,18 @@ The wire is the raw receive-pack stream end to end (no `git daemon`/`git://`
 framing). Each side attaches the TCP socket to its `git` child differently,
 because the two commands treat their fds differently:
 
-- **Server** hands `git receive-pack` the accepted socket as its **stdin and
-  stdout** (a `try_clone` for the second fd) — exactly what `git daemon` does
-  internally. `receive-pack` drives the protocol over fd 0/1 happily.
+- **Server** runs `git receive-pack` with **piped** stdin/stdout and copies the
+  bytes between the socket and those pipes with two pump threads, so each
+  direction's byte count can be recorded in the metrics (issue #42). (The
+  original wiring handed `receive-pack` the accepted socket directly as its
+  stdin/stdout — exactly what `git daemon` does — which is simpler but gives no
+  seam to count bytes.) The pumps copy with an explicit read/write loop rather
+  than `std::io::copy`: on Linux that function takes a `splice`/`sendfile`
+  zero-copy fast path between the socket and the pipe that **deadlocked** the
+  bidirectional `receive-pack` exchange (issue #44) — `unpack-objects` was
+  starved of pack bytes — while macOS, lacking that path, was unaffected. A
+  plain buffered loop behaves identically on both platforms and yields the count
+  for free.
 - **Client** must *not* put the transport on fd 0/1: `git push` uses its own
   stdin/stdout, and `fd::0,1` wedges it before the protocol starts. Instead the
   client reserves two inheritable dups of the connected socket in the parent

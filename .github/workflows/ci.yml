@@ -21,7 +21,7 @@ jobs:
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -29,33 +29,8 @@ jobs:
         run: cargo fmt --check
       - name: cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      # DIAGNOSTIC (temporary): separate compiling the test binaries from running
-      # them, so we can tell a slow first-time build (deps at opt-level 3) apart
-      # from a real runtime hang. If execution stalls, a watchdog dumps the
-      # process tree and each git/test process's kernel wait-channel, then kills
-      # it. Revert to `cargo test --all` once understood.
-      - name: compile test binaries
-        run: cargo test --all --no-run
-      - name: run tests (with hang diagnostics)
-        run: |
-          cargo test --all -- --test-threads=1 --nocapture &
-          tpid=$!
-          (
-            sleep 180
-            echo "::group::HANG DIAGNOSTICS (tests still running after 180s)"
-            echo "=== ps -ef ==="; ps -ef
-            for p in $(pgrep -f 'git|gfs|e2e|transfer|integration|end_to_end'); do
-              echo "--- pid $p ---"
-              tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null; echo
-              echo "wchan: $(cat "/proc/$p/wchan" 2>/dev/null)"
-            done
-            echo "::endgroup::"
-            kill -9 "$tpid" 2>/dev/null
-          ) &
-          wd=$!
-          wait "$tpid"; rc=$?
-          kill "$wd" 2>/dev/null
-          exit "$rc"
+      - name: cargo test --all
+        run: cargo test --all
 
   # Keep the declared MSRV honest by building on exactly that toolchain. The
   # repo's rust-toolchain.toml pins `stable`, which would otherwise override the
