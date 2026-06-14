@@ -124,6 +124,26 @@ pub enum ServerError {
         /// The trimmed stderr from the failed `git` invocation.
         stderr: String,
     },
+    /// Another `update-worktree` run already holds this worktree's lock and we
+    /// were asked to fail fast (the default — see [`LockMode`]).
+    #[error("another update is already in progress for worktree `{worktree}`")]
+    WorktreeBusy {
+        /// The worktree whose lock was contended.
+        worktree: PathBuf,
+    },
+    /// We waited for the worktree lock (`--wait --timeout`) but the holder did
+    /// not release it before the deadline.
+    #[error("timed out after {timeout:?} waiting for the lock on worktree `{worktree}`")]
+    LockTimeout {
+        /// The worktree whose lock we waited for.
+        worktree: PathBuf,
+        /// How long we waited before giving up.
+        timeout: Duration,
+    },
+    /// Opening or locking the per-worktree lock file failed for a reason other
+    /// than contention.
+    #[error("could not acquire the worktree lock")]
+    Lock(#[source] std::io::Error),
     /// The blocking serve task panicked or was cancelled.
     #[error("serve task failed: {0}")]
     Join(String),
@@ -581,6 +601,27 @@ fn pre_receive_hook() -> String {
     )
 }
 
+/// How [`update_worktree`] reacts when another run already holds the
+/// per-worktree lock (issue #49).
+///
+/// The per-worktree advisory lock serialises the destructive `read-tree` →
+/// `clean` sequence so two concurrent updates of the *same* worktree cannot
+/// interleave. Distinct worktrees take distinct locks and never contend.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum LockMode {
+    /// Fail immediately with [`ServerError::WorktreeBusy`] if the worktree is
+    /// already being updated. The default — the caller (e.g. a build
+    /// orchestrator) decides whether to retry.
+    #[default]
+    FailFast,
+    /// Wait for the lock. `None` blocks until the holder finishes; `Some(d)`
+    /// polls until `d` elapses, then fails with [`ServerError::LockTimeout`].
+    Wait {
+        /// Optional wait deadline; `None` waits indefinitely.
+        timeout: Option<Duration>,
+    },
+}
+
 /// Check a stream's synced `code` state out into the given worktree.
 ///
 /// An authoritative, destructive overwrite of the remote worktree (ADR-0008),
@@ -594,14 +635,19 @@ fn pre_receive_hook() -> String {
 /// stream lands in which worktree — a dedicated worktree per stream, several
 /// streams taking turns in one, etc. — and this imposes no 1:1 mapping.
 ///
+/// Concurrent updates of the same worktree are serialised by a per-worktree
+/// advisory lock; `mode` controls whether a contended run fails fast (default)
+/// or waits (issue #49).
+///
 /// The blocking `git` work runs on a dedicated thread so it does not occupy the
 /// async executor (mirroring [`listen`]).
 pub async fn update_worktree(
     repo: PathBuf,
     worktree: PathBuf,
     stream: gfs_common::StreamId,
+    mode: LockMode,
 ) -> Result<(), ServerError> {
-    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree, &stream))
+    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree, &stream, mode))
         .await
         .map_err(|e| ServerError::Join(e.to_string()))?
 }
@@ -711,6 +757,7 @@ fn update_worktree_blocking(
     repo: &Path,
     worktree: &Path,
     stream: &gfs_common::StreamId,
+    mode: LockMode,
 ) -> Result<(), ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let git_dir = discovered.git_dir().to_path_buf();
@@ -719,8 +766,9 @@ fn update_worktree_blocking(
     let t_total = Instant::now();
 
     // Resolve the stream's `code` tree first, so a never-synced stream fails
-    // cleanly before any worktree mutation. Then overlay `extra` (absent ⇒
-    // nothing to overlay) onto it at identity paths to get the tree to check out.
+    // cleanly before any worktree mutation (or lock). Then overlay `extra`
+    // (absent ⇒ nothing to overlay) onto it at identity paths to get the tree to
+    // check out.
     let t = Instant::now();
     let code_tree = resolve_code_tree(&git_dir, stream)?;
     let extra_tree = resolve_extra_tree(&git_dir, stream)?;
@@ -733,6 +781,14 @@ fn update_worktree_blocking(
     // `--reset` simply has no stat shortcut and does a one-time full rewrite.
     std::fs::create_dir_all(worktree).map_err(ServerError::CreateWorktree)?;
     let index = worktree_index_path(&git_dir, worktree)?;
+
+    // Serialise against concurrent updates of *this* worktree (issue #49): hold
+    // the per-worktree advisory lock across the destructive `read-tree` →
+    // `clean` window. `_lock` releases on drop at the end of this function (or on
+    // process exit, since the OS owns the `flock`). The read-only tree
+    // resolution above deliberately runs unlocked.
+    let lock_path = worktree_lock_path(&git_dir, worktree)?;
+    let _lock = acquire_worktree_lock(&lock_path, worktree, mode)?;
 
     let t = Instant::now();
     run_git_step(
@@ -893,15 +949,17 @@ fn overlay_extra_onto_code(
     Ok(combined.to_string())
 }
 
-/// The path of the persistent index for `worktree`, under the git dir.
+/// The per-worktree state directory under the git dir, created if absent.
 ///
 /// Keyed by the canonical worktree path so distinct worktrees of one repo get
-/// distinct indexes. The parent directory is created.
-fn worktree_index_path(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
+/// distinct directories (and thus distinct indexes and locks); the same worktree
+/// maps to the same directory across runs regardless of how the path was spelled.
+/// Everything in here lives under the git dir, never inside the worktree itself —
+/// `clean -fdx` would otherwise delete it.
+fn worktree_state_dir(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
     use std::hash::{Hash, Hasher};
 
-    // Canonicalise so the same worktree maps to the same index across runs
-    // regardless of how the path was spelled (the dir exists by now).
+    // The dir exists by now (the worktree was created), so `canonicalize` works.
     let canonical = worktree
         .canonicalize()
         .map_err(ServerError::CreateWorktree)?;
@@ -911,7 +969,88 @@ fn worktree_index_path(git_dir: &Path, worktree: &Path) -> Result<PathBuf, Serve
 
     let dir = git_dir.join("git-full-send").join("worktrees").join(key);
     std::fs::create_dir_all(&dir).map_err(ServerError::CreateWorktree)?;
-    Ok(dir.join("index"))
+    Ok(dir)
+}
+
+/// The path of the persistent index for `worktree`, under the git dir.
+fn worktree_index_path(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
+    Ok(worktree_state_dir(git_dir, worktree)?.join("index"))
+}
+
+/// The path of the per-worktree advisory lock file, under the git dir.
+///
+/// Beside the persistent `index` in the same per-worktree state directory, so it
+/// inherits the same per-worktree keying and never lands inside the worktree.
+/// Public so a caller (e.g. an orchestrator, or a test) can locate the lock that
+/// [`update_worktree`] takes during a checkout.
+pub fn worktree_lock_path(repo: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
+    let git_dir = gix::discover(repo)
+        .map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?
+        .git_dir()
+        .to_path_buf();
+    Ok(worktree_state_dir(&git_dir, worktree)?.join("lock"))
+}
+
+/// Acquire the per-worktree advisory lock at `lock_path` per `mode`.
+///
+/// Returns the open lock-file handle as an RAII guard: the OS releases the
+/// `flock` when the handle is dropped (or the process exits — so a crashed
+/// holder never leaves a stale lock). The caller must keep the returned `File`
+/// alive for the whole critical section.
+fn acquire_worktree_lock(
+    lock_path: &Path,
+    worktree: &Path,
+    mode: LockMode,
+) -> Result<std::fs::File, ServerError> {
+    use std::fs::TryLockError;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(ServerError::Lock)?;
+
+    match mode {
+        LockMode::FailFast => match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(ServerError::WorktreeBusy {
+                worktree: worktree.to_path_buf(),
+            }),
+            Err(TryLockError::Error(e)) => Err(ServerError::Lock(e)),
+        },
+        LockMode::Wait { timeout: None } => {
+            file.lock().map_err(ServerError::Lock)?;
+            Ok(file)
+        }
+        LockMode::Wait {
+            timeout: Some(timeout),
+        } => {
+            // std offers no timed lock, so poll `try_lock` until the deadline.
+            // We are on the blocking `update_worktree` thread, so sleeping is
+            // fine. The first poll is immediate; if the lock is free it returns
+            // at once without sleeping.
+            let deadline = Instant::now() + timeout;
+            let poll = Duration::from_millis(100);
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(file),
+                    Err(TryLockError::WouldBlock) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(ServerError::LockTimeout {
+                                worktree: worktree.to_path_buf(),
+                                timeout,
+                            });
+                        }
+                        std::thread::sleep(poll.min(deadline - now));
+                    }
+                    Err(TryLockError::Error(e)) => return Err(ServerError::Lock(e)),
+                }
+            }
+        }
+    }
 }
 
 /// Run one `git` step of the worktree update with the per-worktree index, mapping
