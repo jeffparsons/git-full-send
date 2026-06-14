@@ -19,14 +19,24 @@ fn test_stream() -> StreamId {
     StreamId::new("test").unwrap()
 }
 
-/// Bind a listener for `repo` on an ephemeral localhost port and serve it on a
-/// background thread, returning the bound address.
+/// Bind a listener for `repo` on an ephemeral localhost port and serve it as a
+/// task on the caller's Tokio runtime, returning the bound address.
+///
+/// The server shares the test's runtime with the in-process client: `push_refs`
+/// is async (it `.await`s the receive-pack exchange), so a current-thread runtime
+/// interleaves the two. The task is detached and stops when the test process
+/// exits — the same fire-and-forget lifecycle the old `std::thread` helper had.
 fn start_server(repo: &Path) -> SocketAddr {
     let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
-    std::thread::spawn(move || {
-        let _ = gfs_server::serve(listener);
+    tokio::spawn(async move {
+        let _ = gfs_server::serve_async(
+            listener,
+            gfs_server::ListenConfig::default(),
+            std::future::pending::<()>(),
+        )
+        .await;
     });
     addr
 }
@@ -198,10 +208,14 @@ async fn rejects_refs_outside_the_namespace() {
     let remote = addr.to_string();
 
     // A namespaced ref is accepted…
-    gfs_client::push_ref(c, &remote, &code).expect("a refs/git-full-send/* push is accepted");
+    gfs_client::push_ref(c, &remote, &code)
+        .await
+        .expect("a refs/git-full-send/* push is accepted");
     // …but anything outside the namespace is declined by the pre-receive hook.
     assert!(
-        gfs_client::push_ref(c, &remote, "refs/heads/main").is_err(),
+        gfs_client::push_ref(c, &remote, "refs/heads/main")
+            .await
+            .is_err(),
         "a non-namespaced push is rejected",
     );
     assert!(

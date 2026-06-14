@@ -92,7 +92,7 @@ pub async fn sync(
 
     // Push both refs in one receive-pack exchange (ADR-0004/0005).
     let t = Instant::now();
-    push::push_refs(&repo_dir, &remote, &[&code.code_ref, &extra.extra_ref])?;
+    push::push_refs(&repo_dir, &remote, &[&code.code_ref, &extra.extra_ref]).await?;
     let push_ms = elapsed_ms(t);
 
     // Retain both delta bases only after the push succeeds.
