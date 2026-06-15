@@ -1120,8 +1120,14 @@ fn backdate_code_ref(repo: &Path, stream: &StreamId, unix_secs: i64) {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        // Identity via env so this works in a bare server repo with no configured
+        // `user.*` (CI has no global identity).
         .env("GIT_COMMITTER_DATE", &date)
         .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_NAME", "git-full-send tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@git-full-send.invalid")
+        .env("GIT_AUTHOR_NAME", "git-full-send tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@git-full-send.invalid")
         .args(["commit-tree", tree.trim(), "-m", "backdated"])
         .output()
         .expect("run git commit-tree");
