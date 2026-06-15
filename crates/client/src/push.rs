@@ -17,11 +17,16 @@
 //! The socket is passed on dedicated file descriptors, **not** as the child's
 //! stdin/stdout: `git push` uses its own stdin/stdout, and pointing the
 //! transport at fd 0/1 wedges it before the protocol even starts. We reserve two
-//! inheritable dups of the socket in the parent — `try_clone_to_owned` for the
-//! dup, then `rustix` to clear `FD_CLOEXEC` so they survive `exec` — and pass
-//! their numbers as `fd::<in>,<out>`, leaving `git`'s own stdio untouched. (The
-//! server side is simpler — `git receive-pack` happily takes the raw socket as
-//! its stdin/stdout, exactly as `git daemon` feeds it.)
+//! dups of the socket in the parent (`try_clone_to_owned`) and pass their
+//! numbers as `fd::<in>,<out>`, leaving `git`'s own stdio untouched. The dups
+//! keep `FD_CLOEXEC` in the parent; `git` would normally not inherit them across
+//! `exec`, so we clear the flag **only in the forked child** via a `pre_exec`
+//! hook (`fcntl(F_SETFD)`, async-signal-safe) just before `exec`. `fork` copies
+//! the fd table, so the intended `git push` still inherits the dups while no
+//! unrelated concurrent `spawn` can — the dups are never inheritable in the
+//! parent's fd table (#57). (The server side is simpler — `git receive-pack`
+//! happily takes the raw socket as its stdin/stdout, exactly as `git daemon`
+//! feeds it.)
 //!
 //! ## Per-chain delta policy
 //!
@@ -52,6 +57,7 @@
 
 use std::net::TcpStream;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
@@ -166,10 +172,12 @@ pub async fn push_refs(
         source,
     })?;
 
-    // Reserve two inheritable dups of the socket for the transport's input and
-    // output fds, and pass their numbers to the `fd::` transport. Reserving them
-    // in the parent — rather than `dup2`-ing in a `pre_exec` hook — keeps them
-    // clear of the fds `Command` uses to wire up the child's own stdio.
+    // Reserve two dups of the socket for the transport's input and output fds,
+    // and pass their numbers to the `fd::` transport. Reserving them in the
+    // parent (vs. `dup2`-ing in a `pre_exec` hook) keeps them clear of the fds
+    // `Command` uses to wire up the child's own stdio. The dups keep
+    // `FD_CLOEXEC`; a `pre_exec` hook clears it in the child just before `exec`
+    // (below), so they are never inheritable across an unrelated `spawn` (#57).
     let transport = TransportFds::reserve(&sock).map_err(PushError::Io)?;
 
     // Force (`+`): the synthetic scratch refs are overwritten each sync, and a
@@ -192,25 +200,47 @@ pub async fn push_refs(
                 .arg("--no-thin");
         }
     }
-    let child = command
-        .arg(format!(
-            "fd::{},{}",
-            transport.in_fd.as_raw_fd(),
-            transport.out_fd.as_raw_fd()
-        ))
+    let in_fd = transport.in_fd.as_raw_fd();
+    let out_fd = transport.out_fd.as_raw_fd();
+    command
+        .arg(format!("fd::{in_fd},{out_fd}"))
         .args(&refspecs)
         .current_dir(workdir)
         // `git push` keeps its own stdio; the transport lives on the reserved fds.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(PushError::Spawn)?;
+        .stderr(Stdio::piped());
+
+    // Clear `FD_CLOEXEC` on the transport dups in the forked child, just before
+    // `exec`, so `git push` inherits them while the parent's copies stay
+    // `FD_CLOEXEC` throughout — no unrelated concurrent `spawn` can inherit the
+    // connection socket (#57). `tokio::process::Command` doesn't re-expose
+    // `CommandExt`, so the hook is registered on the inner `std` command.
+    //
+    // SAFETY: the closure runs after `fork`, once `std` has wired up the child's
+    // stdio, and before `exec`. It only calls `fcntl(F_SETFD)` — async-signal-
+    // safe — on two fixed descriptors, with no allocation or locking. The parent
+    // keeps the `OwnedFd`s alive (in `transport`) until after `spawn`, and the
+    // closure captures only the raw fd numbers, so the descriptors are still open
+    // when the child clears the flag.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            for raw in [in_fd, out_fd] {
+                let fd = BorrowedFd::borrow_raw(raw);
+                rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty())
+                    .map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+
+    let child = command.spawn().map_err(PushError::Spawn)?;
 
     // The child now holds its own copies of the transport fds; drop the parent's
     // so the connection closes cleanly once the push completes. `tokio::process`
-    // is built on `std::process`, so the reserved inheritable dups pass to the
-    // child exactly as before — but `child.wait_with_output().await` now yields
+    // is built on `std::process`, so the reserved dups (and the `pre_exec` flag
+    // flip) pass to the child exactly as a synchronous spawn would — but
+    // `child.wait_with_output().await` now yields
     // for the duration of the receive-pack exchange instead of blocking the
     // runtime thread (so a co-located server task can make progress).
     drop(transport);
@@ -238,20 +268,20 @@ impl TransportFds {
     fn reserve(socket: impl AsFd) -> std::io::Result<Self> {
         let socket = socket.as_fd();
         Ok(Self {
-            in_fd: dup_inheritable(socket)?,
-            out_fd: dup_inheritable(socket)?,
+            in_fd: dup_socket(socket)?,
+            out_fd: dup_socket(socket)?,
         })
     }
 }
 
-/// Duplicate `fd` to a new owned descriptor with `FD_CLOEXEC` cleared, so it is
-/// inherited across `exec`. `try_clone_to_owned` dups to the lowest free fd
-/// (≥ 3 in practice, since stdio holds 0–2) but sets `FD_CLOEXEC`; `rustix`
-/// clears it. The returned `OwnedFd` closes the parent's copy on drop.
-fn dup_inheritable(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
-    let dup = fd.try_clone_to_owned()?;
-    rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)?;
-    Ok(dup)
+/// Duplicate `fd` to a new owned descriptor for the transport. `try_clone_to_owned`
+/// dups to the lowest free fd (≥ 3 in practice, since stdio holds 0–2) and sets
+/// `FD_CLOEXEC`, so the dup is **not** inherited across `exec` from the parent —
+/// the flag is cleared only in the forked child, via the `pre_exec` hook in
+/// [`push_refs`], so it is never inheritable across an unrelated `spawn` (#57).
+/// The returned `OwnedFd` closes the parent's copy on drop.
+fn dup_socket(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    fd.try_clone_to_owned()
 }
 
 /// Pin `commit` (a just-pushed tip) under `sent_ref` so its objects survive
