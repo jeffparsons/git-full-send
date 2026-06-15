@@ -385,6 +385,7 @@ dependencies = [
  "gix",
  "rustix",
  "serde",
+ "serde_json",
  "tempfile",
  "test-support",
  "thiserror",

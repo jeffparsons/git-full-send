@@ -342,7 +342,9 @@ base reset — never the previously-mysterious "sometimes slow".
   small **follow-up benchmark** — sync a changed build output with vs. without the
   prior tip retained, measuring pack size and `pack-objects` CPU — would confirm
   the bimodal split directly and is recommended before locking in the tuning
-  numbers. Filed as a candidate follow-up rather than done here.
+  numbers. Filed as a candidate follow-up rather than done here. **Resolved:** see
+  [§6 Benchmark results](#6-benchmark-results-issue-51), which measures the
+  with/without-base split directly.
 - **Real output sizes vs. `core.bigFileThreshold` (512 MiB)** were not measured;
   whether any force-included outputs cross the threshold (§2.2) should be checked
   against the actual `extra` set (ADR-0007) when configuring the tool.
@@ -350,6 +352,54 @@ base reset — never the previously-mysterious "sometimes slow".
   gitoxide moves fast — re-check `crate-status.md` and #306/#307 before relying on
   a gap being open (it would only *widen* the set of options, not change today's
   recommendation).
+
+## 6. Benchmark results (issue #51)
+
+The §5 follow-up is now a runnable harness:
+`crates/client/tests/delta_base_benchmark.rs`. It stands up the real
+`git receive-pack` server in-process, drives single-ref `git push` exchanges, and
+reads the inbound pack size the server already records per connection (`bytes_in`,
+ADR-0013). Base presence is set by **which fresh server already holds the prior
+tip** — real push negotiation, not gc timing. Reproduce with:
+
+```text
+cargo test -p gfs-client --test delta_base_benchmark -- --ignored --nocapture
+```
+
+Each row pushes a changed 4 MiB artifact (below `core.bigFileThreshold`, so
+delta-eligible). A/B use a **delta-friendly** artifact (text, one changed line);
+C/D use a **delta-hostile** one (incompressible bytes, rebuilt from scratch so it
+shares nothing with its predecessor). Representative run (`ms` is server-side wall
+time — noisy, single-machine, indicative only):
+
+| Scenario | Chain | Policy | Base | bytes_in | ms |
+| --- | --- | --- | --- | ---: | ---: |
+| A — delta-friendly, changed line | `code` | thin | present | 671 | 73 |
+| B — delta-friendly, same content | `code` | thin | absent | 208,271 | 80 |
+| C — delta-hostile, rebuilt artifact | `extra` | whole-object | present | 4,196,082 | 206 |
+| D — delta-hostile, rebuilt artifact | `code` | thin | present | 4,196,080 | 247 |
+
+**A vs. B — the delta-base payoff (§2.1).** With the prior tip retained, the
+changed line crosses as a 671-byte thin `OBJ_REF_DELTA`; with no base, the same
+content is sent whole (208 KB — the zlib-compressed text, not the raw 4 MiB). That
+is a **~310× reduction** purely from base availability, and it is exactly the
+bimodal **base present ⇒ small delta / base absent ⇒ whole object** split §2.1
+predicts and §3 fixes with retention + `--thin`. (B is sub-megabyte only because
+text compresses; an incompressible whole send is ~4 MiB, as C/D show.)
+
+**C vs. D — the per-chain delta policy (§2.3, issue #50).** On a rebuilt,
+incompressible artifact the `--thin` push (D) and the whole-object `extra` policy
+(C) cost the **same bytes on the wire** (D/C ≈ 1.00): the delta search finds no
+usable base and sends the object whole regardless. Thin buys nothing here — and in
+this run actually cost *more* server time (247 ms vs. 206 ms), the futile
+delta-search CPU §2.3 describes (timing is noisy, but the direction matches).
+This is the empirical backing for #50's decision to put the volatile `extra` chain
+on a predictable whole-object send rather than a variable delta search.
+
+Together the rows confirm the design's two levers: **retain the base** so
+delta-friendly changes stay tiny (`code`/`--thin`), and **don't bother deltifying**
+content that won't delta (`extra`/whole-object) — predictable cost, no wasted
+search.
 
 ## Sources
 
