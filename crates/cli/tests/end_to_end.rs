@@ -65,6 +65,12 @@ fn start_server(repo: &Path) -> SocketAddr {
 /// hermetic from any real per-user include file on the developer's machine (a
 /// missing file is treated as an empty layer).
 async fn run_cli(args: &[&str]) {
+    run_cli_capture(args).await;
+}
+
+/// Like [`run_cli`], but returns the command's captured stdout — used to assert on
+/// operator-facing output such as the end-of-sync summary block (issue #53).
+async fn run_cli_capture(args: &[&str]) -> String {
     let output = tokio::process::Command::new(BIN)
         .args(args)
         .env(
@@ -81,6 +87,7 @@ async fn run_cli(args: &[&str]) {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
+    String::from_utf8(output.stdout).expect("stdout is utf-8")
 }
 
 /// The recursive set of paths in `tree_ish` within `repo`.
@@ -288,7 +295,7 @@ async fn round_trip_records_metrics_on_both_sides() {
     let stream = test_stream();
     let stream_arg = stream.as_str();
 
-    run_cli(&[
+    let sync_stdout = run_cli_capture(&[
         "sync",
         "--repo",
         c.to_str().unwrap(),
@@ -298,6 +305,23 @@ async fn round_trip_records_metrics_on_both_sides() {
         stream_arg,
     ])
     .await;
+
+    // The operator-facing summary block (issue #53) reports the same fixture the
+    // metrics record does: stream/remote, one code file ("hello" = 5 B) and one
+    // extra file ("app" = 3 B). Bytes are well under 1 KiB, so they print as `B`.
+    assert!(
+        sync_stdout.contains(&format!("Synced stream {stream_arg} to {remote}")),
+        "summary names the stream and remote:\n{sync_stdout}",
+    );
+    assert!(
+        sync_stdout.contains("code:  1 file(s) (+5 B), 0 removed"),
+        "summary reports the code layer:\n{sync_stdout}",
+    );
+    assert!(
+        sync_stdout.contains("extra: 1 file(s) (3 B)"),
+        "summary reports the extra layer:\n{sync_stdout}",
+    );
+
     let worktree = tempfile::tempdir().expect("worktree dir");
     run_cli(&[
         "update-worktree",

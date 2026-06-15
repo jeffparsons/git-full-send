@@ -34,6 +34,44 @@ pub use push::{DeltaPolicy, PushError, push_ref, push_refs};
 pub use select::{SelectError, select_extra_paths, select_extra_paths_with};
 pub use stream::StreamResolveError;
 
+/// Wall-clock per-phase timings for one `sync`, in milliseconds.
+///
+/// The two encode phases and the two pushes are timed separately because each
+/// chain rides its own receive-pack exchange with its own delta policy
+/// (ADR-0005); `retain_ms` is the (small) cost of pinning each pushed tip as the
+/// next delta base. These feed both the durable metrics record (issue #42) and
+/// the operator-facing [`SyncSummary`] (issue #53).
+#[derive(Debug, Clone, Copy)]
+pub struct SyncTimings {
+    pub total_ms: f64,
+    pub code_encode_ms: f64,
+    pub extra_encode_ms: f64,
+    pub code_push_ms: f64,
+    pub extra_push_ms: f64,
+    pub retain_ms: f64,
+}
+
+/// Operator-facing summary of one completed `sync` (issue #53).
+///
+/// Carries the counts, sizes, and per-phase timings a `sync` already computes for
+/// its metrics record (issue #42), returned so the caller can present them however
+/// it likes. The durable JSONL record (ADR-0013) is still written independently
+/// inside [`sync`]; this is the live summary surface.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SyncSummary {
+    /// The stream the state was synced under.
+    pub stream: StreamId,
+    /// The server endpoint pushed to (`HOST:PORT`).
+    pub remote: String,
+    /// Code-layer sizes: the index→worktree delta (overlaid/removed).
+    pub code: CodeLayerStats,
+    /// Extra-layer sizes: the full force-include set.
+    pub extra: ExtraLayerStats,
+    /// Per-phase wall-clock timings.
+    pub timings: SyncTimings,
+}
+
 /// Errors returned by client operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -75,7 +113,7 @@ pub async fn sync(
     remote: String,
     stream: Option<StreamId>,
     user_include: Option<PathBuf>,
-) -> Result<(), ClientError> {
+) -> Result<SyncSummary, ClientError> {
     let stream = stream::resolve_stream(&repo_dir, stream)?;
 
     // Time each phase for the per-sync metrics record (issue #42, ADR-0013).
@@ -120,28 +158,25 @@ pub async fn sync(
     retain_ms += elapsed_ms(t);
 
     let total_ms = elapsed_ms(t_total);
-    tracing::info!(
-        stream = %stream, %remote, total_ms,
-        code_files = code.stats.files_overlaid, code_bytes = code.stats.bytes_overlaid,
-        extra_files = extra.stats.files, extra_bytes = extra.stats.bytes,
-        "pushed code and extra state to server"
-    );
+    let timings = SyncTimings {
+        total_ms,
+        code_encode_ms,
+        extra_encode_ms,
+        code_push_ms,
+        extra_push_ms,
+        retain_ms,
+    };
 
-    // Best-effort: record the sync's timings and per-layer sizes (ADR-0013).
-    metrics::record_sync(
-        &repo_dir,
-        &stream,
-        &remote,
-        &code,
-        &extra,
-        metrics::Timings {
-            total_ms,
-            code_encode_ms,
-            extra_encode_ms,
-            code_push_ms,
-            extra_push_ms,
-            retain_ms,
-        },
-    );
-    Ok(())
+    // Best-effort: record the sync's timings and per-layer sizes (ADR-0013). The
+    // human-readable summary is the caller's job (issue #53): we return the same
+    // counts/sizes/timings as a `SyncSummary` rather than logging a summary line.
+    metrics::record_sync(&repo_dir, &stream, &remote, &code, &extra, timings);
+
+    Ok(SyncSummary {
+        stream,
+        remote,
+        code: code.stats,
+        extra: extra.stats,
+        timings,
+    })
 }

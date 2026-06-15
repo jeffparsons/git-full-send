@@ -9,18 +9,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::SyncTimings;
 use crate::encode::{EncodeOutcome, ExtraOutcome};
-
-/// Wall-clock phase timings for one `sync`, in milliseconds.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Timings {
-    pub total_ms: f64,
-    pub code_encode_ms: f64,
-    pub extra_encode_ms: f64,
-    pub code_push_ms: f64,
-    pub extra_push_ms: f64,
-    pub retain_ms: f64,
-}
 
 /// One `sync` operation's metrics record.
 #[derive(Serialize)]
@@ -70,7 +60,7 @@ pub(crate) fn record_sync(
     remote: &str,
     code: &EncodeOutcome,
     extra: &ExtraOutcome,
-    timings: Timings,
+    timings: SyncTimings,
 ) {
     let git_dir = match gix::discover(repo_dir) {
         Ok(repo) => repo.git_dir().to_path_buf(),
