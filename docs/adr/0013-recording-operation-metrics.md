@@ -61,8 +61,10 @@ the durable record.
 
 ### What is recorded
 
-- **Client `sync`:** per-phase wall times (`code_encode`, `extra_encode`, `push`,
-  `retain`) and the total; for the **code** layer the working-tree *delta*
+- **Client `sync`:** per-phase wall times (`code_encode`, `extra_encode`,
+  `code_push`, `extra_push`, `retain`) and the total — the two pushes are timed
+  separately because each chain rides its own exchange with its own delta policy
+  ([ADR-0005](0005-transfer-mechanism.md)); for the **code** layer the working-tree *delta*
   (files overlaid, bytes overlaid, files removed) and for the **extra** layer the
   *full* selected set (files, bytes), each with its commit/tree id; plus stream,
   remote, timestamp, and tool version.

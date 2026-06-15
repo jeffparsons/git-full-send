@@ -11,8 +11,8 @@
 //! transport, so `git` speaks the receive-pack protocol directly over the socket
 //! — a raw receive-pack stream, no custom framing (ADR-0005). `git` blocks the
 //! `fd::`/`ext::` transports by default, so we enable it explicitly with
-//! `-c protocol.fd.allow=always`. `--thin` lets a changed blob travel as a small
-//! delta against a base the server already holds (Research 0003).
+//! `-c protocol.fd.allow=always`. The delta policy on the wire is chosen per chain
+//! (see below).
 //!
 //! The socket is passed on dedicated file descriptors, **not** as the child's
 //! stdin/stdout: `git push` uses its own stdin/stdout, and pointing the
@@ -22,6 +22,15 @@
 //! their numbers as `fd::<in>,<out>`, leaving `git`'s own stdio untouched. (The
 //! server side is simpler — `git receive-pack` happily takes the raw socket as
 //! its stdin/stdout, exactly as `git daemon` feeds it.)
+//!
+//! ## Per-chain delta policy
+//!
+//! A single `git push` applies one delta policy to the whole pack. ADR-0005 wants
+//! `--thin` deltas for the `code` chain but a *predictable whole-object send* for
+//! the volatile `extra` chain, so `sync` pushes the two chains in **separate**
+//! exchanges, each with its own [`DeltaPolicy`]. `--thin` lets a changed blob
+//! travel as a small delta against a base the server already holds (Research 0003);
+//! `--no-thin -c pack.window=0` disables the delta search for the whole-object send.
 //!
 //! This is Unix-only; the tool is Unix-first. A purely standalone binary could
 //! instead bridge the socket with an `ext::` "micro-utility" connector and avoid
@@ -97,29 +106,53 @@ pub enum PushError {
     },
 }
 
+/// How a push asks `git` to deltify the objects it sends.
+///
+/// A single `git push` applies **one** delta policy to the whole pack (`--thin`,
+/// `pack.window`/`pack.depth` are per-invocation, not per-ref), so a sync that
+/// wants different policies for its `code` and `extra` chains issues one push per
+/// chain (ADR-0005).
+#[derive(Debug, Clone, Copy, Default)]
+pub enum DeltaPolicy {
+    /// `--thin`: send a changed blob as a small delta against a base the server
+    /// already holds. The default; used for the `code` chain (ADR-0005).
+    #[default]
+    Thin,
+    /// `--no-thin -c pack.window=0`: disable the delta search for a *predictable
+    /// whole-object send*. Used for the volatile `extra` chain (ADR-0005), whose
+    /// big build outputs don't delta well — negotiation still excludes objects the
+    /// server already holds, so only the *changed* objects travel, just whole
+    /// rather than thin-deltified.
+    WholeObject,
+}
+
 /// Push `ref_name` from the repository at `repo_dir` to `remote`
-/// (`HOST:PORT`) via the server's `git receive-pack`. A thin wrapper over
-/// [`push_refs`] for a single ref; the seam tests use it to exercise the
-/// server's ref-namespace policy.
-pub async fn push_ref(repo_dir: &Path, remote: &str, ref_name: &str) -> Result<(), PushError> {
-    push_refs(repo_dir, remote, &[ref_name]).await
+/// (`HOST:PORT`) via the server's `git receive-pack`, under `policy`. A thin
+/// wrapper over [`push_refs`] for a single ref; the seam tests use it to exercise
+/// the server's ref-namespace policy.
+pub async fn push_ref(
+    repo_dir: &Path,
+    remote: &str,
+    ref_name: &str,
+    policy: DeltaPolicy,
+) -> Result<(), PushError> {
+    push_refs(repo_dir, remote, &[ref_name], policy).await
 }
 
 /// Push `ref_names` from the repository at `repo_dir` to `remote` (`HOST:PORT`)
-/// via the server's `git receive-pack`, all in **one** `git push` exchange.
+/// via the server's `git receive-pack`, in **one** `git push` exchange under the
+/// given `policy`.
 ///
-/// `sync` pushes the `code` and `extra` refs together here (ADR-0004/0005), then
-/// pins their delta bases with [`retain_pushed_tip`]. On success every ref (and
+/// `sync` pushes the `code` and `extra` chains in **separate** exchanges so each
+/// can carry its own [`DeltaPolicy`] (ADR-0005), pinning each chain's delta base
+/// with [`retain_pushed_tip`] after its push succeeds. On success every ref (and
 /// its objects) is on the server.
-///
-/// ## Delta policy (deferred)
-///
-/// A single `git push` applies one global delta policy. ADR-0005 wants `--thin`
-/// deltas for the `code` chain but a *predictable whole-object send* for the
-/// volatile `extra` chain; reconciling that per chain (e.g. a second push or pack
-/// config) is left as a follow-up. For now both travel in the one `--thin`
-/// exchange.
-pub async fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Result<(), PushError> {
+pub async fn push_refs(
+    repo_dir: &Path,
+    remote: &str,
+    ref_names: &[&str],
+    policy: DeltaPolicy,
+) -> Result<(), PushError> {
     let repo = gix::discover(repo_dir).map_err(|source| PushError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -143,11 +176,23 @@ pub async fn push_refs(repo_dir: &Path, remote: &str, ref_names: &[&str]) -> Res
     // new `code` commit is parented on HEAD rather than the previous tip, so
     // successive pushes are deliberately non-fast-forward (ADR-0004/0005).
     let refspecs: Vec<String> = ref_names.iter().map(|r| format!("+{r}:{r}")).collect();
-    let child = Command::new("git")
-        .arg("-c")
-        .arg("protocol.fd.allow=always")
-        .arg("push")
-        .arg("--thin")
+    let mut command = Command::new("git");
+    command.arg("-c").arg("protocol.fd.allow=always");
+    // The per-chain delta policy (ADR-0005): `code` rides thin deltas; `extra`
+    // disables the delta search entirely for a predictable whole-object send.
+    match policy {
+        DeltaPolicy::Thin => {
+            command.arg("push").arg("--thin");
+        }
+        DeltaPolicy::WholeObject => {
+            command
+                .arg("-c")
+                .arg("pack.window=0")
+                .arg("push")
+                .arg("--no-thin");
+        }
+    }
+    let child = command
         .arg(format!(
             "fd::{},{}",
             transport.in_fd.as_raw_fd(),

@@ -44,11 +44,13 @@ Adopt **Option 1**: the client runs `git push` and the server ingests with
   writable refs to the `refs/git-full-send/*` namespace, `receive.*` tuning), and
   avoid running a separate `git daemon --enable=receive-pack` — the one `git
   daemon` service its own manual flags as "dangerous" (anonymous push).
-- **Client.** A stock `git push` / `git send-pack` advertising and pushing the two
-  scratch refs ([ADR-0004](0004-encoding-the-sync-state-in-git.md)) in one
-  exchange, wired to the SSH tunnel ([ADR-0006](0006-transport-and-connectivity.md))
-  as a raw receive-pack stream (e.g. via the `ext::` transport). No custom wire
-  protocol.
+- **Client.** A stock `git push` / `git send-pack` advertising and pushing the
+  scratch refs ([ADR-0004](0004-encoding-the-sync-state-in-git.md)), wired to the
+  SSH tunnel ([ADR-0006](0006-transport-and-connectivity.md)) as a raw
+  receive-pack stream (e.g. via the `ext::` transport). No custom wire protocol.
+  The two scratch refs travel in **one exchange per chain** rather than a single
+  combined push, because a `git push` applies one delta policy to its whole pack
+  and the chains want different policies (see "Per-chain delta policy" below).
 - **Native gix transfer is deferred, not rejected.** It is currently blocked on
   three simultaneous gix gaps — client push (#306, outscoped from 1.0), server
   `accept()` (#307), and new-delta computation (#306/#2531). Revisit if gix push
@@ -88,15 +90,42 @@ available:
   during sync windows; run maintenance deliberately, outside the hot path).
 - **Match delta policy to the payload**: for the volatile big-files chain, prefer
   a predictable whole-object send over a variable delta search where the payload
-  won't delta well anyway; keep delta defaults for the code chain.
+  won't delta well anyway; keep delta defaults for the code chain. See "Per-chain
+  delta policy" below for how this is implemented.
 
 After an unavoidable one-off first sync, each subsequent sync then moves only the
 changed bytes, deltified, at bounded and predictable cost.
 
+## Per-chain delta policy
+
+A single `git push` applies **one** delta policy to its whole pack (`--thin`,
+`pack.window`/`pack.depth` are per-invocation, not per-ref), so the two chains
+cannot share one push and still get different policies. The client therefore
+pushes **each chain in its own exchange** (issue #50):
+
+- **`code` → `--thin`.** Thin deltas against the retained base — the code chain
+  deltas well, so this is the cheap, small-on-the-wire path.
+- **`extra` → `--no-thin -c pack.window=0`.** `pack.window=0` disables the delta
+  search entirely for a predictable whole-object send; `--no-thin` keeps git from
+  emitting thin deltas against bases outside the pack. Because the `extra` commit
+  is parented on the retained `sent_extra` tip, push negotiation still excludes
+  objects the server already holds, so only the *changed* objects travel — just
+  whole rather than thin-deltified. This trades a futile delta search (and the
+  bimodal-performance symptom above) for bounded, predictable cost on a chain of
+  big build outputs that won't delta well.
+
+Each chain's retained tip is advanced only after its own push succeeds, so the two
+chains fail independently — a `code` success is not lost if the `extra` push fails.
+
 ## Consequences
 
-- The transfer leg is a single `git` subprocess on each side; gix's role stays
-  object synthesis ([Research 0001](../research/0001-gix-git-plumbing-vs-libgit2-capability-gap.md)).
+- The transfer leg is a `git` subprocess on each side; gix's role stays object
+  synthesis ([Research 0001](../research/0001-gix-git-plumbing-vs-libgit2-capability-gap.md)).
+- A sync now runs **two** receive-pack exchanges (one per chain), so two `git
+  push`/`receive-pack` subprocess pairs and two tunnel connections per sync — a
+  little more latency than a single combined push, bought for the per-chain delta
+  policy and predictable `extra` transfer. The per-chain push times are recorded
+  separately ([ADR-0013](0013-recording-operation-metrics.md)).
 - The server's `listen` process forks `git receive-pack` per connection and must
   confine writable refs to the `refs/git-full-send/*` namespace.
 - Predictability depends on **ref retention on both ends** and controlled
