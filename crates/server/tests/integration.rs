@@ -1,7 +1,8 @@
-//! Token integration tests for the server.
+//! Integration tests for the server crate.
 //!
-//! These do not exercise any server logic yet (it is stubbed with `todo!()`);
-//! they establish the temp-git-repo harness that real tests will build on.
+//! These currently cover the temp-git-repo test harness that the server's
+//! integration tests build on, rather than the server operations themselves
+//! (`listen`, `update_worktree`, `list_streams`).
 
 use std::process::Command;
 

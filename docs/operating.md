@@ -210,10 +210,20 @@ config/local.toml    # add a per-user file the project doesn't ship
 
 ### Performance note
 
-The selection walk descends every non-`.git` directory that isn't carved out, so
-an unrelated large ignored tree (e.g. `node_modules`) is still traversed even
-when nothing in it is selected. This is an accepted cost for the MVP; keep the
-include set curated.
+The selection walk prunes itself: a directory is entered only if it is already
+inside a selected subtree, or an include pattern could still match beneath it.
+Patterns with a literal directory prefix — anchored by a leading `/` or an
+interior `/` (e.g. `/dist/`, `web-client/dist/`) — let the walk skip unrelated
+trees, so a large ignored `node_modules` is never descended when nothing in it
+is selected. The prune is a deliberate over-approximation: it never skips a
+directory the exhaustive walk would have selected from.
+
+The residual caveat is the **unanchored** pattern: a bare basename or
+`basename/` (e.g. `*.wasm`, `dist/`), or one starting with `**`/a wildcard, can
+match at any depth, so it forces the full exhaustive walk and emits a warning
+(such a pattern is usually an accidental include). Keep the include set curated
+and prefer anchored patterns. See `crates/client/src/select.rs` and
+[ADR-0007](adr/0007-syncing-extra-gitignored-files.md) for detail.
 
 ## 5. Metrics
 
