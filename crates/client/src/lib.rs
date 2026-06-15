@@ -30,7 +30,7 @@ pub use encode::{
     CodeLayerStats, EncodeError, EncodeOutcome, ExtraLayerStats, ExtraOutcome, encode, encode_extra,
 };
 pub use gfs_common::{StreamId, StreamIdError};
-pub use push::{PushError, push_ref, push_refs};
+pub use push::{DeltaPolicy, PushError, push_ref, push_refs};
 pub use select::{SelectError, select_extra_paths, select_extra_paths_with};
 pub use stream::StreamResolveError;
 
@@ -57,10 +57,11 @@ pub enum ClientError {
 /// Synthesises two commits: the `code` commit (committed history plus
 /// working-tree changes) and the `extra` commit (the force-included,
 /// normally-gitignored files — ADR-0007), each under its per-stream ref
-/// (ADR-0004). Both refs are transferred to the server's `git receive-pack` in a
-/// single `git push --thin` exchange (ADR-0005), and the pushed tips are retained
-/// locally as the next delta bases. Refs are namespaced per stream so concurrent
-/// senders don't clobber each other (ADR-0012).
+/// (ADR-0004). Each chain is transferred to the server's `git receive-pack` in its
+/// own `git push` exchange so it can carry its own delta policy (ADR-0005): `code`
+/// rides `--thin` deltas, `extra` gets a predictable whole-object send. The pushed
+/// tips are retained locally as the next delta bases. Refs are namespaced per
+/// stream so concurrent senders don't clobber each other (ADR-0012).
 ///
 /// `repo_dir` locates the repository (typically the current directory);
 /// `remote` is the server endpoint (`HOST:PORT`, typically a tunnelled localhost
@@ -90,20 +91,33 @@ pub async fn sync(
     let extra_encode_ms = elapsed_ms(t);
     tracing::info!(commit = %extra.commit, stream = %stream, ref_ = %extra.extra_ref, "encoded extra state");
 
-    // Push both refs in one receive-pack exchange (ADR-0004/0005).
+    // Push each chain in its own receive-pack exchange so it can carry its own
+    // delta policy (ADR-0005): `code` rides `--thin` deltas; `extra` gets a
+    // predictable whole-object send. Retain each chain's tip right after its own
+    // push succeeds, so a `code` success survives a later `extra` failure.
     let t = Instant::now();
-    push::push_refs(&repo_dir, &remote, &[&code.code_ref, &extra.extra_ref]).await?;
-    let push_ms = elapsed_ms(t);
-
-    // Retain both delta bases only after the push succeeds.
+    push::push_refs(&repo_dir, &remote, &[&code.code_ref], DeltaPolicy::Thin).await?;
+    let code_push_ms = elapsed_ms(t);
     let t = Instant::now();
     push::retain_pushed_tip(&repo_dir, &gfs_common::sent_ref(&stream), code.commit)?;
+    let mut retain_ms = elapsed_ms(t);
+
+    let t = Instant::now();
+    push::push_refs(
+        &repo_dir,
+        &remote,
+        &[&extra.extra_ref],
+        DeltaPolicy::WholeObject,
+    )
+    .await?;
+    let extra_push_ms = elapsed_ms(t);
+    let t = Instant::now();
     push::retain_pushed_tip(
         &repo_dir,
         &gfs_common::sent_extra_ref(&stream),
         extra.commit,
     )?;
-    let retain_ms = elapsed_ms(t);
+    retain_ms += elapsed_ms(t);
 
     let total_ms = elapsed_ms(t_total);
     tracing::info!(
@@ -124,7 +138,8 @@ pub async fn sync(
             total_ms,
             code_encode_ms,
             extra_encode_ms,
-            push_ms,
+            code_push_ms,
+            extra_push_ms,
             retain_ms,
         },
     );

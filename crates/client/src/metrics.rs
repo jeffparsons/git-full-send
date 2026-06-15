@@ -17,7 +17,8 @@ pub(crate) struct Timings {
     pub total_ms: f64,
     pub code_encode_ms: f64,
     pub extra_encode_ms: f64,
-    pub push_ms: f64,
+    pub code_push_ms: f64,
+    pub extra_push_ms: f64,
     pub retain_ms: f64,
 }
 
@@ -32,7 +33,8 @@ struct SyncRecord<'a> {
     total_ms: f64,
     code_encode_ms: f64,
     extra_encode_ms: f64,
-    push_ms: f64,
+    code_push_ms: f64,
+    extra_push_ms: f64,
     retain_ms: f64,
     code: CodeLayer,
     extra: ExtraLayer,
@@ -87,7 +89,8 @@ pub(crate) fn record_sync(
         total_ms: timings.total_ms,
         code_encode_ms: timings.code_encode_ms,
         extra_encode_ms: timings.extra_encode_ms,
-        push_ms: timings.push_ms,
+        code_push_ms: timings.code_push_ms,
+        extra_push_ms: timings.extra_push_ms,
         retain_ms: timings.retain_ms,
         code: CodeLayer {
             files_overlaid: code.stats.files_overlaid,

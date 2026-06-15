@@ -138,8 +138,8 @@ async fn push_lands_extra_ref_alongside_code() {
     .await
     .expect("sync succeeds");
 
-    // The `extra` ref landed on the server in the same exchange as `code`, with
-    // the selected build output at its identity path…
+    // The `extra` ref landed on the server alongside `code` (each chain rides its
+    // own push now — ADR-0005), with the selected build output at its identity path…
     let extra = extra_ref(&stream);
     assert_eq!(
         tree_paths(server.path(), &extra),
@@ -208,14 +208,19 @@ async fn rejects_refs_outside_the_namespace() {
     let remote = addr.to_string();
 
     // A namespaced ref is accepted…
-    gfs_client::push_ref(c, &remote, &code)
+    gfs_client::push_ref(c, &remote, &code, gfs_client::DeltaPolicy::default())
         .await
         .expect("a refs/git-full-send/* push is accepted");
     // …but anything outside the namespace is declined by the pre-receive hook.
     assert!(
-        gfs_client::push_ref(c, &remote, "refs/heads/main")
-            .await
-            .is_err(),
+        gfs_client::push_ref(
+            c,
+            &remote,
+            "refs/heads/main",
+            gfs_client::DeltaPolicy::default()
+        )
+        .await
+        .is_err(),
         "a non-namespaced push is rejected",
     );
     assert!(
@@ -226,6 +231,97 @@ async fn rejects_refs_outside_the_namespace() {
             .expect("run git rev-parse")
             .success(),
         "the rejected ref was not created on the server",
+    );
+}
+
+#[tokio::test]
+async fn push_refs_whole_object_lands_objects() {
+    // The `extra` chain's whole-object policy (`--no-thin -c pack.window=0`,
+    // ADR-0005) still lands the ref and its objects on the server.
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "a.txt", "a");
+    commit_all(c, "baseline");
+    let extra = extra_ref(&test_stream());
+    git(c, &["update-ref", &extra, "HEAD"]);
+
+    gfs_client::push_ref(
+        c,
+        &addr.to_string(),
+        &extra,
+        gfs_client::DeltaPolicy::WholeObject,
+    )
+    .await
+    .expect("a whole-object push is accepted");
+
+    // The ref and its tree are walkable on the server.
+    assert_eq!(
+        git(server.path(), &["rev-parse", &extra]).trim(),
+        git(c, &["rev-parse", &extra]).trim(),
+        "the server has the pushed tip",
+    );
+    assert_eq!(
+        tree_paths(server.path(), &extra),
+        BTreeSet::from(["a.txt".to_string()]),
+        "the objects landed under the whole-object policy",
+    );
+}
+
+#[tokio::test]
+async fn extra_chain_second_sync_lands_changed_output() {
+    // A changed force-included output transfers correctly on a second sync, i.e.
+    // the whole-object `extra` push lands changed objects against the retained
+    // parent — not just on the first run (ADR-0005).
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, ".gitignore", "dist/\n");
+    write_file(c, ".git-full-send-include", "dist/\n");
+    commit_all(c, "baseline");
+    write_file(c, "dist/app.js", "built-v1");
+
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
+    let extra = extra_ref(&stream);
+    let first = git(server.path(), &["rev-parse", &extra]);
+
+    // Change the build output and sync again (the retained extra tip is the base).
+    write_file(c, "dist/app.js", "built-v2");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
+    let second = git(server.path(), &["rev-parse", &extra]);
+
+    assert_ne!(first.trim(), second.trim(), "the server extra ref advanced");
+    assert_eq!(
+        git(
+            server.path(),
+            &["cat-file", "blob", &format!("{extra}:dist/app.js")]
+        ),
+        "built-v2",
+        "the server has the changed build output",
+    );
+    assert_eq!(
+        git(c, &["rev-parse", &sent_extra_ref(&stream)]).trim(),
+        second.trim(),
+        "the retention ref advanced to the new extra tip",
     );
 }
 
