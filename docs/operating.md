@@ -122,6 +122,37 @@ one.
 - The command is **symmetric** — see "Retiring a stream" below for cleaning up
   the client side as well.
 
+### `reap` — reclaim stale streams
+
+```sh
+# See what would go (deletes nothing):
+git-full-send reap --repo /path/to/target-repo --older-than-days 30 --dry-run
+
+# Then actually reclaim them:
+git-full-send reap --repo /path/to/target-repo --older-than-days 30
+```
+
+Forgets every stream on the server whose `code` was last synced more than
+`--older-than-days` ago — the automatic, age-based complement to the manual
+`forget-stream` ([ADR-0015](adr/0015-ttl-based-reaping-of-stale-streams.md)). It
+is just "find the stale streams, then `forget-stream` each", so it inherits that
+command's behaviour.
+
+- **A stream's age is the committer date of its `code` commit.** The client
+  re-stamps that commit to "now" on every sync, so it tracks when the stream was
+  last synced — no extra bookkeeping on the server.
+- **Opt-in, never implicit.** `--older-than-days` is required; there is no
+  default age and nothing runs on its own. Run it by hand, or from cron/a timer
+  when you want it periodic — it is not wired into `listen`.
+- **`--dry-run`** lists the streams that would be reaped (with their age and ref
+  count) and deletes nothing — run it first to preview.
+- **Server-side only.** It reclaims the server's `code`/`extra` refs. A client
+  repo's local `sent/*` pins are cleaned up with `forget-stream` (see "Retiring a
+  stream" below); `reap` does not touch them.
+- **Safe and idempotent**, like `forget-stream`: reaping a stream that is still in
+  use just makes the next `sync` re-create its refs, and a second `reap` with the
+  same cutoff finds nothing new.
+
 ## 3. Stream ids
 
 A **stream** is an independent, reusable slot of synced state. Refs are

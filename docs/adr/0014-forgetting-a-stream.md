@@ -77,4 +77,7 @@ target repo, in one ref transaction, returning the count removed.
 - **TTL-based reaping.** Automatically forgetting streams whose `code` ref is
   older than a configurable age is a complementary policy, split into its own
   follow-up so its design (where the age is measured, opt-in vs. default, client
-  vs. server) is not pre-judged here.
+  vs. server) is not pre-judged here. **Settled in
+  [ADR-0015](0015-ttl-based-reaping-of-stale-streams.md)** (issue #63): an opt-in,
+  server-side `reap` command that forgets streams whose `code` committer date is
+  older than a required cutoff.

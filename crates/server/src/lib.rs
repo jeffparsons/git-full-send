@@ -104,6 +104,9 @@ pub enum ServerError {
     /// Deleting a stream's refs failed.
     #[error("could not forget stream")]
     ForgetStream(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Reaping stale streams failed (enumerating, or reading a `code` commit).
+    #[error("could not reap streams")]
+    Reap(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// Creating the worktree directory (or its sidecar index directory) failed.
     #[error("could not create the worktree directory")]
     CreateWorktree(#[source] std::io::Error),
@@ -670,19 +673,23 @@ pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerErro
     for reference in iter {
         let reference = reference.map_err(ServerError::ListStreams)?;
         let name = reference.name().as_bstr().to_string();
-        // Recover `<id>` from `refs/git-full-send/streams/<id>/code`, leaving the
-        // companion `…/sent/code` and anything else untouched.
-        let Some(rest) = name.strip_prefix(gfs_common::STREAMS_PREFIX) else {
-            continue;
-        };
-        let Some(id) = rest.strip_suffix("/code") else {
-            continue;
-        };
-        if let Ok(stream) = gfs_common::StreamId::new(id) {
+        if let Some(stream) = stream_id_from_code_ref(&name) {
             streams.push(stream);
         }
     }
     Ok(streams)
+}
+
+/// Recover a stream id from a `refs/git-full-send/streams/<id>/code` ref name,
+/// or `None` if `name` isn't a stream's `code` ref.
+///
+/// Shared by [`list_streams`] and [`reap_streams`] so the layout recovery lives
+/// in one place. The companion `…/extra` ref (and anything else under the
+/// prefix) lacks the `/code` suffix and is left out.
+fn stream_id_from_code_ref(name: &str) -> Option<gfs_common::StreamId> {
+    let rest = name.strip_prefix(gfs_common::STREAMS_PREFIX)?;
+    let id = rest.strip_suffix("/code")?;
+    gfs_common::StreamId::new(id).ok()
 }
 
 /// Delete every ref of `stream` from `repo`, returning how many were removed.
@@ -735,6 +742,130 @@ pub fn forget_stream(repo: &Path, stream: &gfs_common::StreamId) -> Result<usize
         .edit_references(edits)
         .map_err(|e| ServerError::ForgetStream(Box::new(e)))?;
     Ok(applied.len())
+}
+
+/// One stream considered by [`reap_streams`].
+#[derive(Debug, Clone)]
+pub struct ReapedStream {
+    /// The stale stream.
+    pub stream: gfs_common::StreamId,
+    /// The `code` commit's committer time, in Unix seconds, that made it stale.
+    pub committed_unix_secs: i64,
+    /// Refs removed forgetting it — `0` under `dry_run`, where the count is the
+    /// number that *would* be removed.
+    pub refs_removed: usize,
+}
+
+/// The outcome of a [`reap_streams`] pass.
+#[derive(Debug)]
+pub struct ReapOutcome {
+    /// Streams scanned — every stream with a `code` ref.
+    pub scanned: usize,
+    /// Streams found stale (and, unless `dry_run`, forgotten).
+    pub reaped: Vec<ReapedStream>,
+    /// Whether this was a dry run (nothing was deleted).
+    pub dry_run: bool,
+}
+
+/// Forget every stream in `repo` whose `code` commit is older than the cutoff.
+///
+/// TTL-based reaping (issue #63, ADR-0015): the complement to the manual
+/// `forget-stream` ([`forget_stream`], ADR-0014). A stream's age is the committer
+/// date of its `code` commit, which the client re-stamps to "now" on every sync
+/// (ADR-0009 / the client's `encode`), so it tracks "last synced" without any
+/// sidecar marker. A stream is stale when that committer time is **strictly
+/// older** than `cutoff_unix_secs`; the caller picks the cutoff (typically
+/// `now - max_age`), keeping this a pure function of `(repo, cutoff)`.
+///
+/// Reaping is exactly "list the stale streams, then [`forget_stream`] each", so
+/// it inherits that path's guarantees: idempotent, and safe on a live stream (a
+/// later `sync` re-creates the refs). With `dry_run` nothing is deleted — the
+/// returned [`ReapOutcome`] reports which streams *would* be reaped. Server-only:
+/// the client's `sent/*` pins are left to the manual `forget-stream` (ADR-0015).
+pub fn reap_streams(
+    repo: &Path,
+    cutoff_unix_secs: i64,
+    dry_run: bool,
+) -> Result<ReapOutcome, ServerError> {
+    let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
+
+    // First pass: snapshot the stale streams (and the committer time that made
+    // each stale) without mutating refs out from under the live iterator.
+    let mut scanned = 0usize;
+    let mut stale: Vec<(gfs_common::StreamId, i64)> = Vec::new();
+    {
+        let platform = discovered
+            .references()
+            .map_err(|e| ServerError::Reap(Box::new(e)))?;
+        let iter = platform
+            .prefixed(gfs_common::STREAMS_PREFIX)
+            .map_err(|e| ServerError::Reap(Box::new(e)))?;
+        for reference in iter {
+            let mut reference = reference.map_err(ServerError::Reap)?;
+            let name = reference.name().as_bstr().to_string();
+            let Some(stream) = stream_id_from_code_ref(&name) else {
+                continue;
+            };
+            scanned += 1;
+            let id = reference
+                .peel_to_id()
+                .map_err(|e| ServerError::Reap(Box::new(e)))?
+                .detach();
+            let committed = discovered
+                .find_commit(id)
+                .map_err(|e| ServerError::Reap(Box::new(e)))?
+                .time()
+                .map_err(|e| ServerError::Reap(Box::new(e)))?
+                .seconds;
+            if committed < cutoff_unix_secs {
+                stale.push((stream, committed));
+            }
+        }
+    }
+
+    // Second pass: forget each stale stream (or, in a dry run, count the refs it
+    // would shed). `forget_stream` re-discovers the repo and edits refs in one
+    // transaction per stream.
+    let mut reaped = Vec::with_capacity(stale.len());
+    for (stream, committed_unix_secs) in stale {
+        let refs_removed = if dry_run {
+            count_stream_refs(&discovered, &stream)?
+        } else {
+            forget_stream(repo, &stream)?
+        };
+        reaped.push(ReapedStream {
+            stream,
+            committed_unix_secs,
+            refs_removed,
+        });
+    }
+
+    Ok(ReapOutcome {
+        scanned,
+        reaped,
+        dry_run,
+    })
+}
+
+/// Count the refs `stream` holds in `repo` without deleting any — the dry-run
+/// equivalent of the count [`forget_stream`] returns.
+fn count_stream_refs(
+    repo: &gix::Repository,
+    stream: &gfs_common::StreamId,
+) -> Result<usize, ServerError> {
+    let prefix = gfs_common::stream_prefix(stream);
+    let platform = repo
+        .references()
+        .map_err(|e| ServerError::Reap(Box::new(e)))?;
+    let iter = platform
+        .prefixed(prefix.as_str())
+        .map_err(|e| ServerError::Reap(Box::new(e)))?;
+    let mut count = 0;
+    for reference in iter {
+        reference.map_err(ServerError::Reap)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// The blocking body of [`update_worktree`].
