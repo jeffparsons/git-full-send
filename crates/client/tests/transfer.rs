@@ -1099,3 +1099,132 @@ async fn distinct_worktrees_do_not_contend() {
         "worktree B was checked out",
     );
 }
+
+/// Seconds since the Unix epoch, for choosing reap cutoffs and back-dating refs.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs() as i64
+}
+
+/// Re-point `stream`'s `code` ref at a commit with committer date `unix_secs`,
+/// reusing the existing code tree — simulating a stream last synced long ago so
+/// reaping (issue #63) has a stale candidate without waiting real time.
+fn backdate_code_ref(repo: &Path, stream: &StreamId, unix_secs: i64) {
+    let tree = git(
+        repo,
+        &["rev-parse", &format!("{}^{{tree}}", code_ref(stream))],
+    );
+    let date = format!("{unix_secs} +0000");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        // Identity via env so this works in a bare server repo with no configured
+        // `user.*` (CI has no global identity).
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_NAME", "git-full-send tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@git-full-send.invalid")
+        .env("GIT_AUTHOR_NAME", "git-full-send tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@git-full-send.invalid")
+        .args(["commit-tree", tree.trim(), "-m", "backdated"])
+        .output()
+        .expect("run git commit-tree");
+    assert!(
+        out.status.success(),
+        "commit-tree failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let oid = String::from_utf8(out.stdout).expect("utf8 oid");
+    git(repo, &["update-ref", &code_ref(stream), oid.trim()]);
+}
+
+/// Sync `who`'s baseline content under a stream named `who` to `addr`.
+async fn sync_stream(addr: &SocketAddr, who: &str) {
+    let client = init_temp_repo();
+    write_file(client.path(), "who.txt", who);
+    commit_all(client.path(), "baseline");
+    gfs_client::sync(
+        client.path().to_path_buf(),
+        addr.to_string(),
+        Some(StreamId::new(who).unwrap()),
+        None,
+    )
+    .await
+    .expect("sync");
+}
+
+#[tokio::test]
+async fn reap_forgets_only_streams_older_than_the_cutoff(/* issue #63 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+    sync_stream(&addr, "old").await;
+    sync_stream(&addr, "fresh").await;
+    let old = StreamId::new("old").unwrap();
+    let fresh = StreamId::new("fresh").unwrap();
+
+    // `old` was last synced ~100 days ago; `fresh` just now.
+    let now = now_unix();
+    backdate_code_ref(server.path(), &old, now - 100 * 86_400);
+
+    // A 30-day cutoff makes only `old` stale.
+    let outcome = gfs_server::reap_streams(server.path(), now - 30 * 86_400, false).expect("reap");
+    assert_eq!(outcome.scanned, 2, "both streams were scanned");
+    assert_eq!(outcome.reaped.len(), 1, "only the stale stream is reaped");
+    assert_eq!(outcome.reaped[0].stream, old);
+    assert_eq!(
+        outcome.reaped[0].refs_removed, 2,
+        "old's code + extra refs were removed"
+    );
+    assert!(!outcome.dry_run);
+
+    // `old` is gone; `fresh` is untouched and is the only stream left.
+    assert!(!ref_exists(server.path(), &code_ref(&old)));
+    assert!(!ref_exists(server.path(), &extra_ref(&old)));
+    assert!(ref_exists(server.path(), &code_ref(&fresh)));
+    assert_eq!(
+        gfs_server::list_streams(server.path()).unwrap(),
+        vec![fresh],
+        "only fresh remains after reaping old",
+    );
+
+    // Re-reaping with the same cutoff finds nothing new — reaping is idempotent.
+    let again = gfs_server::reap_streams(server.path(), now - 30 * 86_400, false).expect("re-reap");
+    assert_eq!(again.scanned, 1);
+    assert!(again.reaped.is_empty());
+}
+
+#[tokio::test]
+async fn reap_dry_run_reports_without_deleting(/* issue #63 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+    sync_stream(&addr, "old").await;
+    let old = StreamId::new("old").unwrap();
+
+    let now = now_unix();
+    backdate_code_ref(server.path(), &old, now - 100 * 86_400);
+
+    let outcome =
+        gfs_server::reap_streams(server.path(), now - 30 * 86_400, true).expect("dry run");
+    assert!(outcome.dry_run);
+    assert_eq!(outcome.reaped.len(), 1);
+    assert_eq!(outcome.reaped[0].stream, old);
+    assert_eq!(
+        outcome.reaped[0].refs_removed, 2,
+        "reports the 2 refs it would remove"
+    );
+
+    // Nothing was actually deleted.
+    assert!(ref_exists(server.path(), &code_ref(&old)));
+    assert!(ref_exists(server.path(), &extra_ref(&old)));
+    assert_eq!(gfs_server::list_streams(server.path()).unwrap(), vec![old]);
+}
+
+#[tokio::test]
+async fn reap_on_a_repo_with_no_streams_is_a_noop(/* issue #63 */) {
+    let server = init_bare_repo();
+    let outcome = gfs_server::reap_streams(server.path(), now_unix(), false).expect("reap");
+    assert_eq!(outcome.scanned, 0);
+    assert!(outcome.reaped.is_empty());
+}

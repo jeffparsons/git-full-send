@@ -405,6 +405,7 @@ fn command_line_surface_is_wired_up() {
         "update-worktree",
         "list-streams",
         "forget-stream",
+        "reap",
     ] {
         assert!(top.contains(sub), "top-level help lists `{sub}`:\n{top}");
     }
@@ -413,6 +414,13 @@ fn command_line_surface_is_wired_up() {
         assert!(
             forget_help.contains(flag),
             "forget-stream exposes {flag}:\n{forget_help}",
+        );
+    }
+    let reap_help = help(&["reap", "--help"]);
+    for flag in ["--repo", "--older-than-days", "--dry-run"] {
+        assert!(
+            reap_help.contains(flag),
+            "reap exposes {flag}:\n{reap_help}",
         );
     }
     assert!(
@@ -426,4 +434,115 @@ fn command_line_surface_is_wired_up() {
             "listen exposes {flag}:\n{listen_help}",
         );
     }
+}
+
+/// Seconds since the Unix epoch, for back-dating a stream's `code` ref.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs() as i64
+}
+
+/// Whether `ref_name` resolves in `repo` (a non-asserting `git rev-parse`).
+fn ref_exists(repo: &Path, ref_name: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", ref_name])
+        .output()
+        .expect("run git rev-parse")
+        .status
+        .success()
+}
+
+/// `reap` through the real binary (issue #63): a back-dated stream is reported by
+/// `--dry-run` without being deleted, then removed by the real run and gone from
+/// `list-streams`.
+#[tokio::test]
+async fn reap_through_the_cli_dry_run_then_deletes() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+    let server_path = server.path().to_str().unwrap().to_string();
+
+    // Sync one stream through the binary.
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    commit_all(c, "baseline");
+    let stream = test_stream();
+    run_cli(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+
+    // Back-date its `code` ref to ~100 days ago so it is reapable now.
+    let date = format!("{} +0000", now_unix() - 100 * 86_400);
+    let tree = git(
+        server.path(),
+        &["rev-parse", &format!("{}^{{tree}}", code_ref(&stream))],
+    );
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(server.path())
+        // Identity via env so this works in a bare server repo with no configured
+        // `user.*` (CI has no global identity).
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_NAME", "git-full-send tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@git-full-send.invalid")
+        .env("GIT_AUTHOR_NAME", "git-full-send tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@git-full-send.invalid")
+        .args(["commit-tree", tree.trim(), "-m", "backdated"])
+        .output()
+        .expect("run git commit-tree");
+    assert!(
+        out.status.success(),
+        "commit-tree failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let oid = String::from_utf8(out.stdout).expect("utf8 oid");
+    git(
+        server.path(),
+        &["update-ref", &code_ref(&stream), oid.trim()],
+    );
+
+    // Dry run: names the stale stream, deletes nothing.
+    let dry = run_cli_capture(&[
+        "reap",
+        "--repo",
+        &server_path,
+        "--older-than-days",
+        "30",
+        "--dry-run",
+    ])
+    .await;
+    assert!(
+        dry.contains(stream.as_str()),
+        "dry-run names the stale stream:\n{dry}",
+    );
+    assert!(
+        ref_exists(server.path(), &code_ref(&stream)),
+        "dry-run must not delete anything",
+    );
+
+    // Real run: removes the refs; the stream leaves `list-streams`.
+    let real = run_cli_capture(&["reap", "--repo", &server_path, "--older-than-days", "30"]).await;
+    assert!(
+        real.contains(stream.as_str()),
+        "reap names the reaped stream:\n{real}",
+    );
+    assert!(!ref_exists(server.path(), &code_ref(&stream)));
+    assert!(!ref_exists(server.path(), &extra_ref(&stream)));
+    let listed = run_cli_capture(&["list-streams", "--repo", &server_path]).await;
+    assert!(
+        listed.trim().is_empty(),
+        "no streams remain after reaping:\n{listed}",
+    );
 }

@@ -31,6 +31,8 @@ enum Command {
     ListStreams(ListStreamsArgs),
     /// Delete a stream's refs so it no longer appears in `list-streams`.
     ForgetStream(ForgetStreamArgs),
+    /// Forget streams whose `code` is older than a cutoff age (server).
+    Reap(ReapArgs),
 }
 
 #[derive(Debug, Args)]
@@ -112,6 +114,20 @@ struct ForgetStreamArgs {
     stream_id: StreamId,
 }
 
+#[derive(Debug, Args)]
+struct ReapArgs {
+    /// Path to the server repository whose stale streams to reap.
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Forget streams whose `code` was last synced more than this many days ago.
+    /// Required — there is no default age, so reaping never happens implicitly.
+    #[arg(long, value_name = "DAYS")]
+    older_than_days: u64,
+    /// Report which streams would be reaped without deleting anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -168,9 +184,59 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Reap(args) => {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let cutoff = now_unix - (args.older_than_days as i64) * SECONDS_PER_DAY;
+            let outcome = gfs_server::reap_streams(&args.repo, cutoff, args.dry_run)?;
+            print_reap_outcome(&outcome, args.older_than_days, now_unix);
+        }
     }
 
     Ok(())
+}
+
+/// Seconds in a day, for converting `--older-than-days` to a cutoff instant.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Print the operator-facing result of a `reap` pass to stdout.
+///
+/// One line per stale stream (with its age and the ref count it shed, or would
+/// shed in a dry run) plus a summary, mirroring `forget-stream`'s plain style.
+fn print_reap_outcome(outcome: &gfs_server::ReapOutcome, older_than_days: u64, now_unix: i64) {
+    if outcome.reaped.is_empty() {
+        println!(
+            "no streams older than {older_than_days} day(s); nothing to reap \
+             ({} scanned)",
+            outcome.scanned,
+        );
+        return;
+    }
+    for reaped in &outcome.reaped {
+        let age_days = (now_unix - reaped.committed_unix_secs).max(0) / SECONDS_PER_DAY;
+        if outcome.dry_run {
+            println!(
+                "would reap `{}` (last synced {age_days} day(s) ago, {} ref(s))",
+                reaped.stream, reaped.refs_removed,
+            );
+        } else {
+            println!(
+                "reaped `{}` (last synced {age_days} day(s) ago, {} ref(s) removed)",
+                reaped.stream, reaped.refs_removed,
+            );
+        }
+    }
+    let n = outcome.reaped.len();
+    if outcome.dry_run {
+        println!(
+            "{n} of {} stream(s) would be reaped (re-run without --dry-run to delete)",
+            outcome.scanned,
+        );
+    } else {
+        println!("reaped {n} of {} stream(s)", outcome.scanned);
+    }
 }
 
 /// Print the operator-facing end-of-sync summary block to stdout (issue #53).

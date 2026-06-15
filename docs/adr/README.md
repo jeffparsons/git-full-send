@@ -24,6 +24,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0012](0012-namespacing-managed-refs-per-stream.md) | Namespacing managed refs per stream | accepted |
 | [0013](0013-recording-operation-metrics.md) | Recording operation metrics | accepted |
 | [0014](0014-forgetting-a-stream.md) | Forgetting a stream | accepted |
+| [0015](0015-ttl-based-reaping-of-stale-streams.md) | TTL-based reaping of stale streams | accepted |
 
 ## Open research tasks
 
