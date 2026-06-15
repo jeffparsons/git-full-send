@@ -35,12 +35,18 @@ because the two commands treat their fds differently:
   for free.
 - **Client** must *not* put the transport on fd 0/1: `git push` uses its own
   stdin/stdout, and `fd::0,1` wedges it before the protocol starts. Instead the
-  client reserves two inheritable dups of the connected socket in the parent
-  (`OwnedFd::try_clone_to_owned`, then `rustix` clears `FD_CLOEXEC` so they
-  survive `exec`) and passes their numbers as `git push --thin fd::<in>,<out>`,
-  leaving `git`'s own stdio free. Reserving in the parent (vs. `dup2` in a
-  `pre_exec` hook) keeps the transport fds clear of the descriptors `Command`
-  uses to wire up the child's stdio.
+  client reserves two dups of the connected socket in the parent
+  (`OwnedFd::try_clone_to_owned`) and passes their numbers as
+  `git push --thin fd::<in>,<out>`, leaving `git`'s own stdio free. Reserving in
+  the parent (vs. `dup2` in a `pre_exec` hook) keeps the transport fds clear of
+  the descriptors `Command` uses to wire up the child's stdio. The dups keep
+  `FD_CLOEXEC` in the parent; `git` would not inherit them across `exec`, so the
+  client clears the flag **only in the forked child**, via a `pre_exec` hook
+  (`rustix` `fcntl(F_SETFD)`, async-signal-safe) registered on the inner `std`
+  command and run just before `exec`. `fork` copies the fd table, so the intended
+  `git push` still inherits the dups while no unrelated concurrent `spawn` can —
+  the previous design cleared `FD_CLOEXEC` in the parent, leaving a window where
+  any concurrent `spawn` inherited the connection socket (#57).
 
 Both invocations set `-c protocol.fd.allow=always`, since `git` blocks the
 `fd::`/`ext::` transports by default. The `ext::`-with-connector shape (e.g.
@@ -54,7 +60,11 @@ hand a child an fd on a chosen number, so the client leans on `rustix` for the
 flag flip (`#29` removed an earlier hand-rolled `libc::fcntl(F_DUPFD)` + `unsafe`
 in favour of `OwnedFd` + `rustix`, dropping the direct `libc` dependency).
 `rustix` may still pull `libc` transitively on some targets, so this removes our
-direct dep and all our `unsafe`, not necessarily `libc` from the tree.
+direct dep, not necessarily `libc`, from the tree. The flag flip now happens
+inside a `pre_exec` hook (#57), which reintroduces one small `unsafe` block —
+registering the hook — but the flip itself is still a safe `rustix` call, and the
+hook body is async-signal-safe (a fixed pair of `fcntl(F_SETFD)` calls, no
+allocation).
 
 A **purely standalone binary** could go further and drop fd-passing entirely via
 the same `ext::`-with-connector shape: a tiny "micro-utility" subcommand that
@@ -94,8 +104,8 @@ under `refs/namespaces/…` rather than land them where the worktree-update step
 - The transfer leg stays a single `git` subprocess per side; `gix`'s role
   remains object synthesis. No custom wire protocol.
 - The attachment is Unix-only (socket fds via `std::os::fd`, with `rustix`
-  clearing `FD_CLOEXEC`); the tool is Unix-first, consistent with the rest of
-  the codebase.
+  clearing `FD_CLOEXEC` in a `pre_exec` hook); the tool is Unix-first, consistent
+  with the rest of the codebase.
 - The server process spawns one `git receive-pack` per connection and must keep
   the hooks directory alive for its lifetime.
 
