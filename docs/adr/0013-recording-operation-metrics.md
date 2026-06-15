@@ -104,6 +104,13 @@ the durable record.
 - The `pre-receive` hook now also appends accepted ref names to a per-connection
   file named by an environment variable, so the handler can report `refs_updated`
   without parsing the sideband.
+- **Summary surface refined by issue #53.** The per-operation human summary the
+  client emits is now a dedicated, formatted **stdout block** (file/byte counts and
+  per-phase durations), not the single combined `tracing` line this ADR originally
+  described. `sync` returns the counts/sizes/timings as a `SyncSummary` and the CLI
+  prints them; the per-phase `tracing` progress lines (stderr) and the durable
+  JSONL record are unchanged. The three surfaces stay complementary: stderr
+  progress log · stdout summary · JSONL durable record.
 
 ### Alternatives considered
 

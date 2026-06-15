@@ -129,7 +129,9 @@ async fn main() -> Result<()> {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
-            gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
+            let summary =
+                gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
+            print_sync_summary(&summary);
         }
         Command::Listen(args) => {
             let config = gfs_server::ListenConfig {
@@ -169,4 +171,85 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print the operator-facing end-of-sync summary block to stdout (issue #53).
+///
+/// A deliberate human-readable surface, distinct from the per-phase `tracing`
+/// progress lines (stderr) and the durable JSONL metrics record (ADR-0013): the
+/// numbers come from the same `sync` computation, formatted for a glance —
+/// binary byte units and second/millisecond durations.
+fn print_sync_summary(summary: &gfs_client::SyncSummary) {
+    let t = &summary.timings;
+    println!(
+        "Synced stream {} to {} in {}",
+        summary.stream,
+        summary.remote,
+        human_ms(t.total_ms),
+    );
+    println!(
+        "  code:  {} file(s) (+{}), {} removed   encode {} · push {}",
+        summary.code.files_overlaid,
+        human_bytes(summary.code.bytes_overlaid),
+        summary.code.files_removed,
+        human_ms(t.code_encode_ms),
+        human_ms(t.code_push_ms),
+    );
+    println!(
+        "  extra: {} file(s) ({})   encode {} · push {}",
+        summary.extra.files,
+        human_bytes(summary.extra.bytes),
+        human_ms(t.extra_encode_ms),
+        human_ms(t.extra_push_ms),
+    );
+}
+
+/// Format a byte count with binary (1024) units: `B` exactly, one decimal above.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Format a millisecond duration: whole `ms` under a second, else `s` with one
+/// decimal. The metrics keep the raw value; only this display rounds.
+fn human_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{}ms", ms.round() as u64)
+    } else {
+        format!("{:.1}s", ms / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_uses_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn human_ms_switches_to_seconds_at_one_second() {
+        assert_eq!(human_ms(0.0), "0ms");
+        assert_eq!(human_ms(12.4), "12ms");
+        assert_eq!(human_ms(999.0), "999ms");
+        assert_eq!(human_ms(1000.0), "1.0s");
+        assert_eq!(human_ms(1400.0), "1.4s");
+    }
 }
