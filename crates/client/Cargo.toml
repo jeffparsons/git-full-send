@@ -27,6 +27,9 @@ tracing.workspace = true
 [dev-dependencies]
 gfs-common.workspace = true
 gfs-server.workspace = true
+# Property test for the force-include prune invariant (issue #52): generates
+# random trees + pattern sets and asserts pruned-vs-exhaustive selection equality.
+proptest.workspace = true
 # Parses the server's `receive` metrics records in the delta-base benchmark
 # harness (`tests/delta_base_benchmark.rs`, issue #51).
 serde_json.workspace = true

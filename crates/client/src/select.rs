@@ -453,15 +453,19 @@ mod tests {
             .collect()
     }
 
-    /// As [`select`], but also return the repo-relative prefixes of every directory
-    /// the walk descended into, so a test can assert the prune skipped a subtree
-    /// rather than merely failing to match anything inside it.
-    fn select_recording(root: &Path, user: Option<&Path>) -> (Vec<String>, Vec<String>) {
+    /// Run the walk under an explicitly supplied `prune` and return the
+    /// (sorted/deduped) selection together with the repo-relative prefixes of every
+    /// directory the walk descended into. The single walk-construction site shared
+    /// by [`select_recording`] and the prune-invariant property test.
+    fn walk_under(
+        root: &Path,
+        user: Option<&Path>,
+        prune: &PruneInfo,
+    ) -> (Vec<String>, Vec<String>) {
         let search = load_search(root, user).unwrap();
-        let prune = build_prune_info(&search);
         let mut walk = Walk {
             search: &search,
-            prune: &prune,
+            prune,
             out: Vec::new(),
             entered: Vec::new(),
         };
@@ -471,6 +475,15 @@ mod tests {
         selected.dedup();
         let entered: Vec<String> = walk.entered.iter().map(ToString::to_string).collect();
         (selected, entered)
+    }
+
+    /// As [`select`], but also return the repo-relative prefixes of every directory
+    /// the walk descended into, so a test can assert the prune skipped a subtree
+    /// rather than merely failing to match anything inside it.
+    fn select_recording(root: &Path, user: Option<&Path>) -> (Vec<String>, Vec<String>) {
+        let search = load_search(root, user).unwrap();
+        let prune = build_prune_info(&search);
+        walk_under(root, user, &prune)
     }
 
     #[test]
@@ -668,5 +681,121 @@ mod tests {
         let got = select(dir.path(), None);
         assert!(got.contains(&"keep.txt".to_string()));
         assert!(!got.iter().any(|p| p.starts_with(".git/")), "got {got:?}",);
+    }
+
+    // --- Property test: pruning never changes the selected set -------------------
+    //
+    // The walk prune (`PruneInfo::can_contain_match`) is a deliberate
+    // over-approximation: it changes only *which directories are entered*, never
+    // *which files are selected* (see the module docs). We assert that property
+    // directly over randomly generated trees and pattern sets by comparing the
+    // pruned walk against an exhaustive (prune-disabled) walk.
+    mod prune_invariant {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeSet;
+
+        // Disjoint name sets: intermediate path segments come from `DIR_NAMES`,
+        // leaf (file) names from `FILE_NAMES`. Keeping them disjoint guarantees no
+        // generated file path is an ancestor of another, so materialising the tree
+        // never hits a file-vs-directory collision on disk. The names are chosen so
+        // the generated patterns below actually match (a shared alphabet — random
+        // unique names would make almost every pattern a no-op, a vacuous test).
+        const DIR_NAMES: &[&str] = &["a", "b", "dist", "sub"];
+        const FILE_NAMES: &[&str] = &["app", "x.wasm", "y.txt", "app.js"];
+
+        // Candidate include patterns spanning every anchoring class the prune
+        // distinguishes: anchored multi-segment (`a/dist/`, `a/b/app`, `a/dist/**`),
+        // root-anchored (`/dist/`, `/a/b`), interior-wildcard (`a/*/y.txt`),
+        // unanchored basename / basename-dir (`dist/`, `app`, `*.wasm`, `sub/`), and
+        // leading `**` (`**/app`). Each may be emitted as a `!` carve-out too.
+        const PATTERNS: &[&str] = &[
+            "a/dist/",
+            "a/b/app",
+            "a/dist/**",
+            "/dist/",
+            "/a/b",
+            "a/*/y.txt",
+            "dist/",
+            "app",
+            "*.wasm",
+            "sub/",
+            "**/app",
+        ];
+
+        /// A random repo-relative file path: 0–3 directory segments then a file name.
+        fn file_path() -> impl Strategy<Value = Vec<&'static str>> {
+            (
+                proptest::collection::vec(proptest::sample::select(DIR_NAMES.to_vec()), 0..4),
+                proptest::sample::select(FILE_NAMES.to_vec()),
+            )
+                .prop_map(|(mut segments, file)| {
+                    segments.push(file);
+                    segments
+                })
+        }
+
+        /// A random include line, optionally negated into a `!` carve-out.
+        fn pattern_line() -> impl Strategy<Value = String> {
+            (proptest::sample::select(PATTERNS.to_vec()), any::<bool>()).prop_map(
+                |(pattern, negate)| {
+                    if negate {
+                        format!("!{pattern}")
+                    } else {
+                        pattern.to_string()
+                    }
+                },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The pruned walk and an exhaustive (prune-disabled) walk must select
+            /// exactly the same files for any tree and pattern set.
+            #[test]
+            fn prune_never_changes_selection(
+                files in proptest::collection::vec(file_path(), 1..12),
+                patterns in proptest::collection::vec(pattern_line(), 0..6),
+            ) {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+
+                // Materialise the random tree (parents created by `write`).
+                for segments in &files {
+                    write(root, &segments.join("/"), "x");
+                }
+                // Project-layer include file from the random patterns.
+                let include: String = patterns.iter().map(|p| format!("{p}\n")).collect();
+                write(root, PROJECT_INCLUDE_FILE, &include);
+
+                let search = load_search(root, None).unwrap();
+                let pruned = build_prune_info(&search);
+                // An always-descend prune is exactly the exhaustive walk: every
+                // directory (bar `.git`) is entered, nothing is skipped.
+                let exhaustive = PruneInfo {
+                    any_unanchored: true,
+                    prefixes: Vec::new(),
+                };
+
+                let (sel_pruned, entered_pruned) = walk_under(root, None, &pruned);
+                let (sel_exhaustive, entered_exhaustive) = walk_under(root, None, &exhaustive);
+
+                // Primary invariant: pruning never changes the selected set.
+                prop_assert_eq!(&sel_pruned, &sel_exhaustive);
+
+                // Bonus: the prune only ever *skips* directories, so every directory
+                // the pruned walk entered was also entered by the exhaustive walk.
+                // This guards against a vacuous pass (e.g. both walks selecting
+                // nothing while the prune silently misbehaves).
+                let exhaustive_dirs: BTreeSet<&String> = entered_exhaustive.iter().collect();
+                for entered in &entered_pruned {
+                    prop_assert!(
+                        exhaustive_dirs.contains(entered),
+                        "pruned walk entered {entered:?} the exhaustive walk did not",
+                    );
+                }
+            }
+        }
     }
 }
