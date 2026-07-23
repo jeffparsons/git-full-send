@@ -1,6 +1,8 @@
 # ADR-0011 — Worktree reassembly mechanics
 
-- Status: accepted
+- Status: accepted; amended by
+  [ADR-0016](0016-clean-spares-undelivered-gitignored-files.md) — the `clean`
+  step (Decision step 3 and its `-x` Consequences bullet) now runs without `-x`
 - Date: 2026-06-13
 
 ## Context

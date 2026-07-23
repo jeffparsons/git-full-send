@@ -630,6 +630,151 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
 }
 
 #[tokio::test]
+async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    // The synced tree's .gitignore is what marks the remote-local files below
+    // as ignored once it is checked out into the worktree.
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "keep.txt", "v1");
+    write_file(c, ".gitignore", "ignored.txt\nignored-dir/\n");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::default(),
+    )
+    .await
+    .expect("first update-worktree");
+
+    // Remote-side gitignored state gfs never delivered — a co-hosted dev
+    // environment's local files.
+    write_file(wt, "ignored.txt", "local state");
+    write_file(wt, "ignored-dir/cache.bin", "local cache");
+
+    // A second sync + update of the same worktree must leave them alone.
+    write_file(c, "keep.txt", "v2");
+    commit_all(c, "edit keep.txt");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::default(),
+    )
+    .await
+    .expect("second update-worktree");
+
+    assert_eq!(
+        std::fs::read_to_string(wt.join("ignored.txt")).expect("read ignored.txt"),
+        "local state",
+        "an undelivered gitignored file survives the update",
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("ignored-dir/cache.bin")).expect("read cache.bin"),
+        "local cache",
+        "an undelivered gitignored directory survives the update",
+    );
+    // The delivered files still updated as usual.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("keep.txt")).expect("read keep.txt"),
+        "v2",
+        "the delivered file was updated",
+    );
+}
+
+#[tokio::test]
+async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "keep.txt", "v1");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("first sync");
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::default(),
+    )
+    .await
+    .expect("first update-worktree");
+
+    // Remote-side untracked files that are not gitignored: genuine cruft, still
+    // swept by the post-read-tree clean.
+    write_file(wt, "cruft.txt", "junk");
+    write_file(wt, "cruft-dir/junk.txt", "junk");
+
+    write_file(c, "keep.txt", "v2");
+    commit_all(c, "edit keep.txt");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("second sync");
+    gfs_server::update_worktree(
+        server.path().to_path_buf(),
+        wt.to_path_buf(),
+        stream.clone(),
+        gfs_server::LockMode::default(),
+    )
+    .await
+    .expect("second update-worktree");
+
+    assert!(
+        !wt.join("cruft.txt").exists(),
+        "an untracked non-ignored file is removed",
+    );
+    assert!(
+        !wt.join("cruft-dir").exists(),
+        "an untracked non-ignored directory is removed",
+    );
+    assert_eq!(
+        worktree_files(wt),
+        tree_paths(server.path(), &code_ref(&stream)),
+        "worktree matches the synced tree exactly",
+    );
+}
+
+#[tokio::test]
 async fn two_streams_do_not_clobber_each_other() {
     let server = init_bare_repo();
     let addr = start_server(server.path());

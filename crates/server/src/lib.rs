@@ -870,20 +870,25 @@ fn count_stream_refs(
 
 /// The blocking body of [`update_worktree`].
 ///
-/// Reassembles the worktree with the persistent-index pipeline of ADR-0011.
-/// First resolve the `code` tree and overlay the stream's `extra` tree
-/// (force-included, normally-gitignored files — ADR-0007) onto it at identity
-/// paths, producing a single **combined** tree; then `read-tree --reset -u`
-/// (reset index + worktree to that tree, discarding remote-local edits and
-/// removing files dropped since the last sync) and `clean -fdx` (prune untracked
-/// leftovers), keyed on a per-worktree index so Git's stat cache keeps the work
-/// proportional to the sync delta.
+/// Reassembles the worktree with the persistent-index pipeline of ADR-0011 (as
+/// amended by ADR-0016). First resolve the `code` tree and overlay the stream's
+/// `extra` tree (force-included, normally-gitignored files — ADR-0007) onto it
+/// at identity paths, producing a single **combined** tree; then `read-tree
+/// --reset -u` (reset index + worktree to that tree, discarding remote-local
+/// edits and removing files dropped since the last sync) and `clean -fd` (prune
+/// untracked non-ignored leftovers), keyed on a per-worktree index so Git's stat
+/// cache keeps the work proportional to the sync delta.
 ///
 /// Folding `extra` into the checked-out tree makes the volatile force-include set
 /// fall out of the same machinery as `code`: dropped `extra` files were in the
 /// prior combined index and are removed by `--reset -u`, while surviving `extra`
-/// files are index-tracked so `clean -fdx`'s `-x` leaves them untouched and only
-/// prunes genuine remote-local junk.
+/// files are index-tracked so `clean` never considers them.
+///
+/// `clean` deliberately runs without `-x` (ADR-0016): read-tree already manages
+/// the whole delivered set, `extra` included, so `clean`'s only job is sweeping
+/// untracked non-ignored cruft. Gitignored files gfs didn't deliver (a co-hosted
+/// dev environment's `.env`, caches, build state) belong to the user and are
+/// left alone.
 fn update_worktree_blocking(
     repo: &Path,
     worktree: &Path,
@@ -932,13 +937,7 @@ fn update_worktree_blocking(
     let read_tree_ms = elapsed_ms(t);
 
     let t = Instant::now();
-    run_git_step(
-        "clean",
-        &git_dir,
-        worktree,
-        &index,
-        &["clean", "-d", "-f", "-x"],
-    )?;
+    run_git_step("clean", &git_dir, worktree, &index, &["clean", "-d", "-f"])?;
     let clean_ms = elapsed_ms(t);
 
     let total_ms = elapsed_ms(t_total);
@@ -1086,7 +1085,7 @@ fn overlay_extra_onto_code(
 /// distinct directories (and thus distinct indexes and locks); the same worktree
 /// maps to the same directory across runs regardless of how the path was spelled.
 /// Everything in here lives under the git dir, never inside the worktree itself —
-/// `clean -fdx` would otherwise delete it.
+/// `clean -fd` would otherwise delete it.
 fn worktree_state_dir(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
     use std::hash::{Hash, Hasher};
 
