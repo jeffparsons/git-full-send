@@ -66,7 +66,7 @@ pub(crate) struct UpdateWorktreeRecord {
     pub resolve_ms: f64,
     /// The `git read-tree --reset -u` step.
     pub read_tree_ms: f64,
-    /// The `git clean -fdx` step.
+    /// The `git clean -fd` step.
     pub clean_ms: f64,
     /// The combined tree that was checked out.
     pub tree: String,

@@ -25,6 +25,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0013](0013-recording-operation-metrics.md) | Recording operation metrics | accepted |
 | [0014](0014-forgetting-a-stream.md) | Forgetting a stream | accepted |
 | [0015](0015-ttl-based-reaping-of-stale-streams.md) | TTL-based reaping of stale streams | accepted |
+| [0016](0016-clean-spares-undelivered-gitignored-files.md) | `clean` spares gitignored files it didn't deliver | accepted |
 
 ## Open research tasks
 
