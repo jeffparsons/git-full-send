@@ -18,7 +18,7 @@ test-support = { path = "crates/test-support" }
 
 # External crates. Versions are pinned here once and inherited by members via
 # `dep.workspace = true`; see ADR-0001 for the rationale behind the core set.
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 bstr = "1.12.1"
 clap = "4.6.1"
 getrandom = "0.4.2"
