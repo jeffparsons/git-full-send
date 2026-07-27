@@ -365,11 +365,63 @@ The `read_tree.*` split comes from `git`'s own trace2 instrumentation and is
 best-effort: an unfamiliar `git` version means those fields are absent, never
 that the checkout fails.
 
-Inspect or aggregate the sink with any JSON tool, e.g. the slowest syncs:
+### Aggregating the sink
 
 ```sh
-jq -r 'select(.kind=="sync") | [.total_ms, .stream] | @tsv' \
-    .git/git-full-send/metrics.jsonl | sort -rn | head
+git-full-send metrics --repo .                       # every kind
+git-full-send metrics --repo . --kind sync --last 20 # the recent syncs only
 ```
 
+Prints count and p50/p95/max for every numeric field of every record kind,
+nested fields flattened to dotted keys (`code.push_ms`, `outbound.advertisement`).
+It doesn't know any record's shape, so it keeps working across a schema change —
+and it will happily aggregate old and new records side by side, which is what
+`schema` is there to disambiguate. `--json` emits the same summary structurally.
+
 The file grows unbounded for now (no rotation); delete it freely — it is regenerated.
+
+## 6. When it's slow: `doctor`
+
+```sh
+git-full-send doctor --repo /path/to/target-repo [--worktree /path/to/worktree]
+```
+
+Reports the conditions that predictably make syncs slow — and, unlike a bare
+number, what to do about each ([ADR-0018](adr/0018-liveness-and-repo-health-surfaces.md)):
+
+- **ref count**, and the ref advertisement it implies on *every* connection;
+- **`alternates`** entries that don't resolve (git prints `unable to normalize
+  alternate object path` for these and carries on regardless, so they go
+  unnoticed);
+- **object/pack layout** and `receive.autogc`;
+- **the target worktree**: whether it is the repository's own working tree —
+  which `update-worktree` will happily stomp (ADR-0008) — and the state of its
+  per-worktree index;
+- **unanchored force-include patterns**, which defeat the selection walk's
+  pruning ([§4](#4-force-include-pattern-files)).
+
+It exits **non-zero** if any check is an `error`, so an orchestrator can gate on
+it; warnings do not affect the exit code. `--json` emits the checks structurally.
+
+The two cheapest checks — ref count and broken alternates — also run once at
+`listen` startup and log if they find something.
+
+### A worked example
+
+Symptoms: every `update-worktree` takes 4 seconds, and each sync feels slow even
+when nothing changed.
+
+```sh
+# 1. What did the last checkout actually do?
+git-full-send update-worktree --repo … --worktree … --stream-id … 
+#   → "tree 97cfe08ee1d5 — nothing to write or remove (same tree as the last checkout)"
+#   → "index warm: 34,012 entries, 2.6 MiB"
+#   A large read-tree that wrote nothing is not explained by work done.
+
+# 2. What does a connection cost before any data moves?
+git-full-send probe --remote 127.0.0.1:9419
+#   → "ref advertisement: 3.0 MiB for 28709 ref(s) (4 git-full-send's)"
+
+# 3. What should be done about it?
+git-full-send doctor --repo /path/to/target-repo
+```

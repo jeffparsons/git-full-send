@@ -13,7 +13,7 @@ data lands (a JSON Lines sink per side) and recorded per-phase wall times plus
 per-layer file/byte counts. It deliberately left "analysis / reporting tooling"
 out of scope: the decision only *produces* the data.
 
-Field use since then (issue #75) showed the data is not enough to act on. Against
+Field use since then (#75) showed the data is not enough to act on. Against
 a ~34,000-file monorepo worktree on a server repo with 28,709 refs:
 
 - a **no-op** `update-worktree` recorded `read_tree_ms=4008` — a number that says

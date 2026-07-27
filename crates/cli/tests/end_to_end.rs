@@ -544,6 +544,140 @@ async fn the_human_summary_stays_the_default_on_both_commands() {
     );
 }
 
+/// Run the binary and return `(exit code, stdout)` without asserting success —
+/// for commands whose non-zero exit is the thing under test.
+async fn run_cli_status(args: &[&str]) -> (i32, String) {
+    let output = tokio::process::Command::new(BIN)
+        .args(args)
+        .env(
+            "GIT_FULL_SEND_USER_INCLUDE",
+            "/nonexistent/git-full-send-include",
+        )
+        .output()
+        .await
+        .unwrap_or_else(|e| panic!("spawn `git-full-send {}`: {e}", args.join(" ")));
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+/// `doctor` reports the repo conditions that predictably hurt, and exits non-zero
+/// on a *broken* one so an orchestrator can gate on it (ADR-0018).
+///
+/// The fixture is the exact failure from #75: an `objects/info/alternates`
+/// entry pointing at a path that no longer exists, which git complains about on
+/// every invocation while carrying on, and which gfs used to pass through in
+/// silence.
+#[tokio::test]
+async fn doctor_reports_a_broken_alternates_and_exits_non_zero() {
+    let server = init_bare_repo();
+    let repo = server.path().to_str().unwrap().to_string();
+
+    // Healthy to begin with.
+    let (code, healthy) = run_cli_status(&["doctor", "--repo", &repo]).await;
+    assert_eq!(code, 0, "a healthy repo exits zero:\n{healthy}");
+    assert!(
+        healthy.contains("refs") && healthy.contains("alternates"),
+        "the checks are named:\n{healthy}",
+    );
+
+    // Now break the alternates.
+    let info = server.path().join("objects").join("info");
+    std::fs::create_dir_all(&info).expect("create objects/info");
+    std::fs::write(info.join("alternates"), "/gone/nowhere/objects\n").expect("write alternates");
+
+    let (code, broken) = run_cli_status(&["doctor", "--repo", &repo]).await;
+    assert_eq!(code, 1, "a broken repo exits non-zero:\n{broken}");
+    assert!(
+        broken.contains("/gone/nowhere/objects"),
+        "it names the unreachable entry:\n{broken}",
+    );
+    assert!(
+        broken.contains("ERROR"),
+        "and calls it an error, not a warning:\n{broken}",
+    );
+
+    // The same findings, structurally, for a caller that parses.
+    let (_, json) = run_cli_status(&["doctor", "--repo", &repo, "--json"]).await;
+    let report: serde_json::Value =
+        serde_json::from_str(json.trim()).expect("doctor --json prints one JSON object");
+    assert_eq!(report["kind"], "doctor");
+    let alternates = report["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["name"] == "alternates")
+        .expect("an alternates check");
+    assert_eq!(alternates["status"], "error");
+    assert!(
+        alternates["remedy"].is_string(),
+        "a finding carries what to do about it: {alternates}",
+    );
+}
+
+/// `metrics` summarises the sink so `docs/operating.md` can stop handing out
+/// `jq` incantations (ADR-0017).
+#[tokio::test]
+async fn metrics_summarises_the_sink_after_a_round_trip() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    run_cli(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+
+    let summary = run_cli_capture(&["metrics", "--repo", c.to_str().unwrap()]).await;
+    assert!(
+        summary.contains("sync (1 record(s))"),
+        "the client's sink holds one sync:\n{summary}",
+    );
+    for header in ["p50", "p95", "max"] {
+        assert!(summary.contains(header), "reports {header}:\n{summary}");
+    }
+    assert!(
+        summary.contains("code.push_ms"),
+        "including nested fields, flattened to dotted keys:\n{summary}",
+    );
+
+    // The server's side, filtered to one kind, as JSON.
+    let json = run_cli_capture(&[
+        "metrics",
+        "--repo",
+        server.path().to_str().unwrap(),
+        "--kind",
+        "receive",
+        "--json",
+    ])
+    .await;
+    let stats: serde_json::Value =
+        serde_json::from_str(json.trim()).expect("metrics --json parses");
+    let kinds = stats.as_array().expect("an array of per-kind stats");
+    assert_eq!(kinds.len(), 1, "filtered to `receive`: {stats}");
+    assert_eq!(kinds[0]["kind"], "receive");
+    assert!(
+        kinds[0]["fields"]
+            .as_array()
+            .expect("fields")
+            .iter()
+            .any(|f| f["field"] == "outbound.advertisement"),
+        "including the advertisement split: {stats}",
+    );
+}
+
 /// The finalised CLI surface is wired up: every subcommand parses, and the new
 /// `--user-include` flag and `listen --addr` option are present.
 #[test]
@@ -561,11 +695,14 @@ fn command_line_surface_is_wired_up() {
     let top = help(&["--help"]);
     for sub in [
         "sync",
+        "probe",
         "listen",
         "update-worktree",
         "list-streams",
         "forget-stream",
         "reap",
+        "doctor",
+        "metrics",
     ] {
         assert!(top.contains(sub), "top-level help lists `{sub}`:\n{top}");
     }
@@ -590,10 +727,31 @@ fn command_line_surface_is_wired_up() {
             "sync exposes {flag}:\n{sync_help}"
         );
     }
+    let update_help = help(&["update-worktree", "--help"]);
+    for flag in ["--json", "--measure-worktree"] {
+        assert!(
+            update_help.contains(flag),
+            "update-worktree exposes {flag}:\n{update_help}",
+        );
+    }
     assert!(
-        help(&["update-worktree", "--help"]).contains("--json"),
-        "update-worktree exposes --json",
+        help(&["probe", "--help"]).contains("--remote"),
+        "probe exposes --remote",
     );
+    let doctor_help = help(&["doctor", "--help"]);
+    for flag in ["--repo", "--worktree", "--json"] {
+        assert!(
+            doctor_help.contains(flag),
+            "doctor exposes {flag}:\n{doctor_help}",
+        );
+    }
+    let metrics_help = help(&["metrics", "--help"]);
+    for flag in ["--repo", "--kind", "--last"] {
+        assert!(
+            metrics_help.contains(flag),
+            "metrics exposes {flag}:\n{metrics_help}",
+        );
+    }
     let listen_help = help(&["listen", "--help"]);
     for flag in ["--addr", "--max-connections", "--connection-timeout"] {
         assert!(

@@ -20,6 +20,13 @@ Three commands (a single `git-full-send` binary):
 - **`update-worktree`** (server) — authoritative, destructive checkout of a
   stream's synced state into a worktree directory.
 
+Plus, for when it feels slow: **`probe`** (is the server up, and what does a
+connection cost?), **`doctor`** (which repository conditions are hurting, and
+what to do about them), and **`metrics`** (p50/p95 of everything recorded).
+Every operation explains its own cost — see
+[ADR-0017](docs/adr/0017-making-operation-cost-self-explaining.md) — and `--json`
+gives an integrator the same numbers to parse.
+
 The server binds **localhost only**; connectivity from the client is via a
 **manual SSH tunnel** ([ADR-0006](docs/adr/0006-transport-and-connectivity.md)).
 

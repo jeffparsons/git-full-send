@@ -7,7 +7,7 @@
 ## Context
 
 Two failures of the tool to say what it knows, both found while integrating
-`git-full-send` into an orchestrator (issue #75).
+`git-full-send` into an orchestrator (#75).
 
 **A readiness probe reads as a broken push.** An orchestrator must know when
 `listen` is accepting before it pushes, and the only way to ask is to connect.

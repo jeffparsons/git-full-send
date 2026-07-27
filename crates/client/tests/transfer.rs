@@ -575,7 +575,7 @@ async fn probing_is_reported_as_a_probe_not_a_failure() {
     assert_eq!(hung_up["success"], false);
 }
 
-/// A checkout explains its own cost (issue #75, ADR-0017): the first run finds a
+/// A checkout explains its own cost (#75, ADR-0017): the first run finds a
 /// cold index and real work to do, the second finds a warm index and *nothing* to
 /// do — which is what makes a large `read_tree_ms` on a no-op visibly unexplained
 /// by work done, rather than a mystery to be timed by hand.

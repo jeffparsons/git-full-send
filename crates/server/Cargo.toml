@@ -15,6 +15,9 @@ gfs-common.workspace = true
 gix = { workspace = true, features = ["tree-editor"] }
 # Derive `Serialize` for the per-operation metrics records (issue #42, ADR-0013).
 serde = { workspace = true }
+# `doctor`'s per-check detail is heterogeneous (counts, paths, booleans), so it
+# is carried as JSON values rather than a check-specific struct (ADR-0018).
+serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 # `net`/`signal`/`sync`/`time`/`macros` back the bounded, signal-driven accept

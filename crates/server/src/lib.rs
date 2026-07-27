@@ -43,7 +43,10 @@ use tempfile::TempDir;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+pub mod doctor;
 mod metrics;
+
+pub use doctor::{Check, DoctorReport, doctor};
 
 /// Environment variable naming the file the `pre-receive` hook appends accepted
 /// ref names to, so [`handle_connection`] can record which refs a push updated
@@ -213,6 +216,10 @@ pub fn bind(addr: SocketAddr, repo: PathBuf) -> Result<Listener, ServerError> {
         .to_path_buf();
     let listener = TcpListener::bind(addr).map_err(|source| ServerError::Bind { addr, source })?;
     let hooks = install_hooks()?;
+    // Say the cheap, expensive-to-ignore things once per process, unprompted: the
+    // operator who most needs them is the one who did not think to run `doctor`
+    // (ADR-0018).
+    doctor::log_startup_checks(&repo);
     Ok(Listener {
         listener,
         repo,
@@ -1402,6 +1409,18 @@ fn worktree_state_dir(git_dir: &Path, worktree: &Path) -> Result<PathBuf, Server
 /// The path of the persistent index for `worktree`, under the git dir.
 fn worktree_index_path(git_dir: &Path, worktree: &Path) -> Result<PathBuf, ServerError> {
     Ok(worktree_state_dir(git_dir, worktree)?.join("index"))
+}
+
+/// The git dir of the repository at `repo` — where its `git-full-send/` state
+/// and metrics sink live (ADR-0013).
+///
+/// Public so a caller that needs the sink's location (the `metrics` command) can
+/// resolve it without taking its own `gix` dependency.
+pub fn git_dir(repo: &Path) -> Result<PathBuf, ServerError> {
+    Ok(gix::discover(repo)
+        .map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?
+        .git_dir()
+        .to_path_buf())
 }
 
 /// The path of the per-worktree advisory lock file, under the git dir.
