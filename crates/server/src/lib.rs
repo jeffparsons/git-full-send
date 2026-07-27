@@ -632,6 +632,11 @@ pub enum LockMode {
 /// The `--json` form is how a *client* orchestrating a remote checkout over SSH
 /// gets the server's numbers back: before ADR-0017 they only landed in a file on
 /// the server.
+///
+/// Every duration here is accompanied by the size of the work it did, because a
+/// duration alone is not actionable: a 4-second `read_tree_ms` means one thing
+/// when [`ChangedPaths`] says thousands of files were written and quite another
+/// when it says none were.
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
 pub struct UpdateWorktreeReport {
@@ -648,10 +653,143 @@ pub struct UpdateWorktreeReport {
     pub total_ms: f64,
     /// Resolving the `code`/`extra` trees and building the combined tree.
     pub resolve_ms: f64,
+    /// What this checkout cost us to *measure*, in milliseconds — the
+    /// tree-vs-index diff, and the worktree walk under `measure_worktree`.
+    ///
+    /// Recorded rather than hidden: instrumentation that quietly inflates the
+    /// thing it measures is worse than none (ADR-0017).
+    pub measure_ms: f64,
     /// The `git read-tree --reset -u` step.
     pub read_tree_ms: f64,
     /// The `git clean -fd` step.
     pub clean_ms: f64,
+    /// The state of the per-worktree index this checkout ran against.
+    pub index: IndexState,
+    /// How much of the worktree actually had to change.
+    pub changed: ChangedPaths,
+    /// `read-tree`'s internals, harvested from git's own instrumentation.
+    /// `None` when trace2 gave us nothing (see [`gfs_common::trace2`]).
+    pub read_tree: Option<ReadTreeBreakdown>,
+    /// What the `clean` sweep removed.
+    pub clean: CleanStats,
+    /// Files in the worktree afterwards. Only counted under `measure_worktree`
+    /// (a full filesystem walk), so `None` by default.
+    pub worktree_files: Option<usize>,
+}
+
+/// The per-worktree index as this checkout found it (ADR-0011).
+///
+/// A cold index makes a slow checkout *expected* — there is no stat cache, so
+/// `read-tree` rewrites the whole worktree. A **warm** index taking seconds is
+/// the interesting case, and telling the two apart used to require guessing.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct IndexState {
+    /// `"warm"` if `read-tree` loaded an existing index, `"cold"` if it built one
+    /// from scratch, `"unknown"` if git's instrumentation didn't say.
+    pub state: &'static str,
+    /// Size of the index file before the checkout, in bytes; `None` if absent.
+    pub bytes: Option<u64>,
+    /// Entries in the index after the checkout.
+    pub entries: Option<i64>,
+}
+
+/// How far the worktree was from the tree being checked out.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct ChangedPaths {
+    /// Whether this is the very tree the worktree last checked out — in which
+    /// case the tree side of the work is *definitionally* zero, however long
+    /// `read_tree_ms` turns out to be.
+    pub tree_unchanged: bool,
+    /// Paths differing between the target tree and the index, counted without a
+    /// single `lstat` — the work `read-tree` must do from the tree side.
+    pub vs_index: Option<PathDelta>,
+    /// Paths differing between the target tree and what is on *disk*. Costs an
+    /// `lstat` per index entry, so only measured under `measure_worktree`.
+    pub vs_worktree: Option<PathDelta>,
+}
+
+/// A count of paths a checkout would have to change.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct PathDelta {
+    /// Paths that must be created or rewritten.
+    pub to_write: usize,
+    /// Paths that must be removed.
+    pub to_remove: usize,
+}
+
+impl PathDelta {
+    /// Whether nothing at all differs.
+    pub fn is_empty(&self) -> bool {
+        self.to_write == 0 && self.to_remove == 0
+    }
+}
+
+/// `read-tree`'s internal phases, harvested from git's trace2 stream (ADR-0017).
+///
+/// Three very different problems hide inside one number: loading a large index,
+/// walking the tree, and writing files. Each is missing individually if git's
+/// instrumentation didn't report it.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct ReadTreeBreakdown {
+    /// Reading the per-worktree index in (`index:do_read_index`).
+    pub load_index_ms: Option<f64>,
+    /// Walking the tree being checked out (`unpack_trees:traverse_trees`).
+    pub resolve_tree_ms: Option<f64>,
+    /// Applying it to the index and the worktree — the outer
+    /// `unpack_trees:unpack_trees` region less the traversal inside it. This is
+    /// where writing files (and stat-ing the ones that don't need writing) lands.
+    pub apply_ms: Option<f64>,
+    /// Writing the index back out (`index:do_write_index`).
+    pub write_index_ms: Option<f64>,
+}
+
+/// What the post-checkout `clean -fd` sweep removed.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct CleanStats {
+    /// Untracked non-ignored entries removed (ADR-0016).
+    pub removed: usize,
+}
+
+/// Tunables for one [`update_worktree`] run.
+///
+/// Grouped into a struct rather than added as parameters so that the next knob
+/// (there will be one) does not change the signature again. Deliberately *not*
+/// `#[non_exhaustive]` — unlike the report types, this is an input a caller has
+/// to be able to build, and it mirrors [`ListenConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateOptions {
+    /// What to do when another run already holds this worktree's lock.
+    pub lock: LockMode,
+    /// Also measure the worktree itself: how many paths differ from what is on
+    /// disk, and how many files the worktree holds.
+    ///
+    /// Off by default because it is the one genuinely expensive measurement here
+    /// — an `lstat` per index entry plus a full filesystem walk, both
+    /// proportional to the tree rather than to the change (ADR-0017). Everything
+    /// else on the record is cheap enough to always pay for.
+    pub measure_worktree: bool,
+}
+
+impl UpdateOptions {
+    /// Options with the given lock mode and no extra measurement — the common
+    /// case, and what a caller that only cares about contention wants.
+    pub fn with_lock(lock: LockMode) -> Self {
+        Self {
+            lock,
+            measure_worktree: false,
+        }
+    }
+}
+
+impl From<LockMode> for UpdateOptions {
+    fn from(lock: LockMode) -> Self {
+        Self::with_lock(lock)
+    }
 }
 
 /// Check a stream's synced `code` state out into the given worktree.
@@ -677,11 +815,14 @@ pub async fn update_worktree(
     repo: PathBuf,
     worktree: PathBuf,
     stream: gfs_common::StreamId,
-    mode: LockMode,
+    options: impl Into<UpdateOptions>,
 ) -> Result<UpdateWorktreeReport, ServerError> {
-    tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree, &stream, mode))
-        .await
-        .map_err(|e| ServerError::Join(e.to_string()))?
+    let options = options.into();
+    tokio::task::spawn_blocking(move || {
+        update_worktree_blocking(&repo, &worktree, &stream, options)
+    })
+    .await
+    .map_err(|e| ServerError::Join(e.to_string()))?
 }
 
 /// List the streams that have a synced `code` ref in `repo`.
@@ -922,7 +1063,7 @@ fn update_worktree_blocking(
     repo: &Path,
     worktree: &Path,
     stream: &gfs_common::StreamId,
-    mode: LockMode,
+    options: UpdateOptions,
 ) -> Result<UpdateWorktreeReport, ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let git_dir = discovered.git_dir().to_path_buf();
@@ -952,11 +1093,39 @@ fn update_worktree_blocking(
     // `clean` window. `_lock` releases on drop at the end of this function (or on
     // process exit, since the OS owns the `flock`). The read-only tree
     // resolution above deliberately runs unlocked.
-    let lock_path = worktree_state_dir(&git_dir, worktree)?.join("lock");
-    let _lock = acquire_worktree_lock(&lock_path, worktree, mode)?;
+    let state_dir = worktree_state_dir(&git_dir, worktree)?;
+    let lock_path = state_dir.join("lock");
+    let _lock = acquire_worktree_lock(&lock_path, worktree, options.lock)?;
+
+    // Everything from here to the checkout is measurement, and it is timed as
+    // such: instrumentation that inflates the number it explains, invisibly, is
+    // worse than none (ADR-0017).
+    let t = Instant::now();
+    // The index as we found it. Its *warmth* comes from git itself below; what we
+    // can see from out here is whether the file exists and how big it is.
+    let index_bytes = std::fs::metadata(&index).ok().map(|m| m.len());
+    // The strongest no-op signal, and free: the tree the previous successful
+    // checkout wrote here. Equal ids mean the tree side of the work is zero,
+    // whatever `read_tree_ms` turns out to be.
+    let last_tree_path = state_dir.join("last-tree");
+    let tree_unchanged = std::fs::read_to_string(&last_tree_path)
+        .map(|last| last.trim() == tree)
+        .unwrap_or(false);
+    // What `read-tree` will have to change, counted without touching the disk.
+    let vs_index = count_changed_paths(&git_dir, worktree, &index, &tree, Compare::Index);
+    // The expensive pair, opt-in: an `lstat` per index entry, and a full walk.
+    let (vs_worktree, worktree_files) = if options.measure_worktree {
+        (
+            count_changed_paths(&git_dir, worktree, &index, &tree, Compare::Worktree),
+            count_worktree_files(worktree),
+        )
+    } else {
+        (None, None)
+    };
+    let measure_ms = elapsed_ms(t);
 
     let t = Instant::now();
-    run_git_step(
+    let trace = run_git_step(
         "read-tree",
         &git_dir,
         worktree,
@@ -966,13 +1135,35 @@ fn update_worktree_blocking(
     let read_tree_ms = elapsed_ms(t);
 
     let t = Instant::now();
-    run_git_step("clean", &git_dir, worktree, &index, &["clean", "-d", "-f"])?;
+    let clean_output = run_git_step("clean", &git_dir, worktree, &index, &["clean", "-d", "-f"])?;
     let clean_ms = elapsed_ms(t);
+    let clean = CleanStats {
+        // `clean` prints one `Removing <path>` line per entry it deletes.
+        removed: clean_output
+            .stdout
+            .lines()
+            .filter(|l| l.starts_with("Removing "))
+            .count(),
+    };
+
+    // Remember what we just checked out, so the *next* run can tell a no-op from
+    // real work for free. Best-effort, like every other measurement here.
+    if let Err(error) = std::fs::write(&last_tree_path, &tree) {
+        tracing::debug!(%error, "could not record the checked-out tree id");
+    }
+
+    let index = index_state(index_bytes, trace.as_ref());
+    let read_tree = trace.as_ref().and_then(read_tree_breakdown);
 
     let total_ms = elapsed_ms(t_total);
     tracing::info!(
         stream = %stream, worktree = %worktree.display(),
-        total_ms, resolve_ms, read_tree_ms, clean_ms,
+        total_ms, resolve_ms, measure_ms, read_tree_ms, clean_ms,
+        index_state = index.state,
+        index_entries = index.entries,
+        tree_unchanged,
+        paths_to_write = vs_index.map(|d| d.to_write),
+        paths_to_remove = vs_index.map(|d| d.to_remove),
         "updated worktree"
     );
 
@@ -985,8 +1176,18 @@ fn update_worktree_blocking(
         tree,
         total_ms,
         resolve_ms,
+        measure_ms,
         read_tree_ms,
         clean_ms,
+        index,
+        changed: ChangedPaths {
+            tree_unchanged,
+            vs_index,
+            vs_worktree,
+        },
+        read_tree,
+        clean,
+        worktree_files,
     };
 
     // Best-effort metrics record (ADR-0013).
@@ -1214,22 +1415,47 @@ fn acquire_worktree_lock(
     }
 }
 
+/// What a completed `git` step of the worktree update reported about itself.
+struct GitStepOutput {
+    /// The step's stdout, for the steps whose output carries a count (`clean`).
+    stdout: String,
+    /// git's own trace2 stream for the step, when we captured one (ADR-0017).
+    trace: Option<gfs_common::trace2::Trace2>,
+}
+
+impl GitStepOutput {
+    /// The harvested trace2 stream, if any.
+    fn as_ref(&self) -> Option<&gfs_common::trace2::Trace2> {
+        self.trace.as_ref()
+    }
+}
+
 /// Run one `git` step of the worktree update with the per-worktree index, mapping
 /// a spawn failure and a non-zero exit to the matching [`ServerError`].
+///
+/// The child runs with a trace2 capture attached, so a step that dominates a
+/// phase can be decomposed from the inside afterwards (ADR-0017). Capturing is
+/// best-effort: no capture simply means no sub-timings.
 fn run_git_step(
     step: &'static str,
     git_dir: &Path,
     worktree: &Path,
     index: &Path,
     args: &[&str],
-) -> Result<(), ServerError> {
-    let output = Command::new("git")
+) -> Result<GitStepOutput, ServerError> {
+    let mut command = Command::new("git");
+    command
         .arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")
         .arg(worktree)
         .env("GIT_INDEX_FILE", index)
-        .args(args)
+        .args(args);
+    let capture = gfs_common::trace2::Trace2Capture::new();
+    if let Some(capture) = &capture {
+        capture.apply(&mut command);
+    }
+    let output = command
         .output()
         .map_err(|source| ServerError::RunGit { step, source })?;
     if !output.status.success() {
@@ -1238,7 +1464,142 @@ fn run_git_step(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    Ok(())
+    Ok(GitStepOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        trace: capture.and_then(|c| c.harvest()),
+    })
+}
+
+/// Which side of the checkout to compare the target tree against.
+#[derive(Debug, Clone, Copy)]
+enum Compare {
+    /// The index only — no `lstat`, so proportional to the index but with no
+    /// filesystem I/O per path. Cheap enough to always measure.
+    Index,
+    /// The working tree — one `lstat` per index entry. Opt-in only.
+    Worktree,
+}
+
+/// Count the paths a checkout of `tree` would have to write and remove.
+///
+/// `git diff-index` reports the *index or worktree* relative to the tree, so its
+/// letters read backwards from what we want and are flipped here: a path present
+/// in the tree but not the index shows as `D` and is a path to **write**; one
+/// present in the index but not the tree shows as `A` and is a path to
+/// **remove**.
+///
+/// Returns `None` if the diff could not be taken — a missing count is a missing
+/// explanation, never a failed checkout (ADR-0013).
+fn count_changed_paths(
+    git_dir: &Path,
+    worktree: &Path,
+    index: &Path,
+    tree: &str,
+    compare: Compare,
+) -> Option<PathDelta> {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(worktree)
+        .env("GIT_INDEX_FILE", index)
+        .args(["diff-index", "--name-status", "--no-renames"]);
+    if let Compare::Index = compare {
+        command.arg("--cached");
+    }
+    let output = command.arg(tree).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut delta = PathDelta::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        match line.as_bytes().first() {
+            // In the index/worktree but not the tree: the checkout removes it.
+            Some(b'A') => delta.to_remove += 1,
+            // In the tree but not here, or different here: the checkout writes it.
+            Some(b'D' | b'M' | b'T' | b'C' | b'R') => delta.to_write += 1,
+            // `U` (unmerged) and anything unfamiliar: counted as work to do
+            // rather than silently dropped.
+            Some(_) => delta.to_write += 1,
+            None => {}
+        }
+    }
+    Some(delta)
+}
+
+/// Count the files in `worktree`, skipping `.git`.
+///
+/// A full filesystem walk — the reason [`UpdateOptions::measure_worktree`]
+/// exists. `None` if the walk hit an error partway; a partial count would be
+/// worse than none.
+fn count_worktree_files(worktree: &Path) -> Option<usize> {
+    fn walk(dir: &Path, count: &mut usize) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_name() == std::ffi::OsStr::new(".git") {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), count)?;
+            } else {
+                *count += 1;
+            }
+        }
+        Ok(())
+    }
+    let mut count = 0;
+    walk(worktree, &mut count).ok().map(|()| count)
+}
+
+/// Describe the per-worktree index this checkout ran against.
+///
+/// Warmth comes from git itself: `read-tree` emits an `index read/cache_nr`
+/// counter only when it had an index to read, so its presence *is* the warm
+/// signal. Without a trace2 stream we decline to guess.
+fn index_state(bytes: Option<u64>, trace: Option<&gfs_common::trace2::Trace2>) -> IndexState {
+    let read = trace.and_then(|t| t.data_i64("index", "read/cache_nr"));
+    let wrote = trace.and_then(|t| t.data_i64("index", "write/cache_nr"));
+    IndexState {
+        state: match (trace, read) {
+            (None, _) => "unknown",
+            (Some(_), Some(_)) => "warm",
+            (Some(_), None) => "cold",
+        },
+        bytes,
+        entries: wrote.or(read),
+    }
+}
+
+/// Split `read-tree`'s time across its internal phases (ADR-0017).
+///
+/// `None` when git reported none of them, so the record says "we don't know"
+/// rather than "all zero".
+fn read_tree_breakdown(trace: &gfs_common::trace2::Trace2) -> Option<ReadTreeBreakdown> {
+    let load_index_ms = trace.region_ms("index", "do_read_index");
+    let resolve_tree_ms = trace.region_ms("unpack_trees", "traverse_trees");
+    let unpack_ms = trace.region_ms("unpack_trees", "unpack_trees");
+    let write_index_ms = trace.region_ms("index", "do_write_index");
+    // Traversal happens *inside* the unpack region, so the file-touching part is
+    // the difference. Clamped at zero: the two come from separate clock reads.
+    let apply_ms = match (unpack_ms, resolve_tree_ms) {
+        (Some(unpack), Some(traverse)) => Some((unpack - traverse).max(0.0)),
+        (Some(unpack), None) => Some(unpack),
+        (None, _) => None,
+    };
+    if load_index_ms.is_none()
+        && resolve_tree_ms.is_none()
+        && apply_ms.is_none()
+        && write_index_ms.is_none()
+    {
+        return None;
+    }
+    Some(ReadTreeBreakdown {
+        load_index_ms,
+        resolve_tree_ms,
+        apply_ms,
+        write_index_ms,
+    })
 }
 
 #[cfg(test)]

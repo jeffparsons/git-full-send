@@ -81,6 +81,17 @@ git-full-send update-worktree \
   turns in one — [ADR-0012](adr/0012-namespacing-managed-refs-per-stream.md)).
 - Run it whenever you want the remote to reflect the latest `sync` (e.g. from a
   build orchestrator).
+- It prints a summary explaining what the checkout cost: how many paths had to
+  be written or removed, whether the per-worktree index was **warm** (loaded) or
+  **cold** (built from scratch), and where `read-tree`'s time went inside itself
+  ([ADR-0017](adr/0017-making-operation-cost-self-explaining.md)). A slow
+  checkout that reports nothing to write is a slow checkout that did no work —
+  which is the distinction the timings alone could never make.
+- `--measure-worktree` adds the two measurements that are *not* cheap: how many
+  paths differ from what is actually on disk (an `lstat` per index entry) and how
+  many files the worktree holds (a full walk). Everything else on the summary is
+  measured either way; this is opt-in because both are proportional to the tree
+  rather than to the change.
 - **Concurrency:** updates of the *same* worktree are serialised by a
   per-worktree advisory lock, so two runs can't interleave their checkout steps
   (issue #49). By default a run whose worktree is already being updated **fails
@@ -306,6 +317,30 @@ ssh you@workstation git-full-send update-worktree \
 
 Records carry a `schema` integer so a parser knows what it is reading; the
 current version is 2. (Lines written before the field existed are schema 1.)
+
+### What the numbers explain
+
+Every duration on a record is accompanied by the size of the work it did, so a
+slow phase can be attributed rather than guessed at
+([ADR-0017](adr/0017-making-operation-cost-self-explaining.md)):
+
+- **`update_worktree`** — `index.state` (`warm`/`cold`) and `index.entries`;
+  `changed.vs_index` (paths to write/remove, counted without touching the disk)
+  and `changed.tree_unchanged` (this is the tree the worktree last checked out,
+  so the tree side of the work is zero by definition); `read_tree.*`, which
+  splits `read_tree_ms` into loading the index, resolving the tree, applying it,
+  and writing the index back; `clean.removed`; and `measure_ms`, which is what
+  the measuring itself cost.
+- **`sync`** — per layer, `encode_phases.*` (load index · status · hash · write
+  tree · commit) beside `index_entries`, `status_items`, and the files/bytes
+  actually hashed; and for the `extra` layer `select.*` — directories entered
+  and pruned, paths considered, and how many force-include patterns are
+  unanchored. An unanchored pattern disables pruning entirely
+  ([§4](#4-force-include-pattern-files)), and `dirs_entered` is what that costs.
+
+The `read_tree.*` split comes from `git`'s own trace2 instrumentation and is
+best-effort: an unfamiliar `git` version means those fields are absent, never
+that the checkout fails.
 
 Inspect or aggregate the sink with any JSON tool, e.g. the slowest syncs:
 

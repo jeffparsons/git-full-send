@@ -107,6 +107,38 @@ pub enum SelectError {
     NonUnicodePath(PathBuf),
 }
 
+/// What the selection walk cost, alongside what it found (ADR-0017).
+///
+/// The walk already *warns* that an unanchored pattern forces an exhaustive
+/// scan; these counters make the price of that warning visible, so an operator
+/// can see a walk that entered 40,000 directories to select twelve files.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct SelectStats {
+    /// Directories the walk descended into (the repo root included).
+    pub dirs_entered: usize,
+    /// Directories skipped because no positive pattern could match beneath them.
+    /// Zero whenever `unanchored_patterns` is non-zero — one unanchored pattern
+    /// disables pruning entirely.
+    pub dirs_pruned: usize,
+    /// Entries the walk looked at and classified, of any kind.
+    pub paths_considered: usize,
+    /// Positive patterns that match at any depth and so force the exhaustive
+    /// walk.
+    pub unanchored_patterns: usize,
+}
+
+/// The outcome of a measured selection walk: the paths, and what finding them
+/// cost.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Selection {
+    /// The selected repo-relative paths (slash-separated, sorted, deduplicated).
+    pub paths: Vec<BString>,
+    /// What the walk cost to produce them.
+    pub stats: SelectStats,
+}
+
 /// Select the force-included files under `workdir`, returning their
 /// repo-relative paths (slash-separated, sorted, deduplicated).
 ///
@@ -130,6 +162,18 @@ pub fn select_extra_paths_with(
     workdir: &Path,
     user_include_override: Option<&Path>,
 ) -> Result<Vec<BString>, SelectError> {
+    select_extra_paths_measured(workdir, user_include_override).map(|selection| selection.paths)
+}
+
+/// As [`select_extra_paths_with`], but also returning what the walk cost
+/// ([`SelectStats`], ADR-0017).
+///
+/// This is what `sync` calls; the plainer forms above stay for callers (and
+/// tests) that only want the paths.
+pub fn select_extra_paths_measured(
+    workdir: &Path,
+    user_include_override: Option<&Path>,
+) -> Result<Selection, SelectError> {
     match user_include_override {
         Some(path) => select_in(workdir, Some(path)),
         None => select_in(workdir, user_include_path().as_deref()),
@@ -139,7 +183,7 @@ pub fn select_extra_paths_with(
 /// The core of [`select_extra_paths`] with the per-user file path supplied
 /// explicitly (rather than resolved from the environment), so tests can exercise
 /// the two-layer semantics without mutating process-global environment.
-fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Vec<BString>, SelectError> {
+fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Selection, SelectError> {
     let search = load_search(workdir, user_include)?;
     let prune = build_prune_info(&search);
 
@@ -147,14 +191,21 @@ fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Vec<BString>
         search: &search,
         prune: &prune,
         out: Vec::new(),
+        stats: SelectStats {
+            unanchored_patterns: prune.unanchored_count,
+            ..SelectStats::default()
+        },
         #[cfg(test)]
         entered: Vec::new(),
     };
     walk.run(workdir, BString::default(), false)?;
-    let mut selected = walk.out;
-    selected.sort();
-    selected.dedup();
-    Ok(selected)
+    let mut paths = walk.out;
+    paths.sort();
+    paths.dedup();
+    Ok(Selection {
+        paths,
+        stats: walk.stats,
+    })
 }
 
 /// Build the combined allow-list. The project layer is added first and the user
@@ -218,6 +269,8 @@ struct Walk<'a> {
     search: &'a gix::ignore::Search,
     prune: &'a PruneInfo,
     out: Vec<BString>,
+    /// What the walk has cost so far (ADR-0017).
+    stats: SelectStats,
     /// Repo-relative prefixes of every directory the walk descended into,
     /// recorded so tests can assert the prune actually skipped a subtree rather
     /// than merely failing to match anything inside it.
@@ -230,6 +283,7 @@ impl Walk<'_> {
     /// repo-relative paths of selected files to `self.out`. `inherited` is the
     /// included/excluded state propagated from the nearest matched ancestor.
     fn run(&mut self, dir: &Path, rel_prefix: BString, inherited: bool) -> Result<(), SelectError> {
+        self.stats.dirs_entered += 1;
         #[cfg(test)]
         self.entered.push(rel_prefix.clone());
 
@@ -255,6 +309,7 @@ impl Walk<'_> {
             let name = gix::path::os_str_into_bstr(&name_os)
                 .map_err(|_| SelectError::NonUnicodePath(entry.path()))?;
             let rel = join_rel(rel_prefix.as_bstr(), name);
+            self.stats.paths_considered += 1;
 
             let file_type = entry.file_type().map_err(|source| SelectError::Metadata {
                 path: entry.path(),
@@ -267,6 +322,8 @@ impl Walk<'_> {
                 // pattern could still match beneath it; otherwise prune it.
                 if state || self.prune.can_contain_match(rel.as_bstr()) {
                     self.run(&entry.path(), rel, state)?;
+                } else {
+                    self.stats.dirs_pruned += 1;
                 }
             } else if (file_type.is_file() || file_type.is_symlink())
                 && classify(self.search, rel.as_bstr(), false).unwrap_or(inherited)
@@ -288,6 +345,10 @@ struct PruneInfo {
     /// At least one positive pattern is unanchored (matches at any depth), so no
     /// directory can be pruned — fall back to the exhaustive walk.
     any_unanchored: bool,
+    /// How many distinct positive patterns are unanchored, for the walk's
+    /// [`SelectStats`]: the warning says *that* the walk went exhaustive, this
+    /// says how many patterns to go and fix.
+    unanchored_count: usize,
     /// Literal leading directory prefixes of the anchored positive patterns, each
     /// as a list of path segments (e.g. `web-client/dist/` → `["web-client", "dist"]`).
     prefixes: Vec<Vec<BString>>,
@@ -364,6 +425,7 @@ fn build_prune_info(search: &gix::ignore::Search) -> PruneInfo {
 
     PruneInfo {
         any_unanchored,
+        unanchored_count: unanchored.len(),
         prefixes,
     }
 }
@@ -448,6 +510,7 @@ mod tests {
     fn select(root: &Path, user: Option<&Path>) -> Vec<String> {
         select_in(root, user)
             .unwrap()
+            .paths
             .iter()
             .map(ToString::to_string)
             .collect()
@@ -467,6 +530,7 @@ mod tests {
             search: &search,
             prune,
             out: Vec::new(),
+            stats: SelectStats::default(),
             entered: Vec::new(),
         };
         walk.run(root, BString::default(), false).unwrap();
@@ -484,6 +548,55 @@ mod tests {
         let search = load_search(root, user).unwrap();
         let prune = build_prune_info(&search);
         walk_under(root, user, &prune)
+    }
+
+    /// The walk reports what it cost, not just what it found (ADR-0017): an
+    /// anchored pattern prunes the unrelated tree, an unanchored one is forced to
+    /// walk all of it, and the counters make the difference legible instead of
+    /// leaving it as a warning nobody can price.
+    #[test]
+    fn the_walk_reports_the_cost_of_unanchored_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "dist/app.js", "j");
+        for i in 0..5 {
+            write(root, &format!("node_modules/pkg{i}/index.js"), "x");
+        }
+
+        // Anchored: `node_modules/` can't contain a match, so it is never entered.
+        write(root, PROJECT_INCLUDE_FILE, "/dist/\n");
+        let anchored = select_in(root, None).unwrap();
+        assert_eq!(anchored.paths.len(), 1);
+        assert_eq!(anchored.stats.unanchored_patterns, 0);
+        assert!(
+            anchored.stats.dirs_pruned >= 1,
+            "the unrelated tree was pruned: {:?}",
+            anchored.stats,
+        );
+
+        // Unanchored: the same selection, reached the expensive way.
+        write(root, PROJECT_INCLUDE_FILE, "dist/\n");
+        let unanchored = select_in(root, None).unwrap();
+        assert_eq!(
+            unanchored.paths, anchored.paths,
+            "the prune never changes what is selected",
+        );
+        assert_eq!(unanchored.stats.unanchored_patterns, 1);
+        assert_eq!(
+            unanchored.stats.dirs_pruned, 0,
+            "one unanchored pattern disables pruning entirely",
+        );
+        assert!(
+            unanchored.stats.dirs_entered > anchored.stats.dirs_entered,
+            "and the walk visits strictly more: {:?} vs {:?}",
+            unanchored.stats,
+            anchored.stats,
+        );
+        assert!(
+            unanchored.stats.paths_considered > unanchored.paths.len(),
+            "far more paths were considered than selected: {:?}",
+            unanchored.stats,
+        );
     }
 
     #[test]
@@ -627,6 +740,7 @@ mod tests {
     fn can_contain_match_compatibility() {
         let prune = PruneInfo {
             any_unanchored: false,
+            unanchored_count: 0,
             prefixes: vec![vec!["web-client".into(), "dist".into()]],
         };
         let can = |s: &str| prune.can_contain_match(BStr::new(s));
@@ -639,6 +753,7 @@ mod tests {
         // An unanchored set short-circuits to always-descend.
         let exhaustive = PruneInfo {
             any_unanchored: true,
+            unanchored_count: 1,
             prefixes: vec![],
         };
         assert!(exhaustive.can_contain_match(BStr::new("anything/at/all")));
@@ -775,6 +890,7 @@ mod tests {
                 // directory (bar `.git`) is entered, nothing is skipped.
                 let exhaustive = PruneInfo {
                     any_unanchored: true,
+                    unanchored_count: 1,
                     prefixes: Vec::new(),
                 };
 

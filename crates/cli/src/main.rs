@@ -97,6 +97,12 @@ struct UpdateWorktreeArgs {
     /// indefinitely. Has no effect without `--wait`.
     #[arg(long, value_name = "SECS", requires = "wait")]
     timeout: Option<u64>,
+    /// Also measure the worktree: how many paths differ from what is on disk,
+    /// and how many files it holds. Costs an `lstat` per index entry plus a full
+    /// filesystem walk, both proportional to the tree — hence opt-in. Everything
+    /// else on the record is measured either way.
+    #[arg(long)]
+    measure_worktree: bool,
     /// Print the operation's record as one JSON object on stdout instead of the
     /// human summary — the same record appended to the metrics sink (ADR-0017).
     /// This is how a client driving a remote checkout over SSH gets the server's
@@ -179,15 +185,20 @@ async fn main() -> Result<()> {
         Command::UpdateWorktree(args) => {
             // `--timeout` is gated on `--wait` by clap (`requires = "wait"`), so
             // a timeout only ever reaches the `Wait` arm.
-            let mode = if args.wait {
+            let lock = if args.wait {
                 gfs_server::LockMode::Wait {
                     timeout: args.timeout.map(std::time::Duration::from_secs),
                 }
             } else {
                 gfs_server::LockMode::FailFast
             };
+            let options = gfs_server::UpdateOptions {
+                lock,
+                measure_worktree: args.measure_worktree,
+            };
             let report =
-                gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, mode).await?;
+                gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, options)
+                    .await?;
             if args.json {
                 print_json(&report);
             } else {
@@ -306,6 +317,33 @@ fn print_sync_summary(summary: &gfs_client::SyncSummary) {
         human_ms(summary.extra.encode_ms),
         human_ms(summary.extra.push_ms),
     );
+
+    // What the two encodes actually spent their time on. The `extra` walk is the
+    // line that turns "sync feels slow" into "this include pattern is unanchored"
+    // (ADR-0017).
+    let code = &summary.code.stats;
+    println!(
+        "         index {} entries · status {} item(s) · hashed {} file(s) in {}",
+        human_count(code.index_entries),
+        human_count(code.status_items),
+        human_count(code.files_overlaid),
+        human_ms(code.encode_phases.hash_ms),
+    );
+    let walk = &summary.extra.stats.select;
+    let mut walk_line = format!(
+        "         walk {} dir(s), {} pruned, {} path(s) considered in {}",
+        human_count(walk.dirs_entered),
+        human_count(walk.dirs_pruned),
+        human_count(walk.paths_considered),
+        human_ms(summary.extra.stats.encode_phases.select_ms),
+    );
+    if walk.unanchored_patterns > 0 {
+        walk_line.push_str(&format!(
+            "   ({} unanchored pattern(s) — no directory could be pruned)",
+            walk.unanchored_patterns,
+        ));
+    }
+    println!("{walk_line}");
 }
 
 /// Print the operator-facing end-of-checkout summary block to stdout.
@@ -313,6 +351,10 @@ fn print_sync_summary(summary: &gfs_client::SyncSummary) {
 /// `update-worktree` previously left its numbers to a `tracing` line and the
 /// sink; it now has the same human-summary surface `sync` does (ADR-0017), with
 /// `--json` as the machine-readable alternative.
+///
+/// The block is arranged so the *explanation* sits next to the duration it
+/// explains: how much had to change, what the index looked like, and where
+/// `read-tree`'s time actually went.
 fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
     println!(
         "Updated worktree {} from stream {} in {}",
@@ -320,13 +362,88 @@ fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
         report.stream,
         human_ms(report.total_ms),
     );
+
+    // What had to change — the line that says whether a big `read-tree` was
+    // earned. A tree we already checked out is a no-op by definition.
+    let mut work = match report.changed.vs_index {
+        Some(delta) if delta.is_empty() => "nothing to write or remove".to_string(),
+        Some(delta) => format!(
+            "{} to write, {} to remove",
+            human_count(delta.to_write),
+            human_count(delta.to_remove),
+        ),
+        None => "changed paths not measured".to_string(),
+    };
+    if report.changed.tree_unchanged {
+        work.push_str(" (same tree as the last checkout)");
+    }
+    if let Some(delta) = report.changed.vs_worktree {
+        work.push_str(&format!(
+            "; vs. disk {} to write, {} to remove",
+            human_count(delta.to_write),
+            human_count(delta.to_remove),
+        ));
+    }
+    println!("  tree {} — {work}", short_oid(&report.tree));
+
+    // The index, whose warmth is the other half of the explanation.
+    let index = &report.index;
+    let entries = match index.entries {
+        Some(n) => format!("{} entries", human_count(n.max(0) as usize)),
+        None => "entry count unknown".to_string(),
+    };
+    let size = match index.bytes {
+        Some(bytes) => human_bytes(bytes),
+        None => "absent".to_string(),
+    };
+    let mut line = format!("  index {}: {entries}, {size}", index.state);
+    if let Some(files) = report.worktree_files {
+        line.push_str(&format!("   worktree {} file(s)", human_count(files)));
+    }
+    println!("{line}");
+
     println!(
-        "  tree {}   resolve {} · read-tree {} · clean {}",
-        short_oid(&report.tree),
+        "  resolve {} · measure {} · read-tree {} · clean {} ({} removed)",
         human_ms(report.resolve_ms),
+        human_ms(report.measure_ms),
         human_ms(report.read_tree_ms),
         human_ms(report.clean_ms),
+        report.clean.removed,
     );
+
+    // Inside `read-tree`, when git told us (ADR-0017).
+    if let Some(rt) = &report.read_tree {
+        let part = |label: &str, ms: Option<f64>| {
+            ms.map(|ms| format!("{label} {}", human_ms(ms)))
+                .unwrap_or_default()
+        };
+        let parts: Vec<String> = [
+            part("load index", rt.load_index_ms),
+            part("resolve tree", rt.resolve_tree_ms),
+            part("apply", rt.apply_ms),
+            part("write index", rt.write_index_ms),
+        ]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
+        if !parts.is_empty() {
+            println!("    read-tree: {}", parts.join(" · "));
+        }
+    }
+}
+
+/// Format a count with `_`-free thousands separators, so a five-digit entry
+/// count is readable at a glance.
+fn human_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Abbreviate an object id for display, as `git` does. The record keeps the full
