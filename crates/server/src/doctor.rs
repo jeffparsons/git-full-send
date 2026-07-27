@@ -352,7 +352,7 @@ fn check_autogc(repo: &gix::Repository) -> Check {
 /// what state its per-worktree index is in.
 ///
 /// Checking out over the repo's own working tree is exactly the configuration
-/// behind issue #75's measurements (`--repo` and `--worktree` the same path), and
+/// behind #75's measurements (`--repo` and `--worktree` the same path), and
 /// it is worth saying out loud: the checkout is authoritative and destructive
 /// (ADR-0008), so anything uncommitted in that tree is gfs's to overwrite.
 fn check_worktree(repo: &gix::Repository, git_dir: &Path, worktree: &Path) -> Check {
@@ -466,7 +466,7 @@ mod tests {
     }
 
     /// The observation that motivated the check: an alternates entry pointing at
-    /// a path that no longer exists (issue #75).
+    /// a path that no longer exists (#75).
     #[test]
     fn an_unreachable_alternates_entry_is_an_error_with_a_remedy() {
         let dir = tempfile::tempdir().unwrap();

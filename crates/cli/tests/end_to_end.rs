@@ -565,7 +565,7 @@ async fn run_cli_status(args: &[&str]) -> (i32, String) {
 /// `doctor` reports the repo conditions that predictably hurt, and exits non-zero
 /// on a *broken* one so an orchestrator can gate on it (ADR-0018).
 ///
-/// The fixture is the exact failure from issue #75: an `objects/info/alternates`
+/// The fixture is the exact failure from #75: an `objects/info/alternates`
 /// entry pointing at a path that no longer exists, which git complains about on
 /// every invocation while carrying on, and which gfs used to pass through in
 /// silence.

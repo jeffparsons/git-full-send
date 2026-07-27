@@ -11,7 +11,7 @@
 //! exits **zero**, so the server records a clean `no_op` and logs nothing at
 //! warning level.
 //!
-//! It also answers the question that made observation 2 of issue #75 so
+//! It also answers the question that made observation 2 of #75 so
 //! expensive to diagnose: the advertisement is measured **here**, on the client,
 //! so `probe` reports the exact byte cost every connection pays and the number of
 //! refs behind it — no shelling into the workstation, no counting refs by hand.
