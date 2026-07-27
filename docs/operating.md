@@ -268,12 +268,46 @@ for retrospective analysis ([ADR-0013](adr/0013-recording-operation-metrics.md))
 — on the **client** (e.g. `.git/git-full-send/metrics.jsonl`) for each `sync`,
 and on the **server** repo for each `receive` (one per `git receive-pack`
 connection) and each `update-worktree`. Each record carries a `kind` tag, a
-timestamp, phase timings (in milliseconds), and size metadata — the client's
-per-layer file/byte counts, the server's on-wire `bytes_in`/`bytes_out` and the
-refs a push updated. Writing is best-effort: if the file can't be written the
-operation still succeeds and a warning is logged.
+`schema` version, a timestamp, phase timings (in milliseconds), and size metadata
+— the client's per-layer file/byte counts, the server's on-wire
+`bytes_in`/`bytes_out` and the refs a push updated. Writing is best-effort: if
+the file can't be written the operation still succeeds and a warning is logged.
 
-Inspect or aggregate it with any JSON tool, e.g. the slowest syncs:
+### Three surfaces
+
+The same numbers reach you three ways, and they don't overlap:
+
+| surface | where | what for |
+| --- | --- | --- |
+| progress log | **stderr** | live per-phase `tracing` lines |
+| summary | **stdout** | the human block printed at the end of an operation |
+| record | `metrics.jsonl` | the durable, machine-readable line |
+
+### `--json`, for integrators
+
+`sync` and `update-worktree` take `--json`, which prints **exactly the record
+that lands in the sink** as one object on stdout, in place of the human summary
+([ADR-0017](adr/0017-making-operation-cost-self-explaining.md)):
+
+```sh
+git-full-send sync --repo . --remote 127.0.0.1:9419 --stream-id my-laptop --json
+```
+
+Nothing else is written to stdout, so it parses directly — no scraping the
+human block. This is also how a client driving a **remote** checkout over SSH
+gets the server's numbers back, rather than leaving them in a file on the far
+side of the tunnel:
+
+```sh
+ssh you@workstation git-full-send update-worktree \
+    --repo /path/to/repo --worktree /path/to/worktree \
+    --stream-id my-laptop --json | jq .read_tree_ms
+```
+
+Records carry a `schema` integer so a parser knows what it is reading; the
+current version is 2. (Lines written before the field existed are schema 1.)
+
+Inspect or aggregate the sink with any JSON tool, e.g. the slowest syncs:
 
 ```sh
 jq -r 'select(.kind=="sync") | [.total_ms, .stream] | @tsv' \

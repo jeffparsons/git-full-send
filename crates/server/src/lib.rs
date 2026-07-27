@@ -625,6 +625,35 @@ pub enum LockMode {
     },
 }
 
+/// The record of one completed `update-worktree` — the single value written to
+/// the server repo's durable sink, returned to the caller, and printed by
+/// `update-worktree --json` (ADR-0017).
+///
+/// The `--json` form is how a *client* orchestrating a remote checkout over SSH
+/// gets the server's numbers back: before ADR-0017 they only landed in a file on
+/// the server.
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct UpdateWorktreeReport {
+    /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
+    #[serde(flatten)]
+    pub envelope: gfs_common::metrics::Envelope,
+    /// The stream that was checked out.
+    pub stream: gfs_common::StreamId,
+    /// The worktree directory it was checked out into.
+    pub worktree: String,
+    /// The combined `code`+`extra` tree that was checked out.
+    pub tree: String,
+    /// Total wall time for the checkout, in milliseconds.
+    pub total_ms: f64,
+    /// Resolving the `code`/`extra` trees and building the combined tree.
+    pub resolve_ms: f64,
+    /// The `git read-tree --reset -u` step.
+    pub read_tree_ms: f64,
+    /// The `git clean -fd` step.
+    pub clean_ms: f64,
+}
+
 /// Check a stream's synced `code` state out into the given worktree.
 ///
 /// An authoritative, destructive overwrite of the remote worktree (ADR-0008),
@@ -649,7 +678,7 @@ pub async fn update_worktree(
     worktree: PathBuf,
     stream: gfs_common::StreamId,
     mode: LockMode,
-) -> Result<(), ServerError> {
+) -> Result<UpdateWorktreeReport, ServerError> {
     tokio::task::spawn_blocking(move || update_worktree_blocking(&repo, &worktree, &stream, mode))
         .await
         .map_err(|e| ServerError::Join(e.to_string()))?
@@ -894,7 +923,7 @@ fn update_worktree_blocking(
     worktree: &Path,
     stream: &gfs_common::StreamId,
     mode: LockMode,
-) -> Result<(), ServerError> {
+) -> Result<UpdateWorktreeReport, ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let git_dir = discovered.git_dir().to_path_buf();
 
@@ -947,20 +976,22 @@ fn update_worktree_blocking(
         "updated worktree"
     );
 
+    // One value, three surfaces (ADR-0017): the durable sink, the caller's human
+    // summary, and `update-worktree --json`.
+    let report = UpdateWorktreeReport {
+        envelope: gfs_common::metrics::Envelope::new("update_worktree"),
+        stream: stream.clone(),
+        worktree: worktree.display().to_string(),
+        tree,
+        total_ms,
+        resolve_ms,
+        read_tree_ms,
+        clean_ms,
+    };
+
     // Best-effort metrics record (ADR-0013).
-    metrics::record(
-        &git_dir,
-        &metrics::UpdateWorktreeRecord::new(
-            stream.to_string(),
-            worktree.display().to_string(),
-            total_ms,
-            resolve_ms,
-            read_tree_ms,
-            clean_ms,
-            tree,
-        ),
-    );
-    Ok(())
+    metrics::record(&git_dir, &report);
+    Ok(report)
 }
 
 /// Resolve `stream`'s `code` ref (`gfs_common::code_ref`) to its tree id, or

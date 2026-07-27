@@ -52,6 +52,10 @@ struct SyncArgs {
     /// project file (`.git-full-send-include`) is always consulted as well.
     #[arg(long, value_name = "PATH")]
     user_include: Option<PathBuf>,
+    /// Print the operation's record as one JSON object on stdout instead of the
+    /// human summary — the same record appended to the metrics sink (ADR-0017).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -93,6 +97,12 @@ struct UpdateWorktreeArgs {
     /// indefinitely. Has no effect without `--wait`.
     #[arg(long, value_name = "SECS", requires = "wait")]
     timeout: Option<u64>,
+    /// Print the operation's record as one JSON object on stdout instead of the
+    /// human summary — the same record appended to the metrics sink (ADR-0017).
+    /// This is how a client driving a remote checkout over SSH gets the server's
+    /// numbers back.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -130,7 +140,13 @@ struct ReapArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The progress log goes to **stderr**, keeping stdout for the operation's own
+    // output — the human summary block, or the `--json` record (ADR-0013's three
+    // surfaces, as ADR-0017 relies on them). `tracing_subscriber::fmt()` defaults
+    // to stdout, which interleaved log lines into the summary and left `--json`
+    // unparseable.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -147,7 +163,11 @@ async fn main() -> Result<()> {
             };
             let summary =
                 gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
-            print_sync_summary(&summary);
+            if args.json {
+                print_json(&summary);
+            } else {
+                print_sync_summary(&summary);
+            }
         }
         Command::Listen(args) => {
             let config = gfs_server::ListenConfig {
@@ -166,7 +186,13 @@ async fn main() -> Result<()> {
             } else {
                 gfs_server::LockMode::FailFast
             };
-            gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, mode).await?
+            let report =
+                gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, mode).await?;
+            if args.json {
+                print_json(&report);
+            } else {
+                print_update_worktree_summary(&report);
+            }
         }
         Command::ListStreams(args) => {
             for stream in gfs_server::list_streams(&args.repo)? {
@@ -239,6 +265,19 @@ fn print_reap_outcome(outcome: &gfs_server::ReapOutcome, older_than_days: u64, n
     }
 }
 
+/// Print an operation's record as one JSON object on stdout (`--json`, ADR-0017).
+///
+/// Byte-for-byte the record appended to the metrics sink, so an integrator parses
+/// what the operator reads. Serialisation of a record we just built cannot
+/// realistically fail, but a metrics surface is never worth failing an operation
+/// for (ADR-0013), so a failure warns and prints nothing.
+fn print_json(record: &impl serde::Serialize) {
+    match serde_json::to_string(record) {
+        Ok(line) => println!("{line}"),
+        Err(error) => tracing::warn!(%error, "could not serialise the record for --json"),
+    }
+}
+
 /// Print the operator-facing end-of-sync summary block to stdout (issue #53).
 ///
 /// A deliberate human-readable surface, distinct from the per-phase `tracing`
@@ -246,28 +285,55 @@ fn print_reap_outcome(outcome: &gfs_server::ReapOutcome, older_than_days: u64, n
 /// numbers come from the same `sync` computation, formatted for a glance —
 /// binary byte units and second/millisecond durations.
 fn print_sync_summary(summary: &gfs_client::SyncSummary) {
-    let t = &summary.timings;
     println!(
         "Synced stream {} to {} in {}",
         summary.stream,
         summary.remote,
-        human_ms(t.total_ms),
+        human_ms(summary.total_ms),
     );
     println!(
         "  code:  {} file(s) (+{}), {} removed   encode {} · push {}",
-        summary.code.files_overlaid,
-        human_bytes(summary.code.bytes_overlaid),
-        summary.code.files_removed,
-        human_ms(t.code_encode_ms),
-        human_ms(t.code_push_ms),
+        summary.code.stats.files_overlaid,
+        human_bytes(summary.code.stats.bytes_overlaid),
+        summary.code.stats.files_removed,
+        human_ms(summary.code.encode_ms),
+        human_ms(summary.code.push_ms),
     );
     println!(
         "  extra: {} file(s) ({})   encode {} · push {}",
-        summary.extra.files,
-        human_bytes(summary.extra.bytes),
-        human_ms(t.extra_encode_ms),
-        human_ms(t.extra_push_ms),
+        summary.extra.stats.files,
+        human_bytes(summary.extra.stats.bytes),
+        human_ms(summary.extra.encode_ms),
+        human_ms(summary.extra.push_ms),
     );
+}
+
+/// Print the operator-facing end-of-checkout summary block to stdout.
+///
+/// `update-worktree` previously left its numbers to a `tracing` line and the
+/// sink; it now has the same human-summary surface `sync` does (ADR-0017), with
+/// `--json` as the machine-readable alternative.
+fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
+    println!(
+        "Updated worktree {} from stream {} in {}",
+        report.worktree,
+        report.stream,
+        human_ms(report.total_ms),
+    );
+    println!(
+        "  tree {}   resolve {} · read-tree {} · clean {}",
+        short_oid(&report.tree),
+        human_ms(report.resolve_ms),
+        human_ms(report.read_tree_ms),
+        human_ms(report.clean_ms),
+    );
+}
+
+/// Abbreviate an object id for display, as `git` does. The record keeps the full
+/// id; only this display shortens it.
+fn short_oid(oid: &str) -> &str {
+    let n = oid.len().min(12);
+    &oid[..n]
 }
 
 /// Format a byte count with binary (1024) units: `B` exactly, one decimal above.

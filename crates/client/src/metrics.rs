@@ -1,67 +1,18 @@
-//! The per-sync metrics record (issue #42).
+//! Writing the per-sync record to the client's durable sink (issue #42).
 //!
-//! Shapes the JSON Lines record `sync` writes to the client's metrics sink
-//! (`gfs_common::metrics`): the phase timings and the per-layer size metadata
-//! gathered during [`crate::encode`] / [`crate::encode_extra`]. Writing is
-//! best-effort — see [`record_sync`].
+//! The record *shape* is [`crate::SyncSummary`] — since ADR-0017 the same value
+//! `sync` returns and `sync --json` prints, rather than a private twin of it. All
+//! that is left here is locating the client repo's sink and appending to it,
+//! best-effort.
 
 use std::path::Path;
 
-use serde::Serialize;
-
-use crate::SyncTimings;
-use crate::encode::{EncodeOutcome, ExtraOutcome};
-
-/// One `sync` operation's metrics record.
-#[derive(Serialize)]
-struct SyncRecord<'a> {
-    kind: &'static str,
-    ts_unix_ms: u64,
-    tool_version: &'a str,
-    stream: &'a str,
-    remote: &'a str,
-    total_ms: f64,
-    code_encode_ms: f64,
-    extra_encode_ms: f64,
-    code_push_ms: f64,
-    extra_push_ms: f64,
-    retain_ms: f64,
-    code: CodeLayer,
-    extra: ExtraLayer,
-}
-
-/// The code layer's delta size plus the resulting commit/tree ids.
-#[derive(Serialize)]
-struct CodeLayer {
-    files_overlaid: usize,
-    bytes_overlaid: u64,
-    files_removed: usize,
-    commit: String,
-    tree: String,
-}
-
-/// The full extra (force-include) set's size plus the resulting commit/tree ids.
-#[derive(Serialize)]
-struct ExtraLayer {
-    files: usize,
-    bytes: u64,
-    commit: String,
-    tree: String,
-}
-
-/// Write the per-sync metrics record to the client repo's sink, best-effort.
+/// Append the completed sync's record to the client repo's sink, best-effort.
 ///
 /// Resolves the git dir from `repo_dir`; a discovery failure is logged and
 /// swallowed rather than failing the (already successful) sync — metrics are
 /// observability only (ADR-0013).
-pub(crate) fn record_sync(
-    repo_dir: &Path,
-    stream: &gfs_common::StreamId,
-    remote: &str,
-    code: &EncodeOutcome,
-    extra: &ExtraOutcome,
-    timings: SyncTimings,
-) {
+pub(crate) fn record_sync(repo_dir: &Path, summary: &crate::SyncSummary) {
     let git_dir = match gix::discover(repo_dir) {
         Ok(repo) => repo.git_dir().to_path_buf(),
         Err(error) => {
@@ -69,32 +20,5 @@ pub(crate) fn record_sync(
             return;
         }
     };
-
-    let record = SyncRecord {
-        kind: "sync",
-        ts_unix_ms: gfs_common::metrics::now_unix_millis(),
-        tool_version: gfs_common::metrics::tool_version(),
-        stream: stream.as_str(),
-        remote,
-        total_ms: timings.total_ms,
-        code_encode_ms: timings.code_encode_ms,
-        extra_encode_ms: timings.extra_encode_ms,
-        code_push_ms: timings.code_push_ms,
-        extra_push_ms: timings.extra_push_ms,
-        retain_ms: timings.retain_ms,
-        code: CodeLayer {
-            files_overlaid: code.stats.files_overlaid,
-            bytes_overlaid: code.stats.bytes_overlaid,
-            files_removed: code.stats.files_removed,
-            commit: code.commit.to_string(),
-            tree: code.tree.to_string(),
-        },
-        extra: ExtraLayer {
-            files: extra.stats.files,
-            bytes: extra.stats.bytes,
-            commit: extra.commit.to_string(),
-            tree: extra.tree.to_string(),
-        },
-    };
-    gfs_common::metrics::record(&git_dir, &record);
+    gfs_common::metrics::record(&git_dir, summary);
 }

@@ -58,7 +58,10 @@ pub struct EncodeOutcome {
 }
 
 /// Size metadata for the code layer's index→worktree delta in one [`encode`].
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Flattened into [`crate::CodeLayer`] when the sync's record is assembled
+/// (ADR-0017), so these names appear directly under `"code"` in the JSON.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 #[non_exhaustive]
 pub struct CodeLayerStats {
     /// Files added or modified (overlaid from disk over the index base).
@@ -86,7 +89,10 @@ pub struct ExtraOutcome {
 }
 
 /// Size metadata for the full force-include set in one [`encode_extra`].
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Flattened into [`crate::ExtraLayer`] when the sync's record is assembled
+/// (ADR-0017), so these names appear directly under `"extra"` in the JSON.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 #[non_exhaustive]
 pub struct ExtraLayerStats {
     /// Number of force-included files encoded.
