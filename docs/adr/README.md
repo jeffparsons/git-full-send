@@ -26,6 +26,8 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0014](0014-forgetting-a-stream.md) | Forgetting a stream | accepted |
 | [0015](0015-ttl-based-reaping-of-stale-streams.md) | TTL-based reaping of stale streams | accepted |
 | [0016](0016-clean-spares-undelivered-gitignored-files.md) | `clean` spares gitignored files it didn't deliver | accepted |
+| [0017](0017-making-operation-cost-self-explaining.md) | Making operation cost self-explaining | accepted |
+| [0018](0018-liveness-and-repo-health-surfaces.md) | Liveness and repo-health surfaces | accepted |
 
 ## Open research tasks
 

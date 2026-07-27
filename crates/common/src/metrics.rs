@@ -10,12 +10,53 @@
 //!
 //! Metrics are **best-effort observability** (ADR-0013): [`record`] never fails
 //! an operation — a write error is logged via `tracing::warn!` and swallowed.
+//!
+//! Since ADR-0017 a record is also an *output*, not only a side-effect: the value
+//! written here is the value the operation returns, and `--json` prints it
+//! verbatim. Every record therefore opens with the shared [`Envelope`], which
+//! carries the [`SCHEMA_VERSION`] a parser needs to interpret the rest.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+
+/// Version of the record shapes written to the sink and printed by `--json`.
+///
+/// `1` was the flat, `tool_version`-only shape of ADR-0013; `2` (ADR-0017) groups
+/// fields by layer and concern, adds this field, and adds the cost-explaining
+/// counts. Lines written before the field existed are schema 1 by omission.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The fields every record opens with, flattened into the record that carries it.
+///
+/// `kind` tags which shape the rest of the line has (`sync`, `receive`,
+/// `update_worktree`, …), so the one sink file stays self-describing.
+#[derive(Debug, Clone, Serialize)]
+pub struct Envelope {
+    /// Which record shape this line is.
+    pub kind: &'static str,
+    /// The record-shape version — [`SCHEMA_VERSION`] at the time of writing.
+    pub schema: u32,
+    /// When the operation finished, in milliseconds since the Unix epoch.
+    pub ts_unix_ms: u64,
+    /// The `git-full-send` version that produced the record.
+    pub tool_version: &'static str,
+}
+
+impl Envelope {
+    /// Stamp an envelope for a record of the given `kind`, with the timestamp
+    /// taken now.
+    pub fn new(kind: &'static str) -> Self {
+        Self {
+            kind,
+            schema: SCHEMA_VERSION,
+            ts_unix_ms: now_unix_millis(),
+            tool_version: tool_version(),
+        }
+    }
+}
 
 /// Serialises appends within this process so the server's concurrent
 /// connection threads can't interleave half-written lines into the sink.

@@ -384,6 +384,154 @@ async fn round_trip_records_metrics_on_both_sides() {
     );
 }
 
+/// `--json` prints, on stdout, exactly the record that lands in the sink
+/// (ADR-0017) — for `sync` on the client and for `update-worktree` on the server,
+/// which is how a client driving a remote checkout over SSH gets the server's
+/// numbers back.
+///
+/// Equality with the sink line is the point: an integrator parsing stdout and an
+/// operator reading `metrics.jsonl` must see the same numbers, not two
+/// hand-maintained spellings of them.
+#[tokio::test]
+async fn json_output_is_the_same_record_that_lands_in_the_sink() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+    let remote = addr.to_string();
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    commit_all(c, "baseline");
+    write_file(c, "untracked.txt", "hello");
+
+    let stream = test_stream();
+    let stream_arg = stream.as_str();
+
+    let sync_stdout = run_cli_capture(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &remote,
+        "--stream-id",
+        stream_arg,
+        "--json",
+    ])
+    .await;
+
+    // One JSON object, and nothing else: the human block is suppressed.
+    let printed: serde_json::Value =
+        serde_json::from_str(sync_stdout.trim()).expect("sync --json prints one JSON object");
+    assert_eq!(
+        sync_stdout.trim().lines().count(),
+        1,
+        "--json prints the record alone:\n{sync_stdout}",
+    );
+    let recorded = metrics_records(&c.join(".git"))
+        .into_iter()
+        .find(|r| r["kind"] == "sync")
+        .expect("a sync record in the sink");
+    assert_eq!(printed, recorded, "stdout and the sink carry one record");
+
+    // It is self-describing, and carries every number the human summary shows.
+    assert_eq!(printed["kind"], "sync");
+    assert_eq!(printed["schema"], gfs_common::metrics::SCHEMA_VERSION);
+    assert_eq!(printed["stream"], stream_arg);
+    assert_eq!(printed["remote"], remote);
+    for field in ["total_ms", "retain_ms"] {
+        assert!(printed[field].as_f64().is_some(), "{field} present");
+    }
+    for layer in ["code", "extra"] {
+        for field in ["encode_ms", "push_ms", "commit", "tree"] {
+            assert!(
+                !printed[layer][field].is_null(),
+                "{layer}.{field} present:\n{printed}",
+            );
+        }
+    }
+    assert_eq!(printed["code"]["files_overlaid"], 1);
+    assert_eq!(printed["code"]["bytes_overlaid"], "hello".len() as u64);
+
+    // The same contract for the server-side checkout.
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let update_stdout = run_cli_capture(&[
+        "update-worktree",
+        "--repo",
+        server.path().to_str().unwrap(),
+        "--worktree",
+        worktree.path().to_str().unwrap(),
+        "--stream-id",
+        stream_arg,
+        "--json",
+    ])
+    .await;
+    let printed: serde_json::Value = serde_json::from_str(update_stdout.trim())
+        .expect("update-worktree --json prints one JSON object");
+    let recorded = metrics_records(server.path())
+        .into_iter()
+        .find(|r| r["kind"] == "update_worktree")
+        .expect("an update_worktree record in the sink");
+    assert_eq!(printed, recorded, "stdout and the sink carry one record");
+    assert_eq!(printed["stream"], stream_arg);
+    for field in ["total_ms", "resolve_ms", "read_tree_ms", "clean_ms"] {
+        assert!(printed[field].as_f64().is_some(), "{field} present");
+    }
+}
+
+/// Without `--json`, both commands keep their human summary block as the default
+/// (ADR-0017 does not regress the surface issue #53 added), and
+/// `update-worktree` — which previously printed nothing — now has one.
+#[tokio::test]
+async fn the_human_summary_stays_the_default_on_both_commands() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    let sync_stdout = run_cli_capture(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+    assert!(
+        sync_stdout.starts_with("Synced stream "),
+        "sync still leads with the human summary:\n{sync_stdout}",
+    );
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let update_stdout = run_cli_capture(&[
+        "update-worktree",
+        "--repo",
+        server.path().to_str().unwrap(),
+        "--worktree",
+        worktree.path().to_str().unwrap(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+    assert!(
+        update_stdout.starts_with("Updated worktree "),
+        "update-worktree prints a human summary:\n{update_stdout}",
+    );
+    assert!(
+        update_stdout.contains("read-tree"),
+        "and names its phases:\n{update_stdout}",
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(update_stdout.trim()).is_err(),
+        "the default surface is prose, not JSON:\n{update_stdout}",
+    );
+}
+
 /// The finalised CLI surface is wired up: every subcommand parses, and the new
 /// `--user-include` flag and `listen --addr` option are present.
 #[test]
@@ -423,9 +571,16 @@ fn command_line_surface_is_wired_up() {
             "reap exposes {flag}:\n{reap_help}",
         );
     }
+    let sync_help = help(&["sync", "--help"]);
+    for flag in ["--user-include", "--json"] {
+        assert!(
+            sync_help.contains(flag),
+            "sync exposes {flag}:\n{sync_help}"
+        );
+    }
     assert!(
-        help(&["sync", "--help"]).contains("--user-include"),
-        "sync exposes --user-include",
+        help(&["update-worktree", "--help"]).contains("--json"),
+        "update-worktree exposes --json",
     );
     let listen_help = help(&["listen", "--help"]);
     for flag in ["--addr", "--max-connections", "--connection-timeout"] {

@@ -400,6 +400,7 @@ dependencies = [
  "gfs-client",
  "gfs-common",
  "gfs-server",
+ "serde",
  "serde_json",
  "tempfile",
  "test-support",

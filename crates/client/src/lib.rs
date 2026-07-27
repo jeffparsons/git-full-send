@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use serde::Serialize;
 use thiserror::Error;
 
 pub mod encode;
@@ -34,42 +35,72 @@ pub use push::{DeltaPolicy, PushError, push_ref, push_refs};
 pub use select::{SelectError, select_extra_paths, select_extra_paths_with};
 pub use stream::StreamResolveError;
 
-/// Wall-clock per-phase timings for one `sync`, in milliseconds.
+/// The record of one completed `sync` — the single value that is written to the
+/// durable JSONL sink, returned to the caller, and printed by `sync --json`
+/// (ADR-0017).
 ///
-/// The two encode phases and the two pushes are timed separately because each
-/// chain rides its own receive-pack exchange with its own delta policy
-/// (ADR-0005); `retain_ms` is the (small) cost of pinning each pushed tip as the
-/// next delta base. These feed both the durable metrics record (issue #42) and
-/// the operator-facing [`SyncSummary`] (issue #53).
-#[derive(Debug, Clone, Copy)]
-pub struct SyncTimings {
-    pub total_ms: f64,
-    pub code_encode_ms: f64,
-    pub extra_encode_ms: f64,
-    pub code_push_ms: f64,
-    pub extra_push_ms: f64,
-    pub retain_ms: f64,
-}
-
-/// Operator-facing summary of one completed `sync` (issue #53).
+/// Before ADR-0017 this was two structs saying the same thing: a private
+/// `SyncRecord` for the sink and a public `SyncSummary` for the CLI. They are one
+/// now, so an integrator parsing `--json` and an operator reading the sink see
+/// exactly the same numbers.
 ///
-/// Carries the counts, sizes, and per-phase timings a `sync` already computes for
-/// its metrics record (issue #42), returned so the caller can present them however
-/// it likes. The durable JSONL record (ADR-0013) is still written independently
-/// inside [`sync`]; this is the live summary surface.
-#[derive(Debug, Clone)]
+/// Fields are grouped per **layer** rather than flattened: each of `code` and
+/// `extra` rides its own receive-pack exchange with its own delta policy
+/// (ADR-0005), so each carries its own encode/push timings beside the sizes they
+/// explain. `retain_ms` is the (small) cost of pinning both pushed tips as the
+/// next delta bases.
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct SyncSummary {
+    /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
+    #[serde(flatten)]
+    pub envelope: gfs_common::metrics::Envelope,
     /// The stream the state was synced under.
     pub stream: StreamId,
     /// The server endpoint pushed to (`HOST:PORT`).
     pub remote: String,
-    /// Code-layer sizes: the index→worktree delta (overlaid/removed).
-    pub code: CodeLayerStats,
-    /// Extra-layer sizes: the full force-include set.
-    pub extra: ExtraLayerStats,
-    /// Per-phase wall-clock timings.
-    pub timings: SyncTimings,
+    /// Total wall time for the whole sync, in milliseconds.
+    pub total_ms: f64,
+    /// Pinning both pushed tips as the next delta bases, in milliseconds.
+    pub retain_ms: f64,
+    /// The `code` layer: committed history plus the working-tree delta.
+    pub code: CodeLayer,
+    /// The `extra` layer: the full force-included set.
+    pub extra: ExtraLayer,
+}
+
+/// The `code` layer's contribution to one [`SyncSummary`].
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct CodeLayer {
+    /// Synthesising the code commit, in milliseconds.
+    pub encode_ms: f64,
+    /// The `code` chain's own `git push` exchange, in milliseconds.
+    pub push_ms: f64,
+    /// Sizes of the index→worktree delta this sync encoded.
+    #[serde(flatten)]
+    pub stats: CodeLayerStats,
+    /// The synthetic commit that was pushed.
+    pub commit: String,
+    /// The tree that commit holds.
+    pub tree: String,
+}
+
+/// The `extra` layer's contribution to one [`SyncSummary`].
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct ExtraLayer {
+    /// Selecting and encoding the force-included set, in milliseconds.
+    pub encode_ms: f64,
+    /// The `extra` chain's own `git push` exchange, in milliseconds.
+    pub push_ms: f64,
+    /// Sizes of the full force-included set this sync encoded.
+    #[serde(flatten)]
+    pub stats: ExtraLayerStats,
+    /// The synthetic commit that was pushed.
+    pub commit: String,
+    /// The tree that commit holds.
+    pub tree: String,
 }
 
 /// Errors returned by client operations.
@@ -157,26 +188,33 @@ pub async fn sync(
     )?;
     retain_ms += elapsed_ms(t);
 
-    let total_ms = elapsed_ms(t_total);
-    let timings = SyncTimings {
-        total_ms,
-        code_encode_ms,
-        extra_encode_ms,
-        code_push_ms,
-        extra_push_ms,
-        retain_ms,
-    };
-
-    // Best-effort: record the sync's timings and per-layer sizes (ADR-0013). The
-    // human-readable summary is the caller's job (issue #53): we return the same
-    // counts/sizes/timings as a `SyncSummary` rather than logging a summary line.
-    metrics::record_sync(&repo_dir, &stream, &remote, &code, &extra, timings);
-
-    Ok(SyncSummary {
+    // One value, three surfaces (ADR-0017): it is written to the durable sink,
+    // returned to the caller for the human summary, and printed verbatim by
+    // `sync --json`.
+    let summary = SyncSummary {
+        envelope: gfs_common::metrics::Envelope::new("sync"),
         stream,
         remote,
-        code: code.stats,
-        extra: extra.stats,
-        timings,
-    })
+        total_ms: elapsed_ms(t_total),
+        retain_ms,
+        code: CodeLayer {
+            encode_ms: code_encode_ms,
+            push_ms: code_push_ms,
+            stats: code.stats,
+            commit: code.commit.to_string(),
+            tree: code.tree.to_string(),
+        },
+        extra: ExtraLayer {
+            encode_ms: extra_encode_ms,
+            push_ms: extra_push_ms,
+            stats: extra.stats,
+            commit: extra.commit.to_string(),
+            tree: extra.tree.to_string(),
+        },
+    };
+
+    // Best-effort (ADR-0013): a sink that can't be written never fails the sync.
+    metrics::record_sync(&repo_dir, &summary);
+
+    Ok(summary)
 }

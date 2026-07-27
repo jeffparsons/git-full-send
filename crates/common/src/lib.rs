@@ -35,7 +35,10 @@ pub const STREAMS_PREFIX: &str = "refs/git-full-send/streams/";
 /// branch-shaped and contain slashes (e.g. `feature/foo`); the wrapped string is
 /// validated on construction so the assembled ref
 /// `refs/git-full-send/streams/<id>/code` is always a well-formed Git ref.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Serialises as the bare id string, so a metrics record (ADR-0013/ADR-0017)
+/// carries `"stream": "my-laptop"` rather than a wrapper object.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct StreamId(String);
 
 /// The reason a string was rejected as a [`StreamId`].
