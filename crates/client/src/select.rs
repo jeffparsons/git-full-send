@@ -180,6 +180,46 @@ pub fn select_extra_paths_measured(
     }
 }
 
+/// The positive force-include patterns of the repository at `repo_dir` that are
+/// **unanchored**, as they are written in the pattern file.
+///
+/// An unanchored pattern can match at any depth, so it disables the walk's
+/// pruning entirely and forces a full working-tree scan every sync. `sync`
+/// already warns about them as it goes; this is the same finding, available to
+/// `doctor` without running a sync (ADR-0018).
+///
+/// Both layers are consulted, exactly as selection does. `repo_dir` may be a
+/// repository (its working tree is discovered) or a working tree directly; a
+/// bare repository has no patterns and yields none.
+pub fn unanchored_patterns(repo_dir: &Path) -> Result<Vec<String>, SelectError> {
+    let workdir = match gix::discover(repo_dir) {
+        Ok(repo) => match repo.workdir() {
+            Some(workdir) => workdir.to_path_buf(),
+            // Bare: no working tree, so no pattern files to find.
+            None => return Ok(Vec::new()),
+        },
+        // Not a repository: treat the path as a working tree, so this also works
+        // against a checked-out worktree that has no git dir of its own.
+        Err(_) => repo_dir.to_path_buf(),
+    };
+    let search = load_search(&workdir, user_include_path().as_deref())?;
+    let mut out: Vec<String> = Vec::new();
+    for list in &search.patterns {
+        for mapping in &list.patterns {
+            let pattern = &mapping.pattern;
+            // Negative carve-outs never force descent: they only shrink the result.
+            if pattern.is_negative() || prunable_prefix(pattern).is_some() {
+                continue;
+            }
+            let display = pattern.to_string();
+            if !out.contains(&display) {
+                out.push(display);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The core of [`select_extra_paths`] with the per-user file path supplied
 /// explicitly (rather than resolved from the environment), so tests can exercise
 /// the two-layer semantics without mutating process-global environment.

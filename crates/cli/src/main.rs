@@ -35,6 +35,43 @@ enum Command {
     ForgetStream(ForgetStreamArgs),
     /// Forget streams whose `code` is older than a cutoff age (server).
     Reap(ReapArgs),
+    /// Report repository conditions that make syncs slow, with remedies.
+    Doctor(DoctorArgs),
+    /// Summarise a repo's recorded metrics (p50/p95/max per field).
+    Metrics(MetricsArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Repository to examine. A server repo (its ref count and object layout
+    /// are what every connection pays for) or a client repo.
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Worktree that `update-worktree` checks out into, to examine as well.
+    #[arg(long, value_name = "PATH")]
+    worktree: Option<PathBuf>,
+    /// Print the report as one JSON object on stdout instead of the human
+    /// summary.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MetricsArgs {
+    /// Repository whose metrics sink to summarise
+    /// (`<git-dir>/git-full-send/metrics.jsonl`).
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Only summarise records of this kind (`sync`, `receive`,
+    /// `update_worktree`, `probe`).
+    #[arg(long, value_name = "KIND")]
+    kind: Option<String>,
+    /// Only consider the most recent N records of each kind.
+    #[arg(long, value_name = "N")]
+    last: Option<usize>,
+    /// Print the summary as JSON instead of a table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -254,9 +291,90 @@ async fn main() -> Result<()> {
             let outcome = gfs_server::reap_streams(&args.repo, cutoff, args.dry_run)?;
             print_reap_outcome(&outcome, args.older_than_days, now_unix);
         }
+        Command::Doctor(args) => {
+            let mut report = gfs_server::doctor(&args.repo, args.worktree.as_deref())?;
+            // The force-include check belongs with the selection walk that pays
+            // for it, on the client side, so it is composed in here rather than
+            // duplicated in the server's `doctor`.
+            report.push(include_pattern_check(&args.repo, args.worktree.as_deref()));
+            let errors = report.errors();
+            if args.json {
+                print_json(&report);
+            } else {
+                print_doctor_report(&report);
+            }
+            // A broken repository is something an orchestrator should be able to
+            // gate on; a warning is not (ADR-0018).
+            if errors > 0 {
+                std::process::exit(1);
+            }
+        }
+        Command::Metrics(args) => {
+            let git_dir = gfs_server::git_dir(&args.repo)?;
+            let stats = gfs_common::metrics::aggregate(&git_dir, args.kind.as_deref(), args.last);
+            if args.json {
+                print_json(&stats);
+            } else {
+                print_metrics(&stats);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Check the repo's force-include patterns for unanchored ones, which disable
+/// the selection walk's pruning entirely (ADR-0007, ADR-0018).
+///
+/// Lives here rather than in `gfs_server::doctor` because the patterns and the
+/// walk that pays for them are the *client's* (`gfs_client::select`), and the CLI
+/// is the one place that sees both sides.
+fn include_pattern_check(
+    repo: &std::path::Path,
+    worktree: Option<&std::path::Path>,
+) -> gfs_server::Check {
+    // Patterns live at the root of a working tree: the repo's own if it has one,
+    // otherwise the checked-out worktree we were pointed at.
+    let looked_at = match gfs_client::select::unanchored_patterns(repo) {
+        // A bare repo has no working tree of its own, so fall back to the
+        // worktree — that is where a server-side operator's patterns are.
+        Ok(patterns) if patterns.is_empty() && worktree.is_some() => {
+            gfs_client::select::unanchored_patterns(worktree.expect("checked above"))
+        }
+        other => other,
+    };
+
+    match looked_at {
+        Err(error) => gfs_server::Check::new(
+            "include_patterns",
+            gfs_server::doctor::WARN,
+            format!("could not read the force-include patterns: {error}"),
+            None,
+        ),
+        Ok(patterns) if patterns.is_empty() => gfs_server::Check::new(
+            "include_patterns",
+            gfs_server::doctor::OK,
+            "no unanchored force-include patterns",
+            None,
+        ),
+        Ok(patterns) => gfs_server::Check::new(
+            "include_patterns",
+            gfs_server::doctor::WARN,
+            format!(
+                "{} unanchored force-include pattern(s): {}",
+                patterns.len(),
+                patterns.join(", "),
+            ),
+            Some(
+                "an unanchored pattern can match at any depth, so the selection walk \
+                 cannot prune a single directory and scans the whole working tree every \
+                 sync. Anchor them with a leading `/` or a path prefix (`/dist/`, \
+                 `web-client/dist/`)."
+                    .into(),
+            ),
+        )
+        .with("patterns", patterns),
+    }
 }
 
 /// Seconds in a day, for converting `--older-than-days` to a cutoff instant.
@@ -490,6 +608,80 @@ fn print_probe_report(report: &gfs_client::ProbeReport) {
              `git-full-send doctor --repo <server-repo>` for what to do about it.",
         );
     }
+}
+
+/// Print the operator-facing `doctor` report to stdout (ADR-0018).
+///
+/// Each finding leads with its verdict and is followed by its remedy, because a
+/// diagnostic that only states a number leaves the operator exactly where they
+/// started.
+fn print_doctor_report(report: &gfs_server::DoctorReport) {
+    println!("Checked {}", report.repo);
+    if let Some(worktree) = &report.worktree {
+        println!("  worktree {worktree}");
+    }
+    println!();
+    for check in &report.checks {
+        let mark = match check.status {
+            gfs_server::doctor::ERROR => "ERROR",
+            gfs_server::doctor::WARN => " WARN",
+            _ => "   ok",
+        };
+        println!("{mark}  {:<16} {}", check.name, check.summary);
+        if let Some(remedy) = &check.remedy {
+            for line in wrap(remedy, 68) {
+                println!("       {line}");
+            }
+        }
+    }
+    println!();
+    let (errors, warnings) = (report.errors(), report.warnings());
+    if errors == 0 && warnings == 0 {
+        println!("Nothing to report.");
+    } else {
+        println!("{errors} error(s), {warnings} warning(s).");
+    }
+}
+
+/// Print the aggregated metrics summary to stdout.
+fn print_metrics(stats: &[gfs_common::metrics::KindStats]) {
+    if stats.is_empty() {
+        println!("no metrics recorded yet");
+        return;
+    }
+    for kind in stats {
+        println!("{} ({} record(s))", kind.kind, kind.records);
+        println!(
+            "  {:<34} {:>10} {:>10} {:>10}",
+            "field", "p50", "p95", "max"
+        );
+        for field in &kind.fields {
+            println!(
+                "  {:<34} {:>10.1} {:>10.1} {:>10.1}",
+                field.field, field.p50, field.p95, field.max,
+            );
+        }
+        println!();
+    }
+}
+
+/// Wrap `text` to `width` columns on whitespace, for a remedy paragraph.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Format a count with `_`-free thousands separators, so a five-digit entry

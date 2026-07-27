@@ -37,7 +37,7 @@ pub use probe::{ProbeError, ProbeReport, probe};
 pub use push::{DeltaPolicy, PushError, PushWire, push_ref, push_refs};
 pub use select::{
     SelectError, SelectStats, Selection, select_extra_paths, select_extra_paths_measured,
-    select_extra_paths_with,
+    select_extra_paths_with, unanchored_patterns,
 };
 pub use stream::StreamResolveError;
 
