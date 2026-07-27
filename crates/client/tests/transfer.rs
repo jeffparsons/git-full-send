@@ -41,6 +41,32 @@ fn start_server(repo: &Path) -> SocketAddr {
     addr
 }
 
+/// The server's `receive` metrics records, oldest first (ADR-0013).
+fn receive_records(server_git_dir: &Path) -> Vec<serde_json::Value> {
+    let path = server_git_dir.join("git-full-send").join("metrics.jsonl");
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|r| r["kind"] == "receive")
+        .collect()
+}
+
+/// Wait until the server has recorded at least `n` receive records.
+///
+/// The handler records *after* the client's push has returned, so a test that
+/// reads the sink immediately can race it.
+async fn wait_for_receives(server_git_dir: &Path, n: usize) -> Vec<serde_json::Value> {
+    for _ in 0..100 {
+        let records = receive_records(server_git_dir);
+        if records.len() >= n {
+            return records;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("server never recorded {n} receive record(s)");
+}
+
 /// The recursive set of paths in `tree_ish` (run with cwd inside the repo).
 fn tree_paths(repo: &Path, tree_ish: &str) -> BTreeSet<String> {
     git(repo, &["ls-tree", "-r", "--name-only", tree_ish])
@@ -223,6 +249,14 @@ async fn rejects_refs_outside_the_namespace() {
         .is_err(),
         "a non-namespaced push is rejected",
     );
+    // A policy rejection is a real failure with a real cause, and stays
+    // distinguishable from both a broken push and a liveness probe (ADR-0018).
+    let records = wait_for_receives(server.path(), 2).await;
+    assert_eq!(
+        records[1]["outcome"], "rejected",
+        "the namespace hook declined it: {}",
+        records[1],
+    );
     assert!(
         !Command::new("git")
             .args(["rev-parse", "--verify", "--quiet", "refs/heads/main"])
@@ -367,6 +401,178 @@ async fn second_sync_advances_the_server() {
         "two",
         "the server has the latest content",
     );
+}
+
+/// Protocol overhead is reported apart from payload, on both ends (ADR-0017).
+///
+/// The failure this prevents: a 3.1 MB ref advertisement counted as `bytes_out`
+/// alongside pack data, so a repo's ref count looked like transferred data until
+/// somebody counted refs by hand on the far machine.
+#[tokio::test]
+async fn a_push_separates_ref_advertisement_from_pack_data() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "a.txt", "a");
+    commit_all(c, "baseline");
+    let code = code_ref(&test_stream());
+    git(c, &["update-ref", &code, "HEAD"]);
+
+    // --- Against a nearly-empty repo the advertisement is negligible.
+    let first = gfs_client::push_ref(
+        c,
+        &addr.to_string(),
+        &code,
+        gfs_client::DeltaPolicy::default(),
+    )
+    .await
+    .expect("push succeeds");
+    assert!(
+        first.sent.post_flush > 0,
+        "the pack is counted apart from the commands: {first:?}",
+    );
+    assert!(
+        first.sent.pre_flush_pkts > 0,
+        "the ref-update command was counted: {first:?}",
+    );
+    let small_advertisement = first.received.pre_flush;
+
+    // --- Now give the server a pile of refs and push again. Nothing about the
+    // *data* changed; only the advertisement did.
+    // (Pointed at the ref we just pushed: the bare server repo has no HEAD.)
+    for i in 0..200 {
+        git(
+            server.path(),
+            &["update-ref", &format!("refs/noise/r{i}"), &code],
+        );
+    }
+    // Something genuinely new to push, so this is a real update and not git
+    // deciding everything is already up to date.
+    write_file(c, "b.txt", "b");
+    commit_all(c, "second");
+    git(c, &["update-ref", &code, "HEAD"]);
+    let second = gfs_client::push_ref(
+        c,
+        &addr.to_string(),
+        &code,
+        gfs_client::DeltaPolicy::default(),
+    )
+    .await
+    .expect("push succeeds");
+
+    assert!(
+        second.received.pre_flush > small_advertisement * 10,
+        "the advertisement grew with the ref count: {} vs {}",
+        second.received.pre_flush,
+        small_advertisement,
+    );
+    assert!(
+        second.received.pre_flush_pkts >= 200,
+        "one advertised pkt-line per ref: {second:?}",
+    );
+    // And the payload did not: the whole point of splitting them.
+    assert!(
+        second.received.pre_flush > second.sent.post_flush,
+        "overhead now dwarfs the data being pushed: {second:?}",
+    );
+
+    // The server's own record agrees, from the other side of the socket.
+    let records = wait_for_receives(server.path(), 2).await;
+    let last = records.last().expect("a receive record");
+    assert_eq!(last["outcome"], "updated");
+    assert_eq!(
+        last["outbound"]["refs_advertised"].as_u64(),
+        Some(second.received.pre_flush_pkts),
+        "both ends counted the same advertisement: {last}",
+    );
+    assert_eq!(
+        last["inbound"]["pack"].as_u64(),
+        Some(second.sent.post_flush),
+        "and the same pack: {last}",
+    );
+}
+
+/// A liveness check is not a failed push (ADR-0018).
+///
+/// `probe` completes a real receive-pack exchange that updates nothing, so the
+/// server records a clean `no_op`; and even the rude version — connect, hang up —
+/// is classified as a `probe` rather than reported as a broken push.
+#[tokio::test]
+async fn probing_is_reported_as_a_probe_not_a_failure() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    // Some refs to advertise, so the probe has something to measure.
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "a.txt", "a");
+    commit_all(c, "baseline");
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(test_stream()), None)
+        .await
+        .expect("sync succeeds");
+    let pushes = receive_records(server.path()).len();
+
+    // --- The well-behaved probe.
+    let remote = addr.to_string();
+    let report = tokio::task::spawn_blocking(move || gfs_client::probe(&remote))
+        .await
+        .expect("probe task")
+        .expect("the server is up");
+    assert!(
+        report.advertisement_bytes > 0,
+        "the probe measured the advertisement every connection pays: {report:?}",
+    );
+    assert!(
+        report.refs_advertised >= 2,
+        "the synced stream's refs were advertised: {report:?}",
+    );
+    assert_eq!(
+        report.refs_ours, report.refs_advertised,
+        "all of them are git-full-send's in this fixture: {report:?}",
+    );
+
+    let records = wait_for_receives(server.path(), pushes + 1).await;
+    let probe_record = &records[pushes];
+    assert_eq!(
+        probe_record["outcome"], "no_op",
+        "a complete exchange that updates nothing: {probe_record}",
+    );
+    assert_eq!(
+        probe_record["success"], true,
+        "receive-pack exits zero on a flush-only conversation: {probe_record}",
+    );
+    assert_eq!(
+        probe_record["inbound"]["command_pkts"].as_u64(),
+        Some(0),
+        "no ref updates were even attempted: {probe_record}",
+    );
+
+    // --- The rude probe: connect, say nothing, hang up. This is what an
+    // orchestrator did before `probe` existed, and what used to produce
+    // `WARN receive-pack exited non-zero status=…13…`.
+    let addr2 = addr;
+    tokio::task::spawn_blocking(move || {
+        let sock = std::net::TcpStream::connect(addr2).expect("connect");
+        drop(sock);
+    })
+    .await
+    .expect("hang-up task");
+
+    let records = wait_for_receives(server.path(), pushes + 2).await;
+    let hung_up = &records[pushes + 1];
+    assert_eq!(
+        hung_up["outcome"], "probe",
+        "nothing was pushed, so nothing failed: {hung_up}",
+    );
+    assert_eq!(
+        hung_up["inbound"]["command_pkts"].as_u64(),
+        Some(0),
+        "which is exactly what makes it a probe: {hung_up}",
+    );
+    // The record still tells the whole truth — it just isn't called a failure.
+    assert_eq!(hung_up["success"], false);
 }
 
 /// A checkout explains its own cost (issue #75, ADR-0017): the first run finds a

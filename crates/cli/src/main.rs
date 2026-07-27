@@ -23,6 +23,8 @@ struct Cli {
 enum Command {
     /// Synthesise the local sync state and push it to the server (client).
     Sync(SyncArgs),
+    /// Check that a server is accepting, and measure its ref advertisement.
+    Probe(ProbeArgs),
     /// Run the long-running server that receives sync requests (server).
     Listen(ListenArgs),
     /// Check the synced state out into the configured worktree (server).
@@ -54,6 +56,17 @@ struct SyncArgs {
     user_include: Option<PathBuf>,
     /// Print the operation's record as one JSON object on stdout instead of the
     /// human summary — the same record appended to the metrics sink (ADR-0017).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProbeArgs {
+    /// Server endpoint to check (typically a tunnelled localhost port).
+    #[arg(long, value_name = "HOST:PORT")]
+    remote: String,
+    /// Print the probe's record as one JSON object on stdout instead of the
+    /// human summary.
     #[arg(long)]
     json: bool,
 }
@@ -173,6 +186,17 @@ async fn main() -> Result<()> {
                 print_json(&summary);
             } else {
                 print_sync_summary(&summary);
+            }
+        }
+        Command::Probe(args) => {
+            // Blocking, and deliberately so: a probe is one short exchange, and
+            // it must work identically whether an orchestrator runs it standalone
+            // or a script pipes it into `jq`.
+            let report = gfs_client::probe(&args.remote)?;
+            if args.json {
+                print_json(&report);
+            } else {
+                print_probe_report(&report);
             }
         }
         Command::Listen(args) => {
@@ -318,6 +342,20 @@ fn print_sync_summary(summary: &gfs_client::SyncSummary) {
         human_ms(summary.extra.push_ms),
     );
 
+    // What each push actually put on the wire. Splitting the ref advertisement
+    // from the pack is what turns "the push took 3 seconds" into "this repo has
+    // 28,709 refs" (ADR-0017).
+    for (label, wire) in [("code", &summary.code.wire), ("extra", &summary.extra.wire)] {
+        println!(
+            "         {label} wire: sent {} ({} pack) · received {} ({} advertising {} ref(s))",
+            human_bytes(wire.sent.total),
+            human_bytes(wire.sent.post_flush),
+            human_bytes(wire.received.total),
+            human_bytes(wire.received.pre_flush),
+            human_count(wire.received.pre_flush_pkts as usize),
+        );
+    }
+
     // What the two encodes actually spent their time on. The `extra` walk is the
     // line that turns "sync feels slow" into "this include pattern is unanchored"
     // (ADR-0017).
@@ -429,6 +467,28 @@ fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
         if !parts.is_empty() {
             println!("    read-tree: {}", parts.join(" · "));
         }
+    }
+}
+
+/// Print the operator-facing result of a `probe` to stdout (ADR-0018).
+///
+/// The advertisement figure is the point: it is what *every* connection pays
+/// before any of the developer's data moves, and a sync makes two of them.
+fn print_probe_report(report: &gfs_client::ProbeReport) {
+    println!("{} is up ({})", report.remote, human_ms(report.total_ms),);
+    println!(
+        "  ref advertisement: {} for {} ref(s) ({} git-full-send's), on every connection",
+        human_bytes(report.advertisement_bytes),
+        human_count(report.refs_advertised as usize),
+        human_count(report.refs_ours as usize),
+    );
+    // The threshold below which nobody would think twice about the overhead.
+    const NOTABLE: u64 = 256 * 1024;
+    if report.advertisement_bytes >= NOTABLE {
+        println!(
+            "  note: that is paid per connection, and a sync makes two. Run \
+             `git-full-send doctor --repo <server-repo>` for what to do about it.",
+        );
     }
 }
 

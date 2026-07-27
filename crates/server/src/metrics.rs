@@ -21,34 +21,88 @@ pub(crate) struct ReceiveRecord {
     envelope: gfs_common::metrics::Envelope,
     /// Wall time from spawning `receive-pack` to its exit, in milliseconds.
     pub duration_ms: f64,
+    /// What this connection actually was — see [`crate::Outcome`]. The field to
+    /// read: a healthy liveness probe is `success: false` and entirely fine.
+    pub outcome: &'static str,
     /// Whether `receive-pack` exited zero.
     pub success: bool,
     /// Its exit code, if it exited via a code (vs. a signal).
     pub exit_code: Option<i32>,
-    /// Bytes read off the socket into `receive-pack` (the inbound pack).
-    pub bytes_in: u64,
-    /// Bytes written from `receive-pack` back to the socket (the report-status).
-    pub bytes_out: u64,
+    /// The signal that killed it, if one did — `13` (SIGPIPE) is what a prober
+    /// hanging up looks like from here.
+    pub signal: Option<i32>,
+    /// Bytes read off the socket, split into the ref-update commands and the
+    /// pack that follows them (ADR-0017).
+    pub inbound: Inbound,
+    /// Bytes written back to the socket, split into the ref advertisement and
+    /// the report-status that follows it.
+    pub outbound: Outbound,
     /// The refs accepted by the namespace hook for this push.
     pub refs_updated: Vec<String>,
 }
 
+/// The inbound half of a connection: what the client sent.
+#[derive(Debug, Serialize)]
+pub(crate) struct Inbound {
+    /// Every byte received.
+    pub total: u64,
+    /// The ref-update command block, up to and including its flush-pkt.
+    pub commands: u64,
+    /// How many ref-update commands that was. Zero means nothing was being
+    /// pushed — the basis for classifying a probe (ADR-0018).
+    pub command_pkts: u64,
+    /// The pack itself: the only part that is the user's actual data.
+    pub pack: u64,
+}
+
+/// The outbound half of a connection: what the server sent.
+#[derive(Debug, Serialize)]
+pub(crate) struct Outbound {
+    /// Every byte sent.
+    pub total: u64,
+    /// The ref advertisement, which every connection pays for in full regardless
+    /// of how little is being pushed.
+    pub advertisement: u64,
+    /// Refs advertised (one pkt-line each; a repo with no refs still gets one
+    /// placeholder line).
+    pub refs_advertised: u64,
+    /// The report-status sent after the pack was ingested.
+    pub report: u64,
+}
+
 impl ReceiveRecord {
+    /// Assemble the record from how the child ended and what crossed the wire.
+    ///
+    /// `status` is unpacked here rather than by the caller so the three
+    /// exit-related fields cannot disagree with each other.
     pub(crate) fn new(
         duration_ms: f64,
-        success: bool,
-        exit_code: Option<i32>,
-        bytes_in: u64,
-        bytes_out: u64,
+        outcome: &'static str,
+        status: &std::process::ExitStatus,
+        inbound: gfs_common::pktline::WireCounts,
+        outbound: gfs_common::pktline::WireCounts,
         refs_updated: Vec<String>,
     ) -> Self {
+        use std::os::unix::process::ExitStatusExt;
         Self {
             envelope: gfs_common::metrics::Envelope::new("receive"),
             duration_ms,
-            success,
-            exit_code,
-            bytes_in,
-            bytes_out,
+            outcome,
+            success: status.success(),
+            exit_code: status.code(),
+            signal: status.signal(),
+            inbound: Inbound {
+                total: inbound.total,
+                commands: inbound.pre_flush,
+                command_pkts: inbound.pre_flush_pkts,
+                pack: inbound.post_flush,
+            },
+            outbound: Outbound {
+                total: outbound.total,
+                advertisement: outbound.pre_flush,
+                refs_advertised: outbound.pre_flush_pkts,
+                report: outbound.post_flush,
+            },
             refs_updated,
         }
     }

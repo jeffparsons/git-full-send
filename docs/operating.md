@@ -100,6 +100,29 @@ git-full-send update-worktree \
   `--wait --timeout <secs>` to give up after a bounded wait. Distinct worktrees
   never contend.
 
+### `probe` — is the server up? (and what does a connection cost?)
+
+```sh
+git-full-send probe --remote 127.0.0.1:9419
+```
+
+Run from the **client**, through the tunnel. It completes a real receive-pack
+exchange that updates nothing, so an orchestrator can gate on it without faking
+a push — and the server logs a clean no-op rather than a failed push
+([ADR-0018](adr/0018-liveness-and-repo-health-surfaces.md)). Exits non-zero if
+the server is not accepting.
+
+It also reports what every connection pays before any of your data moves:
+
+```text
+127.0.0.1:9419 is up (14ms)
+  ref advertisement: 3.0 MiB for 28709 ref(s) (4 git-full-send's), on every connection
+```
+
+A large number there is a property of the **server repo's ref count**, not of
+your diff, and a sync makes two connections. `doctor` (below) says what to do
+about it.
+
 ### `list-streams` — discover synced streams
 
 ```sh
