@@ -457,14 +457,16 @@ fn handle_connection(
         }
     });
 
-    // Inbound: socket → child stdin (the pushed pack). A broken-pipe error once
-    // the child has exited is expected, not a failure; we keep the byte count.
+    // Inbound: socket → child stdin (the ref-update commands, then the pushed
+    // pack). A broken-pipe error once the child has exited is expected, not a
+    // failure; we keep the byte counts.
     let in_pump = std::thread::spawn(move || {
         let n = pump_counting(&mut sock_in, &mut child_stdin);
         drop(child_stdin); // close the child's stdin
         n
     });
-    // Outbound: child stdout → socket (the report-status).
+    // Outbound: child stdout → socket (the ref advertisement, then the
+    // report-status).
     let out_pump = std::thread::spawn(move || pump_counting(&mut child_stdout, &mut sock_out));
 
     // Drain receive-pack's stderr (progress, hook rejections) to the log.
@@ -477,9 +479,9 @@ fn handle_connection(
     // The child has exited, so its stdout has hit EOF; join the outbound pump to
     // be sure the whole report-status reached the socket, then shut the socket
     // down to send the client its FIN and unblock the inbound pump.
-    let bytes_out = out_pump.join().unwrap_or(0);
+    let bytes_out = out_pump.join().unwrap_or_default();
     let _ = sock.shutdown(Shutdown::Both);
-    let bytes_in = in_pump.join().unwrap_or(0);
+    let bytes_in = in_pump.join().unwrap_or_default();
 
     // Stand the watchdog down (dropping the sender wakes its `recv_timeout`) and
     // join it, so a fired-or-not watchdog never outlives the connection.
@@ -489,31 +491,49 @@ fn handle_connection(
     let stderr = stderr.trim();
     let refs_updated = accepted_refs.map(read_accepted_refs).unwrap_or_default();
 
-    // A non-zero exit (e.g. the namespace hook declining a push) is the
-    // per-connection outcome, not a server fault: log it and keep serving.
-    if status.success() {
-        if !stderr.is_empty() {
-            tracing::debug!(%stderr, "receive-pack finished");
-        }
-    } else {
-        tracing::warn!(?status, %stderr, "receive-pack exited non-zero");
+    // What this connection *was* — not merely whether the child exited zero
+    // (ADR-0018). A prober that connects and hangs up leaves `receive-pack` dead
+    // of SIGPIPE with nothing pushed; that is a healthy liveness check, and
+    // reporting it as a failed push misleads whoever is reading the log for a
+    // real problem.
+    let outcome = classify(&status, &bytes_in, &refs_updated, stderr);
+    match outcome {
+        Outcome::Updated => tracing::info!(
+            outcome = outcome.as_str(),
+            refs = refs_updated.len(),
+            pack_bytes = bytes_in.post_flush,
+            advertisement_bytes = bytes_out.pre_flush,
+            refs_advertised = bytes_out.pre_flush_pkts,
+            duration_ms = elapsed_ms(started),
+            "received git push",
+        ),
+        // Nothing was pushed, so nothing failed. Visible on request, silent by
+        // default: an orchestrator may probe once or twice per invocation.
+        Outcome::NoOp | Outcome::Probe => tracing::debug!(
+            outcome = outcome.as_str(),
+            advertisement_bytes = bytes_out.pre_flush,
+            refs_advertised = bytes_out.pre_flush_pkts,
+            duration_ms = elapsed_ms(started),
+            "connection carried no ref updates",
+        ),
+        // The two cases a human should actually look at.
+        Outcome::Rejected | Outcome::Failed => tracing::warn!(
+            outcome = outcome.as_str(),
+            ?status,
+            %stderr,
+            refs = refs_updated.len(),
+            duration_ms = elapsed_ms(started),
+            "receive-pack did not complete a push",
+        ),
     }
-    tracing::info!(
-        success = status.success(),
-        bytes_in,
-        bytes_out,
-        refs = refs_updated.len(),
-        duration_ms = elapsed_ms(started),
-        "received git push"
-    );
 
     // Best-effort metrics record (ADR-0013), even on a failed receive.
     metrics::record(
         git_dir,
         &metrics::ReceiveRecord::new(
             elapsed_ms(started),
-            status.success(),
-            status.code(),
+            outcome.as_str(),
+            &status,
             bytes_in,
             bytes_out,
             refs_updated,
@@ -522,35 +542,74 @@ fn handle_connection(
     Ok(())
 }
 
-/// Copy `reader` → `writer` to EOF with an explicit read/write loop, returning
-/// the number of bytes moved.
+/// What a `git receive-pack` connection turned out to be (ADR-0018).
 ///
-/// Deliberately *not* `std::io::copy`: between a socket and a pipe on Linux that
-/// function takes a `splice`/`sendfile` zero-copy fast path, which deadlocked
-/// the bidirectional `receive-pack` exchange (issue #44) while passing on macOS,
-/// where no such fast path exists. A plain buffered loop behaves identically on
-/// both platforms and produces the byte count the metrics record needs (#42).
-/// Errors (e.g. a broken pipe once the child has exited) end the copy and return
-/// the bytes moved so far, matching the previous best-effort behaviour.
-fn pump_counting(reader: &mut impl std::io::Read, writer: &mut impl std::io::Write) -> u64 {
-    let mut buf = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if writer.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                total += n as u64;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+/// Derived from what the exchange *contained*, not only from the exit status:
+/// "were any ref updates even attempted" is the question that separates a broken
+/// push from a liveness check, and it also gives `rejected` and `no_op` honest
+/// names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Refs were pushed and accepted.
+    Updated,
+    /// A complete, well-formed exchange that updated nothing — what
+    /// `git-full-send probe` sends.
+    NoOp,
+    /// No ref updates arrived and the exchange ended badly: a prober that hung
+    /// up mid-advertisement, leaving `receive-pack` to die of SIGPIPE.
+    Probe,
+    /// The namespace hook declined a ref (ADR-0005).
+    Rejected,
+    /// A genuine failure.
+    Failed,
+}
+
+impl Outcome {
+    /// The stable string used in the record and the log.
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Updated => "updated",
+            Outcome::NoOp => "no_op",
+            Outcome::Probe => "probe",
+            Outcome::Rejected => "rejected",
+            Outcome::Failed => "failed",
         }
     }
-    let _ = writer.flush();
-    total
 }
+
+/// Classify a finished connection. See [`Outcome`].
+///
+/// Note that a hook rejection does **not** make `receive-pack` exit non-zero:
+/// the refusal travels in the report-status, so the child exits 0 with no refs
+/// accepted. Classifying on the exit status alone would call that a success.
+fn classify(
+    status: &std::process::ExitStatus,
+    inbound: &gfs_common::pktline::WireCounts,
+    refs_updated: &[String],
+    stderr: &str,
+) -> Outcome {
+    if stderr.contains(HOOK_REFUSAL_MARKER) {
+        return Outcome::Rejected;
+    }
+    if status.success() {
+        return match (refs_updated.is_empty(), inbound.pre_flush_pkts) {
+            (false, _) => Outcome::Updated,
+            // Ref updates were asked for and none were accepted.
+            (true, 1..) => Outcome::Rejected,
+            // Nothing was asked for: a complete, empty conversation.
+            (true, 0) => Outcome::NoOp,
+        };
+    }
+    // Nothing was being pushed, so nothing was broken by failing to push it.
+    if inbound.pre_flush_pkts == 0 {
+        return Outcome::Probe;
+    }
+    Outcome::Failed
+}
+
+/// The shared counting byte pump ([`gfs_common::pktline::pump_splitting`]),
+/// which also splits each direction into protocol overhead and payload.
+use gfs_common::pktline::pump_splitting as pump_counting;
 
 /// Read the hook's accepted-ref file into a deduplicated, order-preserving list
 /// of ref names (one per line). A missing/unreadable file yields no refs.
@@ -585,6 +644,11 @@ fn install_hooks() -> Result<TempDir, ServerError> {
     Ok(dir)
 }
 
+/// The text the `pre-receive` hook prints when it declines a ref, used to tell a
+/// policy rejection apart from a genuine failure when classifying a connection
+/// (ADR-0018). Shared by the hook body and [`classify`] so the two cannot drift.
+const HOOK_REFUSAL_MARKER: &str = "git-full-send: refusing ref outside";
+
 /// The `pre-receive` hook body: reject any updated ref outside the
 /// [`gfs_common::REF_NAMESPACE`] namespace (ADR-0005), and append each accepted
 /// ref to the file named by [`ACCEPTED_REFS_ENV`] so the connection handler can
@@ -592,13 +656,14 @@ fn install_hooks() -> Result<TempDir, ServerError> {
 fn pre_receive_hook() -> String {
     let ns = gfs_common::REF_NAMESPACE;
     let refs_env = ACCEPTED_REFS_ENV;
+    let refusal = HOOK_REFUSAL_MARKER;
     format!(
         "#!/bin/sh\n\
          while read -r old new ref; do\n\
          \tcase \"$ref\" in\n\
          \t{ns}*)\n\
          \t\t[ -n \"${refs_env}\" ] && printf '%s\\n' \"$ref\" >> \"${refs_env}\" ;;\n\
-         \t*) echo \"git-full-send: refusing ref outside {ns}: $ref\" >&2; exit 1 ;;\n\
+         \t*) echo \"{refusal} {ns}: $ref\" >&2; exit 1 ;;\n\
          \tesac\n\
          done\n",
     )

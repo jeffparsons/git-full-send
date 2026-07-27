@@ -49,16 +49,24 @@ what the exchange actually contained rather than only from the exit status:
 
 | outcome | condition | log level |
 | --- | --- | --- |
-| `updated` | exited 0, the namespace hook accepted refs | `info` |
-| `no_op` | exited 0, no ref-update commands (a flush-only conversation) | `debug` |
-| `probe` | no ref-update commands arrived at all, however it ended — including a SIGPIPE hang-up | `debug` |
 | `rejected` | the namespace hook declined a ref | `warn` |
+| `updated` | the hook accepted refs | `info` |
+| `no_op` | exited 0 having been asked for no ref updates (a flush-only conversation) | `debug` |
+| `probe` | no ref updates were asked for and it ended badly — a SIGPIPE hang-up | `debug` |
 | `failed` | anything else | `warn` |
 
-"No ref-update commands arrived" is exactly the pre-flush pkt count of the
+"No ref updates were asked for" is exactly the pre-flush pkt count of the
 inbound stream (ADR-0017) being zero, so the classification falls out of the byte
-accounting already being done. `success` stays in the record as a derived
-convenience; `outcome` is the field to read.
+accounting already being done.
+
+**Rejection is checked first, and deliberately not from the exit status.** A
+`pre-receive` hook that declines a ref does not make `git receive-pack` exit
+non-zero — the refusal travels in the report-status, and the child exits **0**
+with no refs accepted. Classifying on the exit status alone would file a
+rejected push under "success", which is how it read before this ADR.
+
+`success` stays in the record as a derived convenience; `outcome` is the field to
+read.
 
 ### Make liveness a first-class question
 

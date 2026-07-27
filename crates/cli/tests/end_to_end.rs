@@ -357,10 +357,22 @@ async fn round_trip_records_metrics_on_both_sides() {
         .iter()
         .find(|r| r["kind"] == "receive")
         .expect("a receive record");
+    assert_eq!(receive["outcome"], "updated");
     assert_eq!(receive["success"], true);
+    // The on-wire bytes are split into protocol overhead and payload on both
+    // ends (ADR-0017), so a large ref advertisement can never again be mistaken
+    // for transferred data.
     assert!(
-        receive["bytes_in"].as_u64().unwrap_or(0) > 0,
-        "bytes were counted off the socket",
+        receive["inbound"]["pack"].as_u64().unwrap_or(0) > 0,
+        "the pack was counted: {receive}",
+    );
+    assert!(
+        receive["inbound"]["command_pkts"].as_u64().unwrap_or(0) > 0,
+        "ref-update commands arrived: {receive}",
+    );
+    assert!(
+        receive["outbound"]["advertisement"].as_u64().unwrap_or(0) > 0,
+        "the ref advertisement was counted separately: {receive}",
     );
     let refs: Vec<&str> = receive["refs_updated"]
         .as_array()

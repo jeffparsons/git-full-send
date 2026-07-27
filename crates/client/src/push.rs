@@ -17,9 +17,9 @@
 //! The socket is passed on dedicated file descriptors, **not** as the child's
 //! stdin/stdout: `git push` uses its own stdin/stdout, and pointing the
 //! transport at fd 0/1 wedges it before the protocol even starts. We reserve two
-//! dups of the socket in the parent (`try_clone_to_owned`) and pass their
-//! numbers as `fd::<in>,<out>`, leaving `git`'s own stdio untouched. The dups
-//! keep `FD_CLOEXEC` in the parent; `git` would normally not inherit them across
+//! dups in the parent (`try_clone_to_owned`) and pass their numbers as
+//! `fd::<in>,<out>`, leaving `git`'s own stdio untouched. The dups keep
+//! `FD_CLOEXEC` in the parent; `git` would normally not inherit them across
 //! `exec`, so we clear the flag **only in the forked child** via a `pre_exec`
 //! hook (`fcntl(F_SETFD)`, async-signal-safe) just before `exec`. `fork` copies
 //! the fd table, so the intended `git push` still inherits the dups while no
@@ -27,6 +27,27 @@
 //! parent's fd table (#57). (The server side is simpler — `git receive-pack`
 //! happily takes the raw socket as its stdin/stdout, exactly as `git daemon`
 //! feeds it.)
+//!
+//! ## The counting interposer
+//!
+//! What `git` gets dups of is **not** the TCP socket but one end of a
+//! `socketpair`; two threads move bytes between the other end and the socket,
+//! counting as they go (ADR-0017). Without that, a sync's dominant cost is
+//! invisible from the machine it runs on: a 3.1 MB ref advertisement and a 64 KB
+//! pack are one `push_ms`, and the numbers that tell them apart live in a file on
+//! the far side of an SSH tunnel.
+//!
+//! The bytes are the identical raw stream — ADR-0005 is unchanged; the pumps are
+//! the server's own [`gfs_common::pktline::pump_splitting`], deliberately not
+//! `std::io::copy` (whose splice fast path deadlocked this exchange in #44), and
+//! the `FD_CLOEXEC` handling above is unchanged in shape, just applied to the
+//! socketpair dups instead of the socket's. The cost is one
+//! localhost-bandwidth userspace copy, the same one the server has always paid.
+//!
+//! Teardown order matters and is the one subtle part: when `git` exits, its dups
+//! close, so the outbound pump sees EOF and is **joined first** — that is what
+//! guarantees everything `git` wrote reached the socket. Only then is the socket
+//! shut down to release the inbound pump.
 //!
 //! ## Per-chain delta policy
 //!
@@ -141,7 +162,7 @@ pub async fn push_ref(
     remote: &str,
     ref_name: &str,
     policy: DeltaPolicy,
-) -> Result<(), PushError> {
+) -> Result<PushWire, PushError> {
     push_refs(repo_dir, remote, &[ref_name], policy).await
 }
 
@@ -158,7 +179,7 @@ pub async fn push_refs(
     remote: &str,
     ref_names: &[&str],
     policy: DeltaPolicy,
-) -> Result<(), PushError> {
+) -> Result<PushWire, PushError> {
     let repo = gix::discover(repo_dir).map_err(|source| PushError::OpenRepo {
         path: repo_dir.to_path_buf(),
         source: Box::new(source),
@@ -172,13 +193,18 @@ pub async fn push_refs(
         source,
     })?;
 
-    // Reserve two dups of the socket for the transport's input and output fds,
-    // and pass their numbers to the `fd::` transport. Reserving them in the
+    // Interpose a socketpair between `git` and the socket so both directions can
+    // be counted and split (ADR-0017). `git` gets dups of `theirs`; the pumps
+    // below own `ours`.
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(PushError::Io)?;
+
+    // Reserve two dups of the transport end for the transport's input and output
+    // fds, and pass their numbers to the `fd::` transport. Reserving them in the
     // parent (vs. `dup2`-ing in a `pre_exec` hook) keeps them clear of the fds
     // `Command` uses to wire up the child's own stdio. The dups keep
     // `FD_CLOEXEC`; a `pre_exec` hook clears it in the child just before `exec`
     // (below), so they are never inheritable across an unrelated `spawn` (#57).
-    let transport = TransportFds::reserve(&sock).map_err(PushError::Io)?;
+    let transport = TransportFds::reserve(&theirs).map_err(PushError::Io)?;
 
     // Force (`+`): the synthetic scratch refs are overwritten each sync, and a
     // new `code` commit is parented on HEAD rather than the previous tip, so
@@ -237,15 +263,50 @@ pub async fn push_refs(
     let child = command.spawn().map_err(PushError::Spawn)?;
 
     // The child now holds its own copies of the transport fds; drop the parent's
-    // so the connection closes cleanly once the push completes. `tokio::process`
-    // is built on `std::process`, so the reserved dups (and the `pre_exec` flag
-    // flip) pass to the child exactly as a synchronous spawn would — but
-    // `child.wait_with_output().await` now yields
+    // — including the whole `theirs` end — so the outbound pump sees EOF when
+    // `git` exits. `tokio::process` is built on `std::process`, so the reserved
+    // dups (and the `pre_exec` flag flip) pass to the child exactly as a
+    // synchronous spawn would — but `child.wait_with_output().await` now yields
     // for the duration of the receive-pack exchange instead of blocking the
     // runtime thread (so a co-located server task can make progress).
     drop(transport);
-    drop(sock);
+    drop(theirs);
+
+    // Outbound: `git` → the server (ref-update commands, then the pack).
+    let mut out_reader = ours.try_clone().map_err(PushError::Io)?;
+    let mut out_writer = sock.try_clone().map_err(PushError::Io)?;
+    let out_pump = std::thread::spawn(move || {
+        let counts = gfs_common::pktline::pump_splitting(&mut out_reader, &mut out_writer);
+        // `git` has stopped talking, so the server should see the same end of
+        // stream it would have seen on a direct socket.
+        let _ = out_writer.shutdown(std::net::Shutdown::Write);
+        counts
+    });
+
+    // Inbound: the server → `git` (ref advertisement, then the report-status).
+    let mut in_reader = sock.try_clone().map_err(PushError::Io)?;
+    let mut in_writer = ours.try_clone().map_err(PushError::Io)?;
+    let in_pump = std::thread::spawn(move || {
+        let counts = gfs_common::pktline::pump_splitting(&mut in_reader, &mut in_writer);
+        // Propagating *this* half-close is load-bearing, not tidiness: after the
+        // report-status the server closes, and `git` waits for its transport to
+        // reach end of stream before it will exit. Interposing a socketpair
+        // without forwarding the close leaves it waiting forever.
+        let _ = in_writer.shutdown(std::net::Shutdown::Write);
+        counts
+    });
+
     let output = child.wait_with_output().await.map_err(PushError::Spawn)?;
+
+    // `git` has exited, so every copy of `theirs` is closed and the outbound pump
+    // is at EOF. Join it *first*: that is what guarantees the pack reached the
+    // socket before we touch it. Only then shut the socket down, which releases
+    // the inbound pump (the server closes its side anyway, but not necessarily
+    // before we get here).
+    let bytes_out = out_pump.join().unwrap_or_default();
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+    let _ = ours.shutdown(std::net::Shutdown::Both);
+    let bytes_in = in_pump.join().unwrap_or_default();
 
     if !output.status.success() {
         return Err(PushError::PushFailed {
@@ -253,7 +314,27 @@ pub async fn push_refs(
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    Ok(())
+    Ok(PushWire {
+        sent: bytes_out,
+        received: bytes_in,
+    })
+}
+
+/// What one `git push` exchange actually cost on the wire (ADR-0017).
+///
+/// The split is what makes it useful: a push whose `received.pre_flush` dwarfs
+/// its `sent.post_flush` is paying for the server repo's ref count, not moving
+/// the developer's data — the diagnosis that previously took counting refs by
+/// hand on the far machine.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct PushWire {
+    /// Client → server: ref-update commands (`pre_flush`) then the pack
+    /// (`post_flush`).
+    pub sent: gfs_common::pktline::WireCounts,
+    /// Server → client: the ref advertisement (`pre_flush`, one pkt per ref)
+    /// then the report-status (`post_flush`).
+    pub received: gfs_common::pktline::WireCounts,
 }
 
 /// A pair of inheritable file descriptors duplicated from the connected socket,

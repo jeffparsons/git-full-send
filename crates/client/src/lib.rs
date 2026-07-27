@@ -18,6 +18,7 @@ use thiserror::Error;
 
 pub mod encode;
 mod metrics;
+pub mod probe;
 mod push;
 pub mod select;
 mod stream;
@@ -32,7 +33,8 @@ pub use encode::{
     ExtraLayerStats, ExtraOutcome, encode, encode_extra,
 };
 pub use gfs_common::{StreamId, StreamIdError};
-pub use push::{DeltaPolicy, PushError, push_ref, push_refs};
+pub use probe::{ProbeError, ProbeReport, probe};
+pub use push::{DeltaPolicy, PushError, PushWire, push_ref, push_refs};
 pub use select::{
     SelectError, SelectStats, Selection, select_extra_paths, select_extra_paths_measured,
     select_extra_paths_with,
@@ -84,6 +86,8 @@ pub struct CodeLayer {
     /// Sizes of the index→worktree delta this sync encoded.
     #[serde(flatten)]
     pub stats: CodeLayerStats,
+    /// What the push cost on the wire, protocol overhead separated from payload.
+    pub wire: PushWire,
     /// The synthetic commit that was pushed.
     pub commit: String,
     /// The tree that commit holds.
@@ -101,6 +105,8 @@ pub struct ExtraLayer {
     /// Sizes of the full force-included set this sync encoded.
     #[serde(flatten)]
     pub stats: ExtraLayerStats,
+    /// What the push cost on the wire, protocol overhead separated from payload.
+    pub wire: PushWire,
     /// The synthetic commit that was pushed.
     pub commit: String,
     /// The tree that commit holds.
@@ -169,14 +175,15 @@ pub async fn sync(
     // predictable whole-object send. Retain each chain's tip right after its own
     // push succeeds, so a `code` success survives a later `extra` failure.
     let t = Instant::now();
-    push::push_refs(&repo_dir, &remote, &[&code.code_ref], DeltaPolicy::Thin).await?;
+    let code_wire =
+        push::push_refs(&repo_dir, &remote, &[&code.code_ref], DeltaPolicy::Thin).await?;
     let code_push_ms = elapsed_ms(t);
     let t = Instant::now();
     push::retain_pushed_tip(&repo_dir, &gfs_common::sent_ref(&stream), code.commit)?;
     let mut retain_ms = elapsed_ms(t);
 
     let t = Instant::now();
-    push::push_refs(
+    let extra_wire = push::push_refs(
         &repo_dir,
         &remote,
         &[&extra.extra_ref],
@@ -205,6 +212,7 @@ pub async fn sync(
             encode_ms: code_encode_ms,
             push_ms: code_push_ms,
             stats: code.stats,
+            wire: code_wire,
             commit: code.commit.to_string(),
             tree: code.tree.to_string(),
         },
@@ -212,6 +220,7 @@ pub async fn sync(
             encode_ms: extra_encode_ms,
             push_ms: extra_push_ms,
             stats: extra.stats,
+            wire: extra_wire,
             commit: extra.commit.to_string(),
             tree: extra.tree.to_string(),
         },
