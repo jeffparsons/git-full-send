@@ -250,6 +250,29 @@ fn code_layer_stats_count_the_working_tree_delta() {
         ("edited!".len() + "fresh".len()) as u64,
         "summed bytes of the overlaid files only",
     );
+
+    // The delta is also reported against the scale it came out of, so a slow
+    // encode can be attributed to the index's size or to the delta's (ADR-0017).
+    assert_eq!(
+        outcome.stats.index_entries, 3,
+        "the three committed files are the index base",
+    );
+    assert_eq!(
+        outcome.stats.status_items, 3,
+        "modify + delete + added were what the status pass yielded; \
+         `unchanged.txt` never came up",
+    );
+    // Phases add up to no more than the whole, and hashing is attributed to the
+    // files that were actually read.
+    let phases = &outcome.stats.encode_phases;
+    assert!(
+        phases.hash_ms > 0.0,
+        "two files were read and hashed: {phases:?}",
+    );
+    assert!(
+        phases.status_ms >= 0.0 && phases.load_index_ms >= 0.0,
+        "the status pass's own cost excludes the hashing it triggered: {phases:?}",
+    );
     // The tree/commit ids the record carries match the written ref.
     assert_eq!(
         git(

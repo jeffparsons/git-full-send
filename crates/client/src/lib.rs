@@ -28,11 +28,15 @@ fn elapsed_ms(start: Instant) -> f64 {
 }
 
 pub use encode::{
-    CodeLayerStats, EncodeError, EncodeOutcome, ExtraLayerStats, ExtraOutcome, encode, encode_extra,
+    CodeEncodePhases, CodeLayerStats, EncodeError, EncodeOutcome, ExtraEncodePhases,
+    ExtraLayerStats, ExtraOutcome, encode, encode_extra,
 };
 pub use gfs_common::{StreamId, StreamIdError};
 pub use push::{DeltaPolicy, PushError, push_ref, push_refs};
-pub use select::{SelectError, select_extra_paths, select_extra_paths_with};
+pub use select::{
+    SelectError, SelectStats, Selection, select_extra_paths, select_extra_paths_measured,
+    select_extra_paths_with,
+};
 pub use stream::StreamResolveError;
 
 /// The record of one completed `sync` — the single value that is written to the

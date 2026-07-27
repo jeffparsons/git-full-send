@@ -14,8 +14,8 @@ gix-validate.workspace = true
 # sink (issue #42, ADR-0013); `tracing` carries the warning when a write fails.
 serde = { workspace = true }
 serde_json.workspace = true
+# Per-invocation temp files receive a `git` child's trace2 event stream, which
+# decomposes a phase timing from the inside (ADR-0017).
+tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

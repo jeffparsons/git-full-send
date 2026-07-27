@@ -11,6 +11,7 @@ use bstr::ByteSlice;
 use thiserror::Error;
 
 pub mod metrics;
+pub mod trace2;
 
 /// Ref namespace that `git-full-send` confines its synced refs to.
 ///

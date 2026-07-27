@@ -64,12 +64,44 @@ pub struct EncodeOutcome {
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 #[non_exhaustive]
 pub struct CodeLayerStats {
-    /// Files added or modified (overlaid from disk over the index base).
+    /// Files added or modified (overlaid from disk over the index base) — the
+    /// files this encode actually had to **read and hash**.
     pub files_overlaid: usize,
-    /// Total content bytes of the overlaid files.
+    /// Total content bytes of the overlaid files: the bytes hashed.
     pub bytes_overlaid: u64,
     /// Files removed from the worktree since the index base.
     pub files_removed: usize,
+    /// Entries in the index the encode seeded its tree from — the paths the
+    /// status pass has to consider, and so the scale the phase is measured
+    /// against. Files *hashed* is `files_overlaid`; this is the population that
+    /// number came out of.
+    pub index_entries: usize,
+    /// Items the status pass yielded: changed, removed, and untracked paths. It
+    /// is the size of the working-tree delta, before we decide what to do with
+    /// each one.
+    pub status_items: usize,
+    /// Where the encode's time went.
+    pub encode_phases: CodeEncodePhases,
+}
+
+/// The phases of one [`encode`], in milliseconds (ADR-0017).
+///
+/// `encode_ms` on its own cannot distinguish "the index is enormous" from "the
+/// working-tree delta is enormous" — these can.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct CodeEncodePhases {
+    /// Opening the index and seeding the tree editor from its entries. No
+    /// hashing and no worktree I/O — pure index size.
+    pub load_index_ms: f64,
+    /// The index→worktree status pass, excluding the hashing it triggered.
+    pub status_ms: f64,
+    /// Reading and hashing the changed/untracked files the status pass found.
+    pub hash_ms: f64,
+    /// Writing the assembled tree objects.
+    pub write_tree_ms: f64,
+    /// Writing the synthetic commit and moving the `code` ref.
+    pub commit_ms: f64,
 }
 
 /// The result of a successful [`encode_extra`].
@@ -99,6 +131,28 @@ pub struct ExtraLayerStats {
     pub files: usize,
     /// Total content bytes of those files.
     pub bytes: u64,
+    /// What the selection walk cost to find them (ADR-0007's prune, measured).
+    pub select: crate::select::SelectStats,
+    /// Where the encode's time went.
+    pub encode_phases: ExtraEncodePhases,
+}
+
+/// The phases of one [`encode_extra`], in milliseconds (ADR-0017).
+///
+/// The split that matters here is walk-versus-hash: an `extra` encode that spends
+/// its time *looking* for files is an include-pattern problem, while one that
+/// spends it hashing is simply a large force-included set.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[non_exhaustive]
+pub struct ExtraEncodePhases {
+    /// Walking the working tree to select the force-included set.
+    pub select_ms: f64,
+    /// Reading and hashing the selected files.
+    pub hash_ms: f64,
+    /// Writing the assembled tree objects.
+    pub write_tree_ms: f64,
+    /// Writing the synthetic commit and moving the `extra` ref.
+    pub commit_ms: f64,
 }
 
 /// Errors returned by [`encode`].
@@ -187,6 +241,11 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
     // hashing, no worktree I/O. The index snapshot is never written back.
     // `index_or_empty` so a fresh repo with no index file yet (unborn HEAD,
     // nothing ever staged) is treated as an empty base rather than an error.
+    // Accumulate the code layer's delta size and per-phase cost as we go
+    // (issue #42, ADR-0017).
+    let mut stats = CodeLayerStats::default();
+    let t_phase = std::time::Instant::now();
+
     let index = repo
         .index_or_empty()
         .map_err(|e| EncodeError::OpenIndex(Box::new(e)))?;
@@ -194,6 +253,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
     let mut editor = repo
         .edit_tree(empty_tree)
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
+    stats.index_entries = index.entries().len();
     for entry in index.entries() {
         // Skip conflict (non-zero stage) entries; the status pass below reports
         // conflicted paths and we take their on-disk content there instead.
@@ -208,8 +268,8 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
             .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
     }
 
-    // Accumulate the code layer's delta size as we overlay (issue #42).
-    let mut stats = CodeLayerStats::default();
+    stats.encode_phases.load_index_ms = crate::elapsed_ms(t_phase);
+    let t_phase = std::time::Instant::now();
 
     // Overlay the index → worktree delta in a single status pass. Rename
     // tracking is off, untracked files are emitted individually, and ignored
@@ -227,6 +287,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
         use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 
         let item = item.map_err(|e| EncodeError::Status(Box::new(e)))?;
+        stats.status_items += 1;
         match item {
             Item::Modification {
                 rela_path, status, ..
@@ -247,8 +308,10 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
                 | EntryStatus::Change(Change::Type { .. })
                 | EntryStatus::IntentToAdd
                 | EntryStatus::Conflict { .. } => {
+                    let t_hash = std::time::Instant::now();
                     let bytes =
                         overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
+                    stats.encode_phases.hash_ms += crate::elapsed_ms(t_hash);
                     stats.files_overlaid += 1;
                     stats.bytes_overlaid += bytes;
                 }
@@ -261,8 +324,10 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
                 if let Some(gix::dir::entry::Kind::File | gix::dir::entry::Kind::Symlink) =
                     entry.disk_kind
                 {
+                    let t_hash = std::time::Instant::now();
                     let bytes =
                         overlay_from_disk(&repo, &mut editor, &workdir, entry.rela_path.as_bstr())?;
+                    stats.encode_phases.hash_ms += crate::elapsed_ms(t_hash);
                     stats.files_overlaid += 1;
                     stats.bytes_overlaid += bytes;
                 }
@@ -273,10 +338,18 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
         }
     }
 
+    // The status pass's own cost is what it took *less* the hashing it triggered,
+    // so a slow encode points at either the walk or the files, not both at once.
+    stats.encode_phases.status_ms =
+        (crate::elapsed_ms(t_phase) - stats.encode_phases.hash_ms).max(0.0);
+    let t_phase = std::time::Instant::now();
+
     let tree_id = editor
         .write()
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?
         .detach();
+    stats.encode_phases.write_tree_ms = crate::elapsed_ms(t_phase);
+    let t_phase = std::time::Instant::now();
 
     let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_MESSAGE)?;
 
@@ -287,6 +360,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
         commit_id,
         "git-full-send: encode code state",
     )?;
+    stats.encode_phases.commit_ms = crate::elapsed_ms(t_phase);
 
     Ok(EncodeOutcome {
         commit: commit_id,
@@ -347,23 +421,37 @@ pub fn encode_extra(
     };
 
     // Build the `extra` tree from the selected paths, seeded from the empty tree.
-    let paths = crate::select::select_extra_paths_with(&workdir, user_include)?;
+    // The walk reports what it cost as well as what it found (ADR-0017).
+    let t_phase = std::time::Instant::now();
+    let selection = crate::select::select_extra_paths_measured(&workdir, user_include)?;
+    let mut stats = ExtraLayerStats {
+        files: selection.paths.len(),
+        bytes: 0,
+        select: selection.stats,
+        encode_phases: ExtraEncodePhases {
+            select_ms: crate::elapsed_ms(t_phase),
+            ..ExtraEncodePhases::default()
+        },
+    };
+
     let empty_tree = repo.empty_tree().id;
     let mut editor = repo
         .edit_tree(empty_tree)
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?;
-    let mut stats = ExtraLayerStats {
-        files: paths.len(),
-        bytes: 0,
-    };
-    for rela_path in &paths {
+    let t_phase = std::time::Instant::now();
+    for rela_path in &selection.paths {
         stats.bytes += overlay_from_disk(&repo, &mut editor, &workdir, rela_path.as_bstr())?;
     }
+    stats.encode_phases.hash_ms = crate::elapsed_ms(t_phase);
+
+    let t_phase = std::time::Instant::now();
     let tree_id = editor
         .write()
         .map_err(|e| EncodeError::BuildTree(Box::new(e)))?
         .detach();
+    stats.encode_phases.write_tree_ms = crate::elapsed_ms(t_phase);
 
+    let t_phase = std::time::Instant::now();
     let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_EXTRA_MESSAGE)?;
 
     let extra_ref = gfs_common::extra_ref(stream);
@@ -373,6 +461,7 @@ pub fn encode_extra(
         commit_id,
         "git-full-send: encode extra state",
     )?;
+    stats.encode_phases.commit_ms = crate::elapsed_ms(t_phase);
 
     Ok(ExtraOutcome {
         commit: commit_id,

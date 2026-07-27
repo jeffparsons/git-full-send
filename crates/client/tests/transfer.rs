@@ -369,6 +369,144 @@ async fn second_sync_advances_the_server() {
     );
 }
 
+/// A checkout explains its own cost (issue #75, ADR-0017): the first run finds a
+/// cold index and real work to do, the second finds a warm index and *nothing* to
+/// do — which is what makes a large `read_tree_ms` on a no-op visibly unexplained
+/// by work done, rather than a mystery to be timed by hand.
+#[tokio::test]
+async fn update_worktree_reports_what_made_it_expensive() {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    for i in 0..8 {
+        write_file(c, &format!("src/f{i}.txt"), "v1");
+    }
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(stream.clone()),
+        None,
+    )
+    .await
+    .expect("sync succeeds");
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    let wt = worktree.path();
+    // Untracked junk for `clean` to sweep, so its count is exercised too.
+    write_file(wt, "junk.txt", "junk");
+
+    let update = |measure_worktree: bool| {
+        let repo = server.path().to_path_buf();
+        let wt = wt.to_path_buf();
+        let stream = stream.clone();
+        async move {
+            gfs_server::update_worktree(
+                repo,
+                wt,
+                stream,
+                gfs_server::UpdateOptions {
+                    lock: gfs_server::LockMode::default(),
+                    measure_worktree,
+                },
+            )
+            .await
+            .expect("update-worktree succeeds")
+        }
+    };
+
+    // --- First run: nothing checked out here before.
+    let first = update(false).await;
+    assert_eq!(
+        first.index.state, "cold",
+        "the first checkout had no index to load",
+    );
+    assert!(
+        !first.changed.tree_unchanged,
+        "no previous checkout to be unchanged from",
+    );
+    let vs_index = first.changed.vs_index.expect("changed paths were counted");
+    assert_eq!(
+        vs_index.to_write, 8,
+        "every file in the tree had to be written: {vs_index:?}",
+    );
+    assert_eq!(first.clean.removed, 1, "the untracked junk was swept");
+    assert!(
+        first.worktree_files.is_none(),
+        "the expensive walk stays opt-in",
+    );
+
+    // --- Second run: identical tree, index now warm. A visible no-op.
+    let second = update(true).await;
+    assert_eq!(
+        second.index.state, "warm",
+        "the second checkout loaded the index the first wrote",
+    );
+    assert!(
+        second.changed.tree_unchanged,
+        "the same tree was checked out again",
+    );
+    assert!(
+        second
+            .changed
+            .vs_index
+            .expect("changed paths were counted")
+            .is_empty(),
+        "a no-op checkout writes and removes nothing: {:?}",
+        second.changed.vs_index,
+    );
+    assert_eq!(
+        second.clean.removed, 0,
+        "nothing left for clean to sweep on a no-op",
+    );
+    // The opt-in measurements arrive only when asked for.
+    assert!(
+        second
+            .changed
+            .vs_worktree
+            .expect("--measure-worktree compares against disk")
+            .is_empty(),
+        "the worktree already matches the tree",
+    );
+    assert_eq!(
+        second.worktree_files,
+        Some(8),
+        "and the worktree holds exactly the tree's files",
+    );
+
+    // The index's size is known both runs; its entry count comes from git's own
+    // instrumentation, which we treat as best-effort (ADR-0017) — so assert it
+    // only when it was reported.
+    assert!(second.index.bytes.is_some(), "the warm index was measured");
+    if let Some(entries) = second.index.entries {
+        assert_eq!(entries, 8, "one index entry per file");
+    }
+    // Likewise the read-tree split: present with a usable trace2, absent without.
+    if let Some(read_tree) = &second.read_tree {
+        let sum = [
+            read_tree.load_index_ms,
+            read_tree.resolve_tree_ms,
+            read_tree.apply_ms,
+            read_tree.write_index_ms,
+        ]
+        .into_iter()
+        .flatten()
+        .sum::<f64>();
+        assert!(
+            sum <= second.read_tree_ms + 1.0,
+            "the parts fit inside the whole: {sum} vs {}",
+            second.read_tree_ms,
+        );
+    }
+    // Measuring costs something, and says so rather than hiding inside the phase
+    // it explains.
+    assert!(second.measure_ms > 0.0, "the measurement timed itself");
+}
+
 #[tokio::test]
 async fn update_worktree_makes_worktree_match_code() {
     let server = init_bare_repo();
