@@ -35,14 +35,19 @@ The server binds **localhost only**; connectivity from the client is via a
 On the remote workstation, start the receiver against a target Git repo:
 
 ```sh
-git-full-send listen --repo /path/to/target-repo   # binds 127.0.0.1:9419
+head -c 32 /dev/urandom | base64 > ~/.config/git-full-send/token   # a shared secret
+chmod 600 ~/.config/git-full-send/token
+git-full-send listen --repo /path/to/target-repo \
+    --token-file ~/.config/git-full-send/token     # binds 127.0.0.1:9419
 ```
 
-From your laptop, open an SSH tunnel to the remote's listen port, then sync:
+Copy that token to your laptop, open an SSH tunnel to the remote's listen port,
+then sync:
 
 ```sh
 ssh -N -L 9419:localhost:9419 you@workstation &     # leave running
-git-full-send sync --repo . --remote 127.0.0.1:9419 --stream-id my-laptop
+git-full-send sync --repo . --remote 127.0.0.1:9419 --stream-id my-laptop \
+    --token-file ~/.config/git-full-send/token
 ```
 
 Back on the remote, check the synced state out into a disposable worktree:
@@ -61,9 +66,13 @@ patterns), and [`docs/adr/`](docs/adr/) for the architecture decisions.
 
 ## Status
 
-MVP. The transport has no built-in authentication or encryption — it leans
-entirely on the SSH tunnel for confidentiality and access control
-([ADR-0006](docs/adr/0006-transport-and-connectivity.md)).
+MVP. The transport has no built-in encryption — it leans entirely on the SSH
+tunnel for confidentiality ([ADR-0006](docs/adr/0006-transport-and-connectivity.md)).
+Pushes are authenticated with a shared secret, because reaching the receiver's
+port should not be the same thing as being allowed to push code it will run
+([ADR-0019](docs/adr/0019-authenticating-the-receive-pack-connection.md)); the
+receiver refuses to start until you either configure one or say
+`--allow-anonymous` out loud.
 
 ## AI use
 

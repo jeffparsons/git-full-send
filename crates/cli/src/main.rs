@@ -91,6 +91,11 @@ struct SyncArgs {
     /// project file (`.git-full-send-include`) is always consulted as well.
     #[arg(long, value_name = "PATH")]
     user_include: Option<PathBuf>,
+    /// File holding the shared secret the server requires (ADR-0019). Defaults to
+    /// `GIT_FULL_SEND_TOKEN` if set; with neither, nothing is presented — which
+    /// only a `listen --allow-anonymous` server will accept.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
     /// Print the operation's record as one JSON object on stdout instead of the
     /// human summary — the same record appended to the metrics sink (ADR-0017).
     #[arg(long)]
@@ -102,6 +107,11 @@ struct ProbeArgs {
     /// Server endpoint to check (typically a tunnelled localhost port).
     #[arg(long, value_name = "HOST:PORT")]
     remote: String,
+    /// File holding the shared secret the server requires (ADR-0019). Defaults to
+    /// `GIT_FULL_SEND_TOKEN` if set. A probe is a connection like any other, so an
+    /// authenticated server refuses one that presents nothing.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
     /// Print the probe's record as one JSON object on stdout instead of the
     /// human summary.
     #[arg(long)]
@@ -113,6 +123,17 @@ struct ListenArgs {
     /// Path to the target Git repository that receives synced refs.
     #[arg(long, value_name = "PATH")]
     repo: PathBuf,
+    /// File holding the shared secret every push must present (ADR-0019).
+    /// Defaults to `GIT_FULL_SEND_TOKEN` if set. Required unless
+    /// `--allow-anonymous` is given.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
+    /// Accept unauthenticated pushes: anything that can reach the port may push
+    /// code this machine will check out and run. The behaviour before ADR-0019,
+    /// kept for setups where the port genuinely cannot be reached by anything
+    /// else — and a flag rather than a default so that choosing it is deliberate.
+    #[arg(long, conflicts_with = "token_file")]
+    allow_anonymous: bool,
     /// Address to bind. Localhost only by default (ADR-0006).
     #[arg(long, value_name = "IP:PORT", default_value = gfs_common::DEFAULT_LISTEN_ADDR)]
     addr: SocketAddr,
@@ -217,8 +238,10 @@ async fn main() -> Result<()> {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
+            let auth = gfs_common::auth::Token::resolve(args.token_file.as_deref())?;
             let summary =
-                gfs_client::sync(repo, args.remote, args.stream_id, args.user_include).await?;
+                gfs_client::sync(repo, args.remote, args.stream_id, args.user_include, auth)
+                    .await?;
             if args.json {
                 print_json(&summary);
             } else {
@@ -229,7 +252,8 @@ async fn main() -> Result<()> {
             // Blocking, and deliberately so: a probe is one short exchange, and
             // it must work identically whether an orchestrator runs it standalone
             // or a script pipes it into `jq`.
-            let report = gfs_client::probe(&args.remote)?;
+            let auth = gfs_common::auth::Token::resolve(args.token_file.as_deref())?;
+            let report = gfs_client::probe(&args.remote, auth.as_ref())?;
             if args.json {
                 print_json(&report);
             } else {
@@ -240,6 +264,11 @@ async fn main() -> Result<()> {
             let config = gfs_server::ListenConfig {
                 max_connections: args.max_connections,
                 connection_timeout: std::time::Duration::from_secs(args.connection_timeout),
+                auth: std::sync::Arc::new(listen_auth(
+                    args.token_file.as_deref(),
+                    args.allow_anonymous,
+                )?),
+                ..Default::default()
             };
             gfs_server::listen(args.addr, args.repo, config).await?
         }
@@ -321,6 +350,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Decide who `listen` will accept a push from, refusing to decide by default
+/// (ADR-0019).
+///
+/// The receiver checks out what it is given and its tooling then *runs* those
+/// files, so an operator who never thought about authentication must not end up
+/// accepting anonymous pushes by omission. Hence: a token, or `--allow-anonymous`,
+/// or an error that names both.
+///
+/// Resolved here rather than by a clap arg group so the message can say what to do
+/// about it — and because the token may equally arrive in the environment, which
+/// clap cannot see from the flag's own definition.
+fn listen_auth(
+    token_file: Option<&std::path::Path>,
+    allow_anonymous: bool,
+) -> Result<gfs_server::Auth> {
+    // `--allow-anonymous` conflicts with `--token-file` in clap, but not with the
+    // environment variable — and an explicit flag beats an ambient one.
+    if allow_anonymous {
+        return Ok(gfs_server::Auth::Anonymous);
+    }
+    match gfs_common::auth::Token::resolve(token_file)? {
+        Some(token) => Ok(gfs_server::Auth::Token(token)),
+        None => anyhow::bail!(
+            "`listen` needs to know who may push: pass `--token-file <PATH>` (or set \
+             `{}`) so pushes must present a shared secret, or `--allow-anonymous` to \
+             accept unauthenticated pushes from anything that can reach the port. \
+             See ADR-0019.",
+            gfs_common::auth::TOKEN_ENV,
+        ),
+    }
 }
 
 /// Check the repo's force-include patterns for unanchored ones, which disable

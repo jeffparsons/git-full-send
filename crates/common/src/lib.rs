@@ -10,6 +10,7 @@
 use bstr::ByteSlice;
 use thiserror::Error;
 
+pub mod auth;
 pub mod metrics;
 pub mod pktline;
 pub mod trace2;
@@ -169,6 +170,17 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 16;
 /// stuck client can't pin a concurrency slot indefinitely. Overridable via the
 /// `listen --connection-timeout` flag.
 pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 300;
+
+/// How long the server waits for a client's authentication preamble, in seconds
+/// (ADR-0019).
+///
+/// Much shorter than [`DEFAULT_CONNECTION_TIMEOUT_SECS`], and for a different
+/// job: the preamble is the first thing an authenticating client writes, so
+/// anything slower than this is a client that will never send one — most often
+/// one with no token configured, waiting for a ref advertisement that is not
+/// coming. Reaching the deadline is what lets the server answer it with a
+/// diagnosis ([`auth::AuthOutcome::Absent`]) rather than leaving it to hang.
+pub const DEFAULT_AUTH_TIMEOUT_SECS: u64 = 10;
 
 /// Errors shared across the client and server boundaries.
 ///

@@ -1,6 +1,10 @@
 # ADR-0006 — Transport & connectivity
 
-- Status: accepted
+- Status: accepted; amended by
+  [ADR-0019](0019-authenticating-the-receive-pack-connection.md) — the receiver
+  now authenticates pushes with a shared secret, so the third Decision bullet
+  ("we do not build our own transport security or authentication") no longer
+  holds for authentication; the tunnel remains the whole of confidentiality
 - Date: 2026-06-12
 
 ## Context

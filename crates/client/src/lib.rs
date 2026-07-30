@@ -32,6 +32,7 @@ pub use encode::{
     CodeEncodePhases, CodeLayerStats, EncodeError, EncodeOutcome, ExtraEncodePhases,
     ExtraLayerStats, ExtraOutcome, encode, encode_extra,
 };
+pub use gfs_common::auth::{AuthError, Token};
 pub use gfs_common::{StreamId, StreamIdError};
 pub use probe::{ProbeError, ProbeReport, probe};
 pub use push::{DeltaPolicy, PushError, PushWire, push_ref, push_refs};
@@ -148,12 +149,16 @@ pub enum ClientError {
 /// the repo's configured `git-full-send.stream-id`, generating and persisting
 /// one on first use. `user_include` overrides the per-user force-include pattern
 /// file (the `--user-include` flag); `None` resolves it from the environment
-/// (`GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` / `$HOME`) as usual.
+/// (`GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` / `$HOME`) as usual. `auth`
+/// is the shared secret the server may require (ADR-0019), presented by both
+/// pushes; `None` presents nothing, which is what an `--allow-anonymous` server
+/// expects.
 pub async fn sync(
     repo_dir: PathBuf,
     remote: String,
     stream: Option<StreamId>,
     user_include: Option<PathBuf>,
+    auth: Option<Token>,
 ) -> Result<SyncSummary, ClientError> {
     let stream = stream::resolve_stream(&repo_dir, stream)?;
 
@@ -175,8 +180,14 @@ pub async fn sync(
     // predictable whole-object send. Retain each chain's tip right after its own
     // push succeeds, so a `code` success survives a later `extra` failure.
     let t = Instant::now();
-    let code_wire =
-        push::push_refs(&repo_dir, &remote, &[&code.code_ref], DeltaPolicy::Thin).await?;
+    let code_wire = push::push_refs(
+        &repo_dir,
+        &remote,
+        &[&code.code_ref],
+        DeltaPolicy::Thin,
+        auth.as_ref(),
+    )
+    .await?;
     let code_push_ms = elapsed_ms(t);
     let t = Instant::now();
     push::retain_pushed_tip(&repo_dir, &gfs_common::sent_ref(&stream), code.commit)?;
@@ -188,6 +199,7 @@ pub async fn sync(
         &remote,
         &[&extra.extra_ref],
         DeltaPolicy::WholeObject,
+        auth.as_ref(),
     )
     .await?;
     let extra_push_ms = elapsed_ms(t);

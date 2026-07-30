@@ -1,6 +1,9 @@
 # ADR-0018 — Liveness and repo-health surfaces
 
-- Status: accepted
+- Status: accepted; extended by
+  [ADR-0019](0019-authenticating-the-receive-pack-connection.md) — the outcome
+  table gains an `unauthenticated` row (`warn`), for a connection refused before
+  `receive-pack` was spawned
 - Date: 2026-07-27
 - Relates to: [ADR-0017](0017-making-operation-cost-self-explaining.md)
 

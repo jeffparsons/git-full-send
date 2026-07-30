@@ -279,7 +279,7 @@ fn commit_artifact(repo: &Path, contents: &[u8]) {
 
 /// Seed the delta base: push `ref_name` and discard the byte count.
 async fn establish_push(client: &Path, addr: SocketAddr, ref_name: &str, policy: DeltaPolicy) {
-    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy)
+    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
         .await
         .expect("establish push succeeds");
 }
@@ -298,7 +298,7 @@ async fn measure_push(
     policy: DeltaPolicy,
 ) -> ReceiveStat {
     let prior = matching_receive_records(server_repo, ref_name).len();
-    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy)
+    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
         .await
         .expect("measured push succeeds");
 

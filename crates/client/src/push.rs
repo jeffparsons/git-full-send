@@ -14,6 +14,12 @@
 //! `-c protocol.fd.allow=always`. The delta policy on the wire is chosen per chain
 //! (see below).
 //!
+//! When the server requires a shared secret (ADR-0019) we write the
+//! authentication preamble onto the socket ourselves, before `git` is spawned —
+//! `receive-pack` is server-speaks-first, so there is a gap before the ref
+//! advertisement in which to do it, and the server verifies it before spawning
+//! its own child.
+//!
 //! The socket is passed on dedicated file descriptors, **not** as the child's
 //! stdin/stdout: `git push` uses its own stdin/stdout, and pointing the
 //! transport at fd 0/1 wedges it before the protocol even starts. We reserve two
@@ -82,6 +88,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
+use gfs_common::auth::Token;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -162,8 +169,9 @@ pub async fn push_ref(
     remote: &str,
     ref_name: &str,
     policy: DeltaPolicy,
+    auth: Option<&Token>,
 ) -> Result<PushWire, PushError> {
-    push_refs(repo_dir, remote, &[ref_name], policy).await
+    push_refs(repo_dir, remote, &[ref_name], policy, auth).await
 }
 
 /// Push `ref_names` from the repository at `repo_dir` to `remote` (`HOST:PORT`)
@@ -174,11 +182,15 @@ pub async fn push_ref(
 /// can carry its own [`DeltaPolicy`] (ADR-0005), pinning each chain's delta base
 /// with [`retain_pushed_tip`] after its push succeeds. On success every ref (and
 /// its objects) is on the server.
+///
+/// `auth` is the shared secret the server may require (ADR-0019); `None` presents
+/// nothing, which is what an `--allow-anonymous` server expects.
 pub async fn push_refs(
     repo_dir: &Path,
     remote: &str,
     ref_names: &[&str],
     policy: DeltaPolicy,
+    auth: Option<&Token>,
 ) -> Result<PushWire, PushError> {
     let repo = gix::discover(repo_dir).map_err(|source| PushError::OpenRepo {
         path: repo_dir.to_path_buf(),
@@ -188,10 +200,25 @@ pub async fn push_refs(
         .workdir()
         .ok_or_else(|| PushError::NoWorktree(repo_dir.to_path_buf()))?;
 
-    let sock = TcpStream::connect(remote).map_err(|source| PushError::Connect {
+    let mut sock = TcpStream::connect(remote).map_err(|source| PushError::Connect {
         remote: remote.to_string(),
         source,
     })?;
+
+    // Authenticate before `git` says anything (ADR-0019). `receive-pack` is
+    // server-speaks-first, so the preamble goes out the moment the connection is
+    // up and the server verifies it before spawning the child — no round trip
+    // beyond the one the connect already paid. It is written straight to the
+    // socket rather than through the interposer below: these are our bytes, not
+    // `git`'s, and counting them would make `PushWire` mean something different
+    // depending on whether a token was configured.
+    if let Some(token) = auth {
+        use std::io::Write;
+
+        sock.write_all(&gfs_common::auth::auth_pkt(token))
+            .and_then(|()| sock.flush())
+            .map_err(PushError::Io)?;
+    }
 
     // Interpose a socketpair between `git` and the socket so both directions can
     // be counted and split (ADR-0017). `git` gets dups of `theirs`; the pumps
