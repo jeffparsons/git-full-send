@@ -20,6 +20,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use gfs_common::auth::Token;
 use thiserror::Error;
 
 /// A flush-pkt: the whole of what a probe sends.
@@ -55,6 +56,15 @@ pub enum ProbeError {
         /// The endpoint we were talking to.
         remote: String,
     },
+    /// The server refused the connection outright, in its own words (ADR-0019) —
+    /// in practice, a server that requires a shared secret we did not present.
+    #[error("`{remote}` refused the connection: {message}")]
+    Refused {
+        /// The endpoint we were talking to.
+        remote: String,
+        /// The server's `ERR` message, verbatim.
+        message: String,
+    },
 }
 
 /// What a [`probe`] found: the server is up, and this is what every connection
@@ -86,7 +96,12 @@ pub struct ProbeReport {
 /// Completes a real receive-pack exchange that updates nothing (see the [module
 /// docs](self)), so the server records it as a clean no-op rather than a failed
 /// push.
-pub fn probe(remote: &str) -> Result<ProbeReport, ProbeError> {
+///
+/// `auth` is the shared secret the server may require (ADR-0019). A probe is a
+/// connection like any other, so an authenticated server refuses one that
+/// presents nothing — and that refusal arrives as [`ProbeError::Refused`],
+/// carrying the server's own message, rather than as a bare failure to answer.
+pub fn probe(remote: &str, auth: Option<&Token>) -> Result<ProbeReport, ProbeError> {
     let started = Instant::now();
     let mut sock = TcpStream::connect(remote).map_err(|source| ProbeError::Connect {
         remote: remote.to_string(),
@@ -96,10 +111,30 @@ pub fn probe(remote: &str) -> Result<ProbeReport, ProbeError> {
     let _ = sock.set_read_timeout(Some(DEFAULT_TIMEOUT));
     let _ = sock.set_write_timeout(Some(DEFAULT_TIMEOUT));
 
+    // Authenticate first, exactly as a push does (ADR-0019): the server verifies
+    // the preamble before spawning the `receive-pack` whose advertisement we are
+    // about to measure.
+    if let Some(token) = auth {
+        sock.write_all(&gfs_common::auth::auth_pkt(token))
+            .and_then(|()| sock.flush())
+            .map_err(|source| ProbeError::Exchange {
+                remote: remote.to_string(),
+                source,
+            })?;
+    }
+
     let advertisement = read_advertisement(&mut sock).map_err(|source| ProbeError::Exchange {
         remote: remote.to_string(),
         source,
     })?;
+    // A refusal is an answer, and a much more useful one than "not a ref
+    // advertisement" — it says what to fix.
+    if let Some(message) = advertisement.error {
+        return Err(ProbeError::Refused {
+            remote: remote.to_string(),
+            message,
+        });
+    }
     if advertisement.refs.is_empty() && advertisement.bytes == 0 {
         return Err(ProbeError::NotReceivePack {
             remote: remote.to_string(),
@@ -140,13 +175,19 @@ struct Advertisement {
     bytes: u64,
     /// The ref names in it, excluding git's `capabilities^{}` placeholder.
     refs: Vec<String>,
+    /// The server's `ERR` message, when it sent one of those instead — the
+    /// protocol's way of refusing before it advertises anything (ADR-0019).
+    error: Option<String>,
 }
 
 /// Read pkt-lines until the flush-pkt that ends the ref advertisement.
 ///
 /// Parsed here rather than counted with [`gfs_common::pktline`] because a probe
 /// wants the ref *names* too — enough to tell `git-full-send`'s own refs from the
-/// repository's, and to drop git's placeholder line for a repo with no refs.
+/// repository's, to drop git's placeholder line for a repo with no refs, and to
+/// notice an `ERR` line where the advertisement should have been (what `git` does
+/// with `PACKET_READ_DIE_ON_ERR_PACKET`, and for the same reason: without it a
+/// refusal reads as a repository with one oddly-named ref).
 fn read_advertisement(sock: &mut TcpStream) -> std::io::Result<Advertisement> {
     let mut bytes = 0u64;
     let mut refs = Vec::new();
@@ -167,6 +208,7 @@ fn read_advertisement(sock: &mut TcpStream) -> std::io::Result<Advertisement> {
             return Ok(Advertisement {
                 bytes,
                 refs: Vec::new(),
+                error: None,
             });
         };
         // The flush-pkt ends the advertisement.
@@ -179,11 +221,28 @@ fn read_advertisement(sock: &mut TcpStream) -> std::io::Result<Advertisement> {
         let mut payload = vec![0u8; len - 4];
         sock.read_exact(&mut payload)?;
         bytes += payload.len() as u64;
+        if let Some(message) = err_message(&payload) {
+            return Ok(Advertisement {
+                bytes,
+                refs,
+                error: Some(message),
+            });
+        }
         if let Some(name) = ref_name(&payload) {
             refs.push(name);
         }
     }
-    Ok(Advertisement { bytes, refs })
+    Ok(Advertisement {
+        bytes,
+        refs,
+        error: None,
+    })
+}
+
+/// The message of an `ERR <message>` pkt-line, or `None` for any other line.
+fn err_message(payload: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(payload);
+    Some(text.strip_prefix("ERR ")?.trim().to_string())
 }
 
 /// The ref name in an advertisement line (`<oid> <name>\0<capabilities>`), or
@@ -218,5 +277,17 @@ mod tests {
             ref_name(b"0000000000000000000000000000000000000000 capabilities^{}\0report-status"),
             None,
         );
+    }
+
+    /// A refusal must not be mistaken for a ref: `ref_name` would happily read
+    /// `git-full-send:` out of an `ERR` line and report a healthy server with one
+    /// ref (ADR-0019).
+    #[test]
+    fn an_err_line_is_a_refusal_not_a_ref() {
+        assert_eq!(
+            err_message(b"ERR git-full-send: authentication required\n"),
+            Some("git-full-send: authentication required".to_string()),
+        );
+        assert_eq!(err_message(b"1234567890abcdef refs/heads/main\n"), None);
     }
 }

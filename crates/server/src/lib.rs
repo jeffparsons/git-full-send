@@ -17,6 +17,13 @@
 //! post-receive gc cannot prune the delta bases a subsequent push needs
 //! (Research 0003).
 //!
+//! Before any of that, a connection must **authenticate** when the listener was
+//! given a shared secret ([`Auth`], ADR-0019): the client's preamble is read and
+//! verified before `receive-pack` is spawned, so a peer that cannot authenticate
+//! never reaches ref negotiation, let alone pack ingest. A listener may instead be
+//! configured [`Auth::Anonymous`], which is the pre-ADR-0019 behaviour and the
+//! reason the CLI makes an operator say so out loud.
+//!
 //! The accept loop is async (tokio) and bounded (issue #47): a
 //! [`Semaphore`]-gated cap means at most `max_connections` handlers run at once,
 //! so a burst can't exhaust threads — further connections wait for a slot. Each
@@ -181,11 +188,32 @@ impl Listener {
     }
 }
 
+/// Who a listener will accept a push from (ADR-0019).
+///
+/// There is no "unset" state on purpose. A receiver whose worktree is then
+/// *executed* should not be able to end up unauthenticated by omission, so the
+/// choice is a value that has to be constructed either way — and the CLI refuses
+/// to construct it implicitly, requiring `--token-file` or `--allow-anonymous`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Auth {
+    /// Every push must present this shared secret before `receive-pack` is
+    /// spawned.
+    Token(gfs_common::auth::Token),
+    /// Anything that can reach the port may push. The behaviour before ADR-0019,
+    /// kept for setups where the port genuinely cannot be reached by anything
+    /// else — and named so that choosing it is deliberate.
+    Anonymous,
+}
+
 /// Tunables for the [`listen`]/[`serve_async`] accept loop (issue #47).
 ///
 /// [`Default`] sources the `gfs_common::DEFAULT_*` constants; the CLI overrides
-/// them from `listen --max-connections` / `--connection-timeout`.
-#[derive(Debug, Clone, Copy)]
+/// them from `listen --max-connections` / `--connection-timeout`. Note that the
+/// default `auth` is [`Auth::Anonymous`] — a *library* default, chosen so a
+/// caller that has not thought about authentication behaves as it did before
+/// ADR-0019; the CLI makes an operator choose explicitly.
+#[derive(Debug, Clone)]
 pub struct ListenConfig {
     /// Maximum number of `git receive-pack` handlers in flight at once. Further
     /// accepted connections wait for a slot.
@@ -193,6 +221,15 @@ pub struct ListenConfig {
     /// Per-connection wall-clock budget; a handler that overruns it is aborted
     /// (its socket is shut down) so a stuck client can't pin a slot.
     pub connection_timeout: Duration,
+    /// Who may push (ADR-0019). Shared by every connection handler, hence the
+    /// [`Arc`].
+    pub auth: Arc<Auth>,
+    /// How long a connection has to present its authentication preamble, when one
+    /// is required. Deliberately *not* a CLI flag: an authenticating client sends
+    /// the preamble immediately, so the deadline only ever governs how quickly a
+    /// client that will never send one is told so
+    /// ([`gfs_common::DEFAULT_AUTH_TIMEOUT_SECS`]).
+    pub auth_timeout: Duration,
 }
 
 impl Default for ListenConfig {
@@ -200,6 +237,8 @@ impl Default for ListenConfig {
         Self {
             max_connections: gfs_common::DEFAULT_MAX_CONNECTIONS,
             connection_timeout: Duration::from_secs(gfs_common::DEFAULT_CONNECTION_TIMEOUT_SECS),
+            auth: Arc::new(Auth::Anonymous),
+            auth_timeout: Duration::from_secs(gfs_common::DEFAULT_AUTH_TIMEOUT_SECS),
         }
     }
 }
@@ -260,12 +299,25 @@ pub async fn serve_async(
         max_connections = config.max_connections,
         "serving git receive-pack",
     );
+    // Say which of the two postures this listener is in, every time, at a level
+    // that matches the risk (ADR-0019). An operator who did not mean to accept
+    // unauthenticated pushes has one line telling them so.
+    match &*config.auth {
+        Auth::Token(_) => tracing::info!("pushes must present the configured shared secret"),
+        Auth::Anonymous => tracing::warn!(
+            "accepting unauthenticated pushes (--allow-anonymous): anything that can reach \
+             this port can push code that this machine will check out and run",
+        ),
+    }
 
     let timeout = config.connection_timeout;
+    let auth_timeout = config.auth_timeout;
+    let auth = config.auth.clone();
     accept_loop(listener, config.max_connections, shutdown, move |sock| {
         let repo = repo.clone();
         let git_dir = git_dir.clone();
         let hooks_dir = hooks_dir.clone();
+        let auth = auth.clone();
         async move {
             // Hand the socket to the blocking handler as a plain blocking std
             // socket (`into_std` leaves it non-blocking, which the byte-pump
@@ -281,7 +333,15 @@ pub async fn serve_async(
                 }
             };
             match tokio::task::spawn_blocking(move || {
-                handle_connection(sock, &repo, &git_dir, &hooks_dir, timeout)
+                handle_connection(
+                    sock,
+                    &repo,
+                    &git_dir,
+                    &hooks_dir,
+                    timeout,
+                    &auth,
+                    auth_timeout,
+                )
             })
             .await
             {
@@ -393,14 +453,27 @@ async fn shutdown_signal() {
 /// the pumps to EOF and makes `git receive-pack` exit — so a stuck client can't
 /// pin a concurrency slot. A blocking `spawn_blocking` task can't be cancelled
 /// from the outside, so the budget is enforced here, where we own the socket.
+///
+/// When `auth` carries a token the connection must authenticate *first*
+/// (ADR-0019) — before the child is spawned, so a peer that cannot present the
+/// secret never reaches ref negotiation or pack ingest.
 fn handle_connection(
     sock: TcpStream,
     repo: &Path,
     git_dir: &Path,
     hooks_dir: &Path,
     timeout: Duration,
+    auth: &Auth,
+    auth_timeout: Duration,
 ) -> Result<(), ServerError> {
     use std::io::Read;
+
+    let started = Instant::now();
+    if let Auth::Token(expected) = auth
+        && !authenticate(&sock, expected, auth_timeout, git_dir, started)
+    {
+        return Ok(());
+    }
 
     let hooks_path = format!("core.hooksPath={}", hooks_dir.display());
 
@@ -408,7 +481,6 @@ fn handle_connection(
     // Best-effort: if it can't be created we simply record no refs.
     let accepted_refs = tempfile::NamedTempFile::new().ok();
 
-    let started = Instant::now();
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -523,8 +595,11 @@ fn handle_connection(
             duration_ms = elapsed_ms(started),
             "connection carried no ref updates",
         ),
-        // The two cases a human should actually look at.
-        Outcome::Rejected | Outcome::Failed => tracing::warn!(
+        // The cases a human should actually look at. `Unauthenticated` cannot
+        // arrive here — `authenticate` logs its own refusal and returns before a
+        // child exists — but it belongs to the same vocabulary, so it is listed
+        // rather than swept under a wildcard.
+        Outcome::Rejected | Outcome::Failed | Outcome::Unauthenticated => tracing::warn!(
             outcome = outcome.as_str(),
             ?status,
             %stderr,
@@ -549,6 +624,77 @@ fn handle_connection(
     Ok(())
 }
 
+/// Read and verify the client's authentication preamble (ADR-0019), returning
+/// whether the connection may proceed.
+///
+/// Runs before `receive-pack` is spawned, and reads *exactly* the preamble, so on
+/// success the bytes that follow are the raw receive-pack stream the child
+/// expects and on failure no child ever existed. A refusal answers with an `ERR`
+/// pkt-line — `git push` surfaces that as `remote error: …`, which is the
+/// difference between a client being told it needs a token and a client watching
+/// the connection drop — then shuts the socket down.
+///
+/// The read is bounded by `deadline` (`ListenConfig::auth_timeout`) rather than by
+/// the much longer per-connection budget: a client that authenticates does so
+/// immediately, and a client that never will is most often one with no token
+/// configured, waiting for a ref advertisement that is not coming. Reaching the
+/// deadline is what turns that deadlock into a diagnosis.
+///
+/// Every failure path here is best-effort — the refusal write, the shutdown, the
+/// record — because the connection is already over as far as the server is
+/// concerned. The one thing that matters is the returned `false`.
+fn authenticate(
+    sock: &TcpStream,
+    expected: &gfs_common::auth::Token,
+    deadline: Duration,
+    git_dir: &Path,
+    started: Instant,
+) -> bool {
+    use std::io::Write;
+
+    let _ = sock.set_read_timeout(Some(deadline));
+    // `&TcpStream` is itself a `Read`, so the preamble comes off the socket
+    // without duplicating the descriptor — and without consuming a byte past it.
+    let mut reader = sock;
+    let outcome = gfs_common::auth::read_auth_pkt(&mut reader, expected);
+    // Hand the socket back exactly as it was found: everything after the preamble
+    // is `receive-pack`'s, and it must not inherit a read deadline.
+    let _ = sock.set_read_timeout(None);
+
+    let Some(refusal) = outcome.refusal() else {
+        return true;
+    };
+
+    let peer = sock
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    tracing::warn!(
+        %peer,
+        reason = outcome.as_str(),
+        duration_ms = elapsed_ms(started),
+        "refused an unauthenticated push",
+    );
+
+    let mut writer = sock;
+    let _ = writer.write_all(&gfs_common::auth::err_pkt(refusal));
+    let _ = writer.flush();
+    let _ = sock.shutdown(Shutdown::Both);
+
+    // Recorded like any other connection (ADR-0013): a refusal is the server
+    // working, and "how many of these are there, and why" is exactly the question
+    // an operator will want the sink to answer.
+    metrics::record(
+        git_dir,
+        &metrics::ReceiveRecord::unauthenticated(
+            elapsed_ms(started),
+            Outcome::Unauthenticated.as_str(),
+            outcome.as_str(),
+        ),
+    );
+    false
+}
+
 /// What a `git receive-pack` connection turned out to be (ADR-0018).
 ///
 /// Derived from what the exchange *contained*, not only from the exit status:
@@ -569,6 +715,10 @@ enum Outcome {
     Rejected,
     /// A genuine failure.
     Failed,
+    /// The peer could not authenticate, so no `receive-pack` was ever spawned
+    /// (ADR-0019). Produced by [`authenticate`] rather than [`classify`], which
+    /// only ever sees connections that got past it.
+    Unauthenticated,
 }
 
 impl Outcome {
@@ -580,6 +730,7 @@ impl Outcome {
             Outcome::Probe => "probe",
             Outcome::Rejected => "rejected",
             Outcome::Failed => "failed",
+            Outcome::Unauthenticated => "unauthenticated",
         }
     }
 }

@@ -12,11 +12,12 @@ it out.
 
 ## 1. The SSH tunnel
 
-The server binds **localhost only** and there is **no built-in authentication or
-encryption** — `git-full-send` leans entirely on an SSH tunnel for
-confidentiality and access control
+The server binds **localhost only** and there is **no built-in encryption** —
+`git-full-send` leans entirely on an SSH tunnel for confidentiality
 ([ADR-0006](adr/0006-transport-and-connectivity.md)). Setting up the tunnel is a
-manual prerequisite to syncing.
+manual prerequisite to syncing. Access control is separate, and is the shared
+secret in [section 2b](#2b-the-shared-secret): loopback keeps the port off the
+network, but not away from everything else on the receiving machine.
 
 From the **client**, forward a local port to the server's loopback listen port:
 
@@ -47,16 +48,86 @@ touches your branches.
 A long-running process that accepts pushed objects:
 
 ```sh
-git-full-send listen --repo /path/to/target-repo [--addr 127.0.0.1:9419]
+git-full-send listen --repo /path/to/target-repo \
+    --token-file ~/.config/git-full-send/token [--addr 127.0.0.1:9419]
 ```
 
 - `--repo` — the target repository.
+- `--token-file` — the shared secret every push must present
+  ([section 2b](#2b-the-shared-secret)). **Required**, unless you pass
+  `--allow-anonymous` instead.
+- `--allow-anonymous` — accept unauthenticated pushes. There is no default:
+  `listen` refuses to start until you choose one or the other.
 - `--addr` — the bind address; defaults to `127.0.0.1:9419`. Keep it on
   loopback (see the tunnel section); the flag exists for choosing a different
   port, not for exposing the server on the network.
 
 Leave it running. It serves each connection independently and stays up across
 syncs.
+
+## 2b. The shared secret
+
+`listen` hands what it receives to `git receive-pack`, and `update-worktree` then
+checks that out **authoritatively** over the target worktree — files your tooling
+on that machine then *runs*. Binding loopback keeps the port off the network, but
+anything already on the receiving machine can still reach it: another local user,
+another SSH session, a port forward someone else set up. So pushes authenticate
+with a shared secret ([ADR-0019](adr/0019-authenticating-the-receive-pack-connection.md)).
+
+Generate one and lock it down:
+
+```sh
+# On the server:
+mkdir -p ~/.config/git-full-send
+head -c 32 /dev/urandom | base64 > ~/.config/git-full-send/token
+chmod 600 ~/.config/git-full-send/token
+```
+
+Copy that value to the **client** and store it the same way. Then both sides name
+it:
+
+```sh
+# server
+git-full-send listen --repo /path/to/target-repo --token-file ~/.config/git-full-send/token
+
+# client
+git-full-send sync --remote 127.0.0.1:9419 --token-file ~/.config/git-full-send/token
+git-full-send probe --remote 127.0.0.1:9419 --token-file ~/.config/git-full-send/token
+```
+
+Either side may instead put the secret **inline** in `GIT_FULL_SEND_TOKEN`, which
+is consulted when no `--token-file` is given. The file is the better habit — it
+keeps the secret out of `ps` and out of processes that merely inherit your
+environment — but the variable is there for a caller that already holds the token
+in memory.
+
+The secret is a single line of printable characters; a trailing newline in the
+file is fine. It is checked before any ref negotiation, so a peer that cannot
+present it never reaches the pack.
+
+### Running without one
+
+```sh
+git-full-send listen --repo /path/to/target-repo --allow-anonymous
+```
+
+Anything that can reach the port may then push code this machine will check out
+and run. Reasonable only where you are confident nothing else can reach it; the
+flag exists so that choosing it is deliberate rather than a default, and the
+server logs a warning for as long as it runs.
+
+### When it goes wrong
+
+| What you see | What it means |
+| --- | --- |
+| `fatal: remote error: git-full-send: authentication required …` on the client | The server requires a secret and you presented none, or the wrong one. Check `--token-file`/`GIT_FULL_SEND_TOKEN` on both ends. |
+| The client hangs for ~10s before that message | You presented nothing at all; that pause is the server's deadline for the preamble, after which it answers. |
+| `fatal: protocol error: bad line length character: git-` | The reverse mismatch: your client presented a secret to a server running `--allow-anonymous`. Configure the token on the server, or drop it from the client. |
+| `refused an unauthenticated push` in the server log | The server's side of the same event, with the peer address and whether the secret was absent, malformed, or wrong. |
+
+Every refusal is also recorded in the server's metrics sink as a `receive` record
+with `"outcome": "unauthenticated"` (see section 5), so a run of them is
+countable rather than merely visible in a log.
 
 ### `update-worktree` — the checkout
 
@@ -103,12 +174,15 @@ git-full-send update-worktree \
 ### `probe` — is the server up? (and what does a connection cost?)
 
 ```sh
-git-full-send probe --remote 127.0.0.1:9419
+git-full-send probe --remote 127.0.0.1:9419 [--token-file <path>]
 ```
 
-Run from the **client**, through the tunnel. It completes a real receive-pack
-exchange that updates nothing, so an orchestrator can gate on it without faking
-a push — and the server logs a clean no-op rather than a failed push
+Run from the **client**, through the tunnel. A probe is a connection like any
+other, so it presents the shared secret too (an authenticated server refuses one
+that doesn't, reporting the refusal rather than "server down"). It completes a
+real receive-pack exchange that updates nothing, so an orchestrator can gate on
+it without faking a push — and the server logs a clean no-op rather than a failed
+push
 ([ADR-0018](adr/0018-liveness-and-repo-health-surfaces.md)). Exits non-zero if
 the server is not accepting.
 

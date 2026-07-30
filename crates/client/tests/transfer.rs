@@ -113,6 +113,7 @@ async fn push_lands_code_ref_and_objects() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("sync succeeds");
@@ -159,6 +160,7 @@ async fn push_lands_extra_ref_alongside_code() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -208,6 +210,7 @@ async fn retains_pushed_tip_on_the_client() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("sync succeeds");
@@ -234,7 +237,7 @@ async fn rejects_refs_outside_the_namespace() {
     let remote = addr.to_string();
 
     // A namespaced ref is accepted…
-    gfs_client::push_ref(c, &remote, &code, gfs_client::DeltaPolicy::default())
+    gfs_client::push_ref(c, &remote, &code, gfs_client::DeltaPolicy::default(), None)
         .await
         .expect("a refs/git-full-send/* push is accepted");
     // …but anything outside the namespace is declined by the pre-receive hook.
@@ -243,7 +246,8 @@ async fn rejects_refs_outside_the_namespace() {
             c,
             &remote,
             "refs/heads/main",
-            gfs_client::DeltaPolicy::default()
+            gfs_client::DeltaPolicy::default(),
+            None
         )
         .await
         .is_err(),
@@ -287,6 +291,7 @@ async fn push_refs_whole_object_lands_objects() {
         &addr.to_string(),
         &extra,
         gfs_client::DeltaPolicy::WholeObject,
+        None,
     )
     .await
     .expect("a whole-object push is accepted");
@@ -325,6 +330,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -337,6 +343,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -375,6 +382,7 @@ async fn second_sync_advances_the_server() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -386,6 +394,7 @@ async fn second_sync_advances_the_server() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -426,6 +435,7 @@ async fn a_push_separates_ref_advertisement_from_pack_data() {
         &addr.to_string(),
         &code,
         gfs_client::DeltaPolicy::default(),
+        None,
     )
     .await
     .expect("push succeeds");
@@ -458,6 +468,7 @@ async fn a_push_separates_ref_advertisement_from_pack_data() {
         &addr.to_string(),
         &code,
         gfs_client::DeltaPolicy::default(),
+        None,
     )
     .await
     .expect("push succeeds");
@@ -509,14 +520,20 @@ async fn probing_is_reported_as_a_probe_not_a_failure() {
     let c = client.path();
     write_file(c, "a.txt", "a");
     commit_all(c, "baseline");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), Some(test_stream()), None)
-        .await
-        .expect("sync succeeds");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        Some(test_stream()),
+        None,
+        None,
+    )
+    .await
+    .expect("sync succeeds");
     let pushes = receive_records(server.path()).len();
 
     // --- The well-behaved probe.
     let remote = addr.to_string();
-    let report = tokio::task::spawn_blocking(move || gfs_client::probe(&remote))
+    let report = tokio::task::spawn_blocking(move || gfs_client::probe(&remote, None))
         .await
         .expect("probe task")
         .expect("the server is up");
@@ -596,6 +613,7 @@ async fn update_worktree_reports_what_made_it_expensive() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -732,6 +750,7 @@ async fn update_worktree_makes_worktree_match_code() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("sync succeeds");
@@ -786,6 +805,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -811,6 +831,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -854,6 +875,7 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -909,6 +931,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -934,6 +957,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -992,6 +1016,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -1018,6 +1043,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -1065,6 +1091,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("first sync");
@@ -1090,6 +1117,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -1133,6 +1161,7 @@ async fn two_streams_do_not_clobber_each_other() {
         addr.to_string(),
         Some(alice_stream.clone()),
         None,
+        None,
     )
     .await
     .expect("alice sync");
@@ -1145,6 +1174,7 @@ async fn two_streams_do_not_clobber_each_other() {
         bob.path().to_path_buf(),
         addr.to_string(),
         Some(bob_stream.clone()),
+        None,
         None,
     )
     .await
@@ -1228,6 +1258,7 @@ async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
             addr.to_string(),
             Some(StreamId::new(who).unwrap()),
             None,
+            None,
         )
         .await
         .expect("sync");
@@ -1264,6 +1295,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -1303,6 +1335,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        None,
     )
     .await
     .expect("sync after local forget");
@@ -1334,6 +1367,7 @@ async fn branch_shaped_stream_id_round_trips() {
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -1370,7 +1404,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     commit_all(c, "baseline");
 
     // No explicit stream: one is generated and persisted to the repo config.
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None)
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None, None)
         .await
         .expect("first sync");
     let id = git(
@@ -1388,7 +1422,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     // A second default sync reuses the same stream (the server ref advances in
     // place rather than spawning a second stream).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None)
+    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None, None)
         .await
         .expect("second sync");
     let second = git(server.path(), &["rev-parse", &code]);
@@ -1437,6 +1471,7 @@ async fn server_with_synced_stream() -> (tempfile::TempDir, SocketAddr, StreamId
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
+        None,
         None,
     )
     .await
@@ -1639,6 +1674,7 @@ async fn sync_stream(addr: &SocketAddr, who: &str) {
         addr.to_string(),
         Some(StreamId::new(who).unwrap()),
         None,
+        None,
     )
     .await
     .expect("sync");
@@ -1716,4 +1752,174 @@ async fn reap_on_a_repo_with_no_streams_is_a_noop(/* issue #63 */) {
     let outcome = gfs_server::reap_streams(server.path(), now_unix(), false).expect("reap");
     assert_eq!(outcome.scanned, 0);
     assert!(outcome.reaped.is_empty());
+}
+
+// --- Authentication (issue #81, ADR-0019) -----------------------------------
+//
+// The whole suite above pushes to an `Auth::Anonymous` listener, which is the
+// assertion that a server told to accept anonymous pushes still does. These cover
+// the other posture: a listener that requires a shared secret must let the secret
+// through and refuse everything else *before* `receive-pack` exists.
+
+/// A shared secret for the tests. Long enough not to trip the short-token warning.
+fn test_token(value: &str) -> gfs_client::Token {
+    gfs_client::Token::new(value, "the test").expect("a valid token")
+}
+
+/// As [`start_server`], but requiring `token` — and with a short authentication
+/// deadline, so the "client presents nothing" case is a fast test rather than a
+/// ten-second one.
+fn start_server_with_auth(repo: &Path, token: gfs_client::Token) -> SocketAddr {
+    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let config = gfs_server::ListenConfig {
+        auth: std::sync::Arc::new(gfs_server::Auth::Token(token)),
+        auth_timeout: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = gfs_server::serve_async(listener, config, std::future::pending::<()>()).await;
+    });
+    addr
+}
+
+/// A client repo with one commit, ready to sync.
+fn client_with_a_commit() -> tempfile::TempDir {
+    let client = init_temp_repo();
+    write_file(client.path(), "a.txt", "a");
+    commit_all(client.path(), "baseline");
+    client
+}
+
+#[tokio::test]
+async fn an_authenticated_server_accepts_the_configured_secret(/* issue #81 */) {
+    let server = init_bare_repo();
+    let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
+    let client = client_with_a_commit();
+
+    gfs_client::sync(
+        client.path().to_path_buf(),
+        addr.to_string(),
+        Some(test_stream()),
+        None,
+        Some(test_token("the-shared-secret-value")),
+    )
+    .await
+    .expect("a sync presenting the right secret succeeds");
+
+    // The preamble is *not* part of the receive-pack stream: the push that follows
+    // it lands exactly as an anonymous one does.
+    assert!(ref_exists(server.path(), &code_ref(&test_stream())));
+    assert!(ref_exists(server.path(), &extra_ref(&test_stream())));
+    let records = wait_for_receives(server.path(), 2).await;
+    assert!(
+        records.iter().all(|r| r["outcome"] == "updated"),
+        "both pushes were recorded as clean updates: {records:?}",
+    );
+}
+
+#[tokio::test]
+async fn an_authenticated_server_refuses_the_wrong_secret(/* issue #81 */) {
+    let server = init_bare_repo();
+    let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
+    let client = client_with_a_commit();
+
+    let error = gfs_client::sync(
+        client.path().to_path_buf(),
+        addr.to_string(),
+        Some(test_stream()),
+        None,
+        Some(test_token("not-the-shared-secret")),
+    )
+    .await
+    .expect_err("a sync presenting the wrong secret is refused");
+
+    // The refusal reached the client *as a refusal*: `git push` surfaces the
+    // server's `ERR` pkt-line, which is the difference between being told to
+    // configure a token and watching the connection drop.
+    let text = format!("{error}");
+    assert!(
+        text.contains("authentication required"),
+        "the client was told why: {text}",
+    );
+
+    // And nothing was received: the refusal happens before `receive-pack` exists.
+    assert!(!ref_exists(server.path(), &code_ref(&test_stream())));
+    let records = wait_for_receives(server.path(), 1).await;
+    assert_eq!(records[0]["outcome"], "unauthenticated");
+    assert_eq!(records[0]["auth_failure"], "mismatch");
+    assert_eq!(records[0]["inbound"]["pack"], 0);
+    assert_eq!(records[0]["outbound"]["advertisement"], 0);
+}
+
+/// The version-skew case, and the one that most needs a diagnosis rather than a
+/// hang: a client with no token configured never speaks, so the server's
+/// authentication deadline is what turns the deadlock into an answer.
+#[tokio::test]
+async fn an_authenticated_server_refuses_a_client_that_presents_nothing(/* issue #81 */) {
+    let server = init_bare_repo();
+    let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
+    let client = client_with_a_commit();
+
+    let error = gfs_client::sync(
+        client.path().to_path_buf(),
+        addr.to_string(),
+        Some(test_stream()),
+        None,
+        None,
+    )
+    .await
+    .expect_err("a sync presenting nothing is refused");
+    assert!(
+        format!("{error}").contains("authentication required"),
+        "the client was told why: {error}",
+    );
+
+    assert!(!ref_exists(server.path(), &code_ref(&test_stream())));
+    let records = wait_for_receives(server.path(), 1).await;
+    assert_eq!(records[0]["outcome"], "unauthenticated");
+    assert_eq!(records[0]["auth_failure"], "absent");
+}
+
+/// A probe is a connection like any other (ADR-0018 meets ADR-0019): it
+/// authenticates, and when it can't, it says so in the server's own words instead
+/// of reporting the server down.
+#[tokio::test]
+async fn a_probe_authenticates_like_any_other_connection(/* issue #81 */) {
+    let server = init_bare_repo();
+    let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
+    let client = client_with_a_commit();
+    gfs_client::sync(
+        client.path().to_path_buf(),
+        addr.to_string(),
+        Some(test_stream()),
+        None,
+        Some(test_token("the-shared-secret-value")),
+    )
+    .await
+    .expect("sync succeeds");
+
+    let remote = addr.to_string();
+    let report = tokio::task::spawn_blocking(move || {
+        gfs_client::probe(&remote, Some(&test_token("the-shared-secret-value")))
+    })
+    .await
+    .expect("probe task")
+    .expect("an authenticated probe reaches the advertisement");
+    assert!(report.refs_advertised >= 2, "it measured refs: {report:?}");
+
+    let remote = addr.to_string();
+    let error = tokio::task::spawn_blocking(move || gfs_client::probe(&remote, None))
+        .await
+        .expect("probe task")
+        .expect_err("an unauthenticated probe is refused");
+    assert!(
+        matches!(error, gfs_client::ProbeError::Refused { .. }),
+        "refused, not merely unanswered: {error:?}",
+    );
+    assert!(
+        format!("{error}").contains("authentication required"),
+        "carrying the server's own message: {error}",
+    );
 }

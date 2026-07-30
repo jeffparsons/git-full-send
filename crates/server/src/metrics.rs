@@ -19,11 +19,16 @@ use serde::Serialize;
 pub(crate) struct ReceiveRecord {
     #[serde(flatten)]
     envelope: gfs_common::metrics::Envelope,
-    /// Wall time from spawning `receive-pack` to its exit, in milliseconds.
+    /// Wall time for the whole connection, in milliseconds.
     pub duration_ms: f64,
     /// What this connection actually was — see [`crate::Outcome`]. The field to
     /// read: a healthy liveness probe is `success: false` and entirely fine.
     pub outcome: &'static str,
+    /// Why authentication was refused (`mismatch`/`malformed`/`absent`), on the
+    /// connections that were (ADR-0019). Absent from every other record, so the
+    /// shape of a normal receive is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_failure: Option<&'static str>,
     /// Whether `receive-pack` exited zero.
     pub success: bool,
     /// Its exit code, if it exited via a code (vs. a signal).
@@ -88,6 +93,7 @@ impl ReceiveRecord {
             envelope: gfs_common::metrics::Envelope::new("receive"),
             duration_ms,
             outcome,
+            auth_failure: None,
             success: status.success(),
             exit_code: status.code(),
             signal: status.signal(),
@@ -104,6 +110,42 @@ impl ReceiveRecord {
                 report: outbound.post_flush,
             },
             refs_updated,
+        }
+    }
+
+    /// The record for a connection refused before `receive-pack` was spawned
+    /// (ADR-0019).
+    ///
+    /// Its own constructor because there is no child to describe: the exit fields
+    /// are `None`/`false` by construction rather than by a caller remembering to
+    /// pass a status that never existed, and the wire counts are zero because
+    /// nothing but the preamble and the refusal crossed.
+    pub(crate) fn unauthenticated(
+        duration_ms: f64,
+        outcome: &'static str,
+        auth_failure: &'static str,
+    ) -> Self {
+        Self {
+            envelope: gfs_common::metrics::Envelope::new("receive"),
+            duration_ms,
+            outcome,
+            auth_failure: Some(auth_failure),
+            success: false,
+            exit_code: None,
+            signal: None,
+            inbound: Inbound {
+                total: 0,
+                commands: 0,
+                command_pkts: 0,
+                pack: 0,
+            },
+            outbound: Outbound {
+                total: 0,
+                advertisement: 0,
+                refs_advertised: 0,
+                report: 0,
+            },
+            refs_updated: Vec::new(),
         }
     }
 }

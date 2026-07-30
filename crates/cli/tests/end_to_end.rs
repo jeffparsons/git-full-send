@@ -71,12 +71,7 @@ async fn run_cli(args: &[&str]) {
 /// Like [`run_cli`], but returns the command's captured stdout — used to assert on
 /// operator-facing output such as the end-of-sync summary block (issue #53).
 async fn run_cli_capture(args: &[&str]) -> String {
-    let output = tokio::process::Command::new(BIN)
-        .args(args)
-        .env(
-            "GIT_FULL_SEND_USER_INCLUDE",
-            "/nonexistent/git-full-send-include",
-        )
+    let output = cli_command(args)
         .output()
         .await
         .unwrap_or_else(|e| panic!("spawn `git-full-send {}`: {e}", args.join(" ")));
@@ -88,6 +83,37 @@ async fn run_cli_capture(args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr),
     );
     String::from_utf8(output.stdout).expect("stdout is utf-8")
+}
+
+/// Run the binary expecting it to *fail*, returning its captured stderr — for the
+/// paths where the diagnosis is the deliverable (ADR-0019's refusal to start).
+async fn run_cli_expecting_failure(args: &[&str]) -> String {
+    let output = cli_command(args)
+        .output()
+        .await
+        .unwrap_or_else(|e| panic!("spawn `git-full-send {}`: {e}", args.join(" ")));
+    assert!(
+        !output.status.success(),
+        "`git-full-send {}` unexpectedly succeeded",
+        args.join(" "),
+    );
+    String::from_utf8(output.stderr).expect("stderr is utf-8")
+}
+
+/// The binary, with the environment pinned so a test never picks up the
+/// developer's own configuration.
+fn cli_command(args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(BIN);
+    command
+        .args(args)
+        // A shared secret in the developer's shell must not silently authenticate
+        // (or fail) a test that says nothing about tokens (ADR-0019).
+        .env_remove("GIT_FULL_SEND_TOKEN")
+        .env(
+            "GIT_FULL_SEND_USER_INCLUDE",
+            "/nonexistent/git-full-send-include",
+        );
+    command
 }
 
 /// The recursive set of paths in `tree_ish` within `repo`.
@@ -720,8 +746,15 @@ fn command_line_surface_is_wired_up() {
             "reap exposes {flag}:\n{reap_help}",
         );
     }
+    let listen_help = help(&["listen", "--help"]);
+    for flag in ["--token-file", "--allow-anonymous"] {
+        assert!(
+            listen_help.contains(flag),
+            "listen exposes {flag}:\n{listen_help}",
+        );
+    }
     let sync_help = help(&["sync", "--help"]);
-    for flag in ["--user-include", "--json"] {
+    for flag in ["--user-include", "--json", "--token-file"] {
         assert!(
             sync_help.contains(flag),
             "sync exposes {flag}:\n{sync_help}"
@@ -869,5 +902,108 @@ async fn reap_through_the_cli_dry_run_then_deletes() {
     assert!(
         listed.trim().is_empty(),
         "no streams remain after reaping:\n{listed}",
+    );
+}
+
+// --- Authentication (issue #81, ADR-0019) -----------------------------------
+
+/// `listen` must not be able to end up unauthenticated by omission: it checks out
+/// what it is given, and the receiving machine's tooling then runs those files. So
+/// the operator names a posture, and the error names both ways to do it.
+#[tokio::test]
+async fn listen_refuses_to_start_without_an_authentication_choice(/* issue #81 */) {
+    let server = init_bare_repo();
+    let repo = server.path().display().to_string();
+
+    let stderr = run_cli_expecting_failure(&["listen", "--repo", &repo]).await;
+    for remedy in ["--token-file", "--allow-anonymous"] {
+        assert!(
+            stderr.contains(remedy),
+            "the refusal names `{remedy}`:\n{stderr}",
+        );
+    }
+
+    // And it never got as far as binding: the choice is resolved first.
+    assert!(
+        !stderr.contains("serving git receive-pack"),
+        "no listener was started:\n{stderr}",
+    );
+}
+
+/// The shared secret across the real CLI surface: a `--token-file` sync lands on
+/// an authenticated server, and the same sync without one does not.
+#[tokio::test]
+async fn a_token_file_sync_round_trips_through_the_binary(/* issue #81 */) {
+    let server = init_bare_repo();
+    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), server.path().to_path_buf())
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    let secret = "the-shared-secret-value";
+    let config = gfs_server::ListenConfig {
+        auth: std::sync::Arc::new(gfs_server::Auth::Token(
+            gfs_common::auth::Token::new(secret, "the test").expect("a valid token"),
+        )),
+        auth_timeout: std::time::Duration::from_millis(300),
+        ..Default::default()
+    };
+    tokio::spawn(async move {
+        let _ = gfs_server::serve_async(listener, config, std::future::pending::<()>()).await;
+    });
+
+    let client = init_temp_repo();
+    write_file(client.path(), "src/main.rs", "fn main() {}");
+    commit_all(client.path(), "baseline");
+    let client_path = client.path().display().to_string();
+    let remote = addr.to_string();
+
+    let token_dir = tempfile::tempdir().expect("token dir");
+    let token_file = token_dir.path().join("token");
+    std::fs::write(&token_file, format!("{secret}\n")).expect("write token file");
+    let token_file = token_file.display().to_string();
+
+    // Without a token: refused, in the server's own words.
+    let stderr = run_cli_expecting_failure(&[
+        "sync",
+        "--repo",
+        &client_path,
+        "--remote",
+        &remote,
+        "--stream-id",
+        test_stream().as_str(),
+    ])
+    .await;
+    assert!(
+        stderr.contains("authentication required"),
+        "the client was told why:\n{stderr}",
+    );
+
+    // With one: an ordinary sync. A trailing newline in the file is fine.
+    run_cli(&[
+        "sync",
+        "--repo",
+        &client_path,
+        "--remote",
+        &remote,
+        "--stream-id",
+        test_stream().as_str(),
+        "--token-file",
+        &token_file,
+    ])
+    .await;
+
+    let worktree = tempfile::tempdir().expect("worktree dir");
+    run_cli(&[
+        "update-worktree",
+        "--repo",
+        &server.path().display().to_string(),
+        "--worktree",
+        &worktree.path().display().to_string(),
+        "--stream-id",
+        test_stream().as_str(),
+    ])
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("src/main.rs")).unwrap(),
+        "fn main() {}",
     );
 }
