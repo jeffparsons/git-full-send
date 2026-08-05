@@ -910,6 +910,104 @@ async fn reap_through_the_cli_dry_run_then_deletes() {
     );
 }
 
+// --- Relative-path invocation (issue #85) ------------------------------------
+
+/// One `update-worktree` run with cwd at `parent` and *relative* `--repo` /
+/// `--worktree` arguments, returning the run's `--json` record.
+async fn run_relative_update(parent: &Path, stream: &StreamId) -> serde_json::Value {
+    let mut command = cli_command(&[
+        "update-worktree",
+        "--repo",
+        "server-repo",
+        "--worktree",
+        "wt",
+        "--stream-id",
+        stream.as_str(),
+        "--json",
+    ]);
+    // The child's cwd, not ours: per-subprocess, so safe under parallel tests.
+    command.current_dir(parent);
+    let output = command.output().await.expect("spawn update-worktree");
+    assert!(
+        output.status.success(),
+        "relative-path update-worktree failed ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("update record is valid JSON")
+}
+
+/// A relative `--repo`/`--worktree` invocation must behave exactly like the
+/// absolute one. Before the fix, the per-worktree `GIT_INDEX_FILE` derived from
+/// the relative git dir was resolved by `clean` against the work tree (git
+/// chdirs into it before resolving the env var), so no index was found, the
+/// entire tracked checkout was classified untracked, and `clean -d -f` deleted
+/// it — leaving the worktree empty after every "successful" update and forcing
+/// a full rewrite on the next one.
+#[tokio::test]
+async fn update_worktree_with_relative_paths_keeps_the_checkout(/* issue #85 */) {
+    let parent = tempfile::tempdir().expect("parent dir");
+    let p = parent.path();
+    git(
+        p,
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=main",
+            "server-repo",
+        ],
+    );
+    let server_repo = p.join("server-repo");
+    let addr = start_server(&server_repo);
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/app.rs", "fn main() {}");
+    write_file(c, "src/deep/nested.rs", "pub fn nested() {}");
+    write_file(c, "README.md", "readme");
+    commit_all(c, "baseline");
+
+    let stream = test_stream();
+    run_cli(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+
+    let expected = expected_union(&server_repo, &stream);
+    let first = run_relative_update(p, &stream).await;
+    assert_eq!(
+        worktree_files(&p.join("wt")),
+        expected,
+        "the first relative-path update materialises the tree",
+    );
+    assert_eq!(
+        first["clean"]["removed"], 0,
+        "clean deleted nothing it just checked out: {first}",
+    );
+
+    let second = run_relative_update(p, &stream).await;
+    assert_eq!(
+        worktree_files(&p.join("wt")),
+        expected,
+        "the second update leaves the checkout in place",
+    );
+    assert_eq!(
+        second["clean"]["removed"], 0,
+        "the no-op's clean deleted nothing: {second}",
+    );
+    assert_eq!(
+        second["changed"]["vs_index"]["to_write"], 0,
+        "the no-op rewrote nothing (the stat cache survived): {second}",
+    );
+}
+
 // --- Additive extra includes (issue #80) -------------------------------------
 
 /// `--extra-include` layers on top of the per-user lookup instead of replacing

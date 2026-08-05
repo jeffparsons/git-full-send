@@ -1289,7 +1289,16 @@ fn update_worktree_blocking(
     options: UpdateOptions,
 ) -> Result<UpdateWorktreeReport, ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
-    let git_dir = discovered.git_dir().to_path_buf();
+    // Canonical, because the `git` steps below get it (and the index path
+    // derived from it) as `--git-dir` / `GIT_INDEX_FILE`. Git absolutizes a
+    // relative `--git-dir` itself, but resolves `GIT_INDEX_FILE` lazily —
+    // `clean` chdirs into the work tree first and would resolve a relative
+    // index path there, find nothing, classify the whole tracked checkout as
+    // untracked, and delete it (issue #85).
+    let git_dir = discovered
+        .git_dir()
+        .canonicalize()
+        .map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
 
     // Time each phase for the per-checkout metrics record (issue #42, ADR-0013).
     let t_total = Instant::now();
@@ -1309,6 +1318,13 @@ fn update_worktree_blocking(
     // would delete it there). A missing/stale index is pure cache: the next
     // `--reset` simply has no stat shortcut and does a one-time full rewrite.
     std::fs::create_dir_all(worktree).map_err(ServerError::CreateWorktree)?;
+    // Canonical for the same reason as the git dir: every spawned `git` step —
+    // and the report — must see the worktree the same way regardless of how
+    // the caller spelled it (issue #85). Shadowing the parameter keeps every
+    // later use on the canonical path.
+    let worktree = &worktree
+        .canonicalize()
+        .map_err(ServerError::CreateWorktree)?;
     let index = worktree_index_path(&git_dir, worktree)?;
 
     // Serialise against concurrent updates of *this* worktree (issue #49): hold
