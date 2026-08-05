@@ -1,0 +1,107 @@
+name: Dev snapshot
+
+# Rolling pre-built binaries for testing on real hosts without a local build:
+# every push to main rebuilds the `dev` prerelease, so the latest snapshot is
+# always at a stable URL:
+#
+#   https://github.com/jeffparsons/git-full-send/releases/download/dev/git-full-send-<target>.tar.gz
+#
+# This is deliberately a moving prerelease, not a versioned release — the
+# workspace is still 0.0.0 and the snapshot exists to get the tip onto client
+# and workstation machines quickly. A future tagged-release workflow can grow
+# out of this one when versioning starts to matter.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight snapshot build; there is no value in
+# finishing a stale one.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The release job rewrites the `dev` tag and release.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          # Each target builds natively on a matching runner — no
+          # cross-compilation toolchain to maintain. macos-latest is arm64;
+          # public repos get arm64 Linux runners for free.
+          - target: aarch64-apple-darwin
+            runs-on: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        # `GFS_BUILD_REV` is compiled into `--version` output (see
+        # `build_version` in the CLI) so a deployed snapshot can say which
+        # commit it came from. `--locked` holds the build to the committed
+        # lockfile.
+        env:
+          GFS_BUILD_REV: ${{ github.sha }}
+        run: cargo build --release --locked -p git-full-send
+      - name: smoke-test the binary
+        run: ./target/release/git-full-send --version
+      - name: package
+        # One tarball per target, named for it, so every asset URL is stable
+        # across snapshots. `shasum` rather than `sha256sum` because it exists
+        # on both the macOS and Ubuntu runners.
+        run: |
+          tar -czf "git-full-send-${{ matrix.target }}.tar.gz" \
+            -C target/release git-full-send
+          shasum -a 256 "git-full-send-${{ matrix.target }}.tar.gz" \
+            > "git-full-send-${{ matrix.target }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-full-send-${{ matrix.target }}
+          path: git-full-send-*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: update the dev prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: aggregate checksums
+        run: |
+          cd assets
+          cat *.sha256 > SHA256SUMS
+          rm *.sha256
+      - name: recreate the dev release at this commit
+        # Delete-and-recreate (rather than editing in place) so the `dev` tag
+        # always points at the commit the assets were built from and no stale
+        # asset can survive a target being renamed or dropped. The brief window
+        # with no release is fine for a dev snapshot.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --yes --cleanup-tag || true
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-12)"
+          gh release create dev \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            --title "Dev snapshot (${short_sha})" \
+            --notes "Rolling snapshot built from \`${short_sha}\` — not a stable release. Assets keep the same names across snapshots, so the download URLs are stable." \
+            assets/*
