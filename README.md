@@ -30,6 +30,24 @@ gives an integrator the same numbers to parse.
 The server binds **localhost only**; connectivity from the client is via a
 **manual SSH tunnel** ([ADR-0006](docs/adr/0006-transport-and-connectivity.md)).
 
+## Installing
+
+Rolling pre-built binaries of the latest `main` are published as the
+[`dev` prerelease](https://github.com/jeffparsons/git-full-send/releases/tag/dev)
+for `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
+`aarch64-unknown-linux-gnu`. The asset names are stable across snapshots, so a
+host can always fetch the latest with the same URL:
+
+```sh
+target=aarch64-apple-darwin    # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
+curl -fsSL "https://github.com/jeffparsons/git-full-send/releases/download/dev/git-full-send-${target}.tar.gz" \
+    | tar -xz -C ~/.local/bin git-full-send
+```
+
+`git-full-send --version` on a snapshot binary reports the commit it was built
+from. To build from source instead: `cargo install --path crates/cli` from a
+checkout (or `cargo build --release`).
+
 ## Quickstart
 
 On the remote workstation, start the receiver against a target Git repo:

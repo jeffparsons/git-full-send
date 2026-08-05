@@ -13,10 +13,23 @@ use git_full_send_common::StreamId;
 
 /// Sync a developer's Git working state to a remote workstation.
 #[derive(Debug, Parser)]
-#[command(name = "git-full-send", version, about)]
+#[command(name = "git-full-send", version = build_version(), about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The crate version, extended with the source revision when the build
+/// pipeline provides one (`GFS_BUILD_REV`, set by the dev-snapshot workflow),
+/// so a deployed snapshot binary can say which commit it was built from.
+///
+/// Leaks the composed string: clap wants `&'static str` (without its `string`
+/// feature), and this runs once for the process's one `Cli::parse`.
+fn build_version() -> &'static str {
+    match option_env!("GFS_BUILD_REV") {
+        Some(rev) => Box::leak(format!("{} ({rev})", env!("CARGO_PKG_VERSION")).into_boxed_str()),
+        None => env!("CARGO_PKG_VERSION"),
+    }
 }
 
 #[derive(Debug, Subcommand)]
