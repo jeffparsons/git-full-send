@@ -11,9 +11,9 @@
 //!
 //! No new measurement seam: the server already records `bytes_in` — the inbound
 //! pack size — per `git receive-pack` connection (ADR-0013,
-//! `gfs_server::metrics::ReceiveRecord`), appended to the repo's JSONL sink at
-//! `gfs_common::metrics::metrics_path(git_dir)`. The harness drives **single-ref**
-//! pushes via [`gfs_client::push_ref`] (not full `sync`) so each measured push
+//! `git_full_send_server::metrics::ReceiveRecord`), appended to the repo's JSONL sink at
+//! `git_full_send_common::metrics::metrics_path(git_dir)`. The harness drives **single-ref**
+//! pushes via [`git_full_send_client::push_ref`] (not full `sync`) so each measured push
 //! maps to exactly one `receive` record, then reads that record's `bytes_in`.
 //!
 //! Base presence is controlled by **which fresh bare server already holds the
@@ -26,7 +26,7 @@
 //! `#[ignore]`-d so a multi-MiB harness stays out of the default `cargo test`:
 //!
 //! ```text
-//! cargo test -p gfs-client --test delta_base_benchmark -- --ignored --nocapture
+//! cargo test -p git-full-send-client --test delta_base_benchmark -- --ignored --nocapture
 //! ```
 //!
 //! `--nocapture` surfaces the results table. The asserted inequalities double as
@@ -36,8 +36,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use gfs_client::DeltaPolicy;
-use gfs_common::{StreamId, code_ref, extra_ref};
+use git_full_send_client::DeltaPolicy;
+use git_full_send_common::{StreamId, code_ref, extra_ref};
 use test_support::{commit_all, git, init_bare_repo, init_temp_repo, write_file};
 
 /// Artifact size for both profiles, in bytes. Large enough that the artifact
@@ -249,15 +249,15 @@ fn report(a: ReceiveStat, b: ReceiveStat, c: ReceiveStat, d: ReceiveStat) {
 /// Bind a listener for `repo` on an ephemeral localhost port and serve it as a
 /// detached task on the test's runtime, returning the bound address. Mirrors the
 /// helper in `transfer.rs` (test files are separate compilation units, so it
-/// can't be shared without coupling `test_support` to `gfs_server`/`tokio`).
+/// can't be shared without coupling `test_support` to `git_full_send_server`/`tokio`).
 fn start_server(repo: &Path) -> SocketAddr {
-    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
+    let listener = git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        let _ = gfs_server::serve_async(
+        let _ = git_full_send_server::serve_async(
             listener,
-            gfs_server::ListenConfig::default(),
+            git_full_send_server::ListenConfig::default(),
             std::future::pending::<()>(),
         )
         .await;
@@ -279,7 +279,7 @@ fn commit_artifact(repo: &Path, contents: &[u8]) {
 
 /// Seed the delta base: push `ref_name` and discard the byte count.
 async fn establish_push(client: &Path, addr: SocketAddr, ref_name: &str, policy: DeltaPolicy) {
-    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
+    git_full_send_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
         .await
         .expect("establish push succeeds");
 }
@@ -298,7 +298,7 @@ async fn measure_push(
     policy: DeltaPolicy,
 ) -> ReceiveStat {
     let prior = matching_receive_records(server_repo, ref_name).len();
-    gfs_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
+    git_full_send_client::push_ref(client, &addr.to_string(), ref_name, policy, None)
         .await
         .expect("measured push succeeds");
 
@@ -320,7 +320,7 @@ async fn measure_push(
 /// includes `ref_name`, in file order. Lines that don't yet parse (a concurrent
 /// partial append) are skipped; the caller polls, so a transient miss just retries.
 fn matching_receive_records(server_repo: &Path, ref_name: &str) -> Vec<ReceiveStat> {
-    let path = gfs_common::metrics::metrics_path(server_repo);
+    let path = git_full_send_common::metrics::metrics_path(server_repo);
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };

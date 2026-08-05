@@ -44,7 +44,7 @@
 //! the far side of an SSH tunnel.
 //!
 //! The bytes are the identical raw stream — ADR-0005 is unchanged; the pumps are
-//! the server's own [`gfs_common::pktline::pump_splitting`], deliberately not
+//! the server's own [`git_full_send_common::pktline::pump_splitting`], deliberately not
 //! `std::io::copy` (whose splice fast path deadlocked this exchange in #44), and
 //! the `FD_CLOEXEC` handling above is unchanged in shape, just applied to the
 //! socketpair dups instead of the socket's. The cost is one
@@ -75,7 +75,7 @@
 //! automatically (the pushed ref persists and `receive.autogc=false` keeps its
 //! objects). On the client, [`encode`] force-overwrites the stream's `code` ref
 //! every sync, orphaning the previously-pushed commit; the stream's `sent` ref
-//! (`gfs_common::sent_ref`) pins the last-confirmed-pushed tip so its objects
+//! (`git_full_send_common::sent_ref`) pins the last-confirmed-pushed tip so its objects
 //! survive locally as the delta base. It is advanced **only after** a push
 //! succeeds, so a failed push leaves it pointing at the state the server
 //! actually has.
@@ -88,7 +88,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
-use gfs_common::auth::Token;
+use git_full_send_common::auth::Token;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -215,7 +215,7 @@ pub async fn push_refs(
     if let Some(token) = auth {
         use std::io::Write;
 
-        sock.write_all(&gfs_common::auth::auth_pkt(token))
+        sock.write_all(&git_full_send_common::auth::auth_pkt(token))
             .and_then(|()| sock.flush())
             .map_err(PushError::Io)?;
     }
@@ -303,7 +303,8 @@ pub async fn push_refs(
     let mut out_reader = ours.try_clone().map_err(PushError::Io)?;
     let mut out_writer = sock.try_clone().map_err(PushError::Io)?;
     let out_pump = std::thread::spawn(move || {
-        let counts = gfs_common::pktline::pump_splitting(&mut out_reader, &mut out_writer);
+        let counts =
+            git_full_send_common::pktline::pump_splitting(&mut out_reader, &mut out_writer);
         // `git` has stopped talking, so the server should see the same end of
         // stream it would have seen on a direct socket.
         let _ = out_writer.shutdown(std::net::Shutdown::Write);
@@ -314,7 +315,7 @@ pub async fn push_refs(
     let mut in_reader = sock.try_clone().map_err(PushError::Io)?;
     let mut in_writer = ours.try_clone().map_err(PushError::Io)?;
     let in_pump = std::thread::spawn(move || {
-        let counts = gfs_common::pktline::pump_splitting(&mut in_reader, &mut in_writer);
+        let counts = git_full_send_common::pktline::pump_splitting(&mut in_reader, &mut in_writer);
         // Propagating *this* half-close is load-bearing, not tidiness: after the
         // report-status the server closes, and `git` waits for its transport to
         // reach end of stream before it will exit. Interposing a socketpair
@@ -358,10 +359,10 @@ pub async fn push_refs(
 pub struct PushWire {
     /// Client → server: ref-update commands (`pre_flush`) then the pack
     /// (`post_flush`).
-    pub sent: gfs_common::pktline::WireCounts,
+    pub sent: git_full_send_common::pktline::WireCounts,
     /// Server → client: the ref advertisement (`pre_flush`, one pkt per ref)
     /// then the report-status (`post_flush`).
-    pub received: gfs_common::pktline::WireCounts,
+    pub received: git_full_send_common::pktline::WireCounts,
 }
 
 /// A pair of inheritable file descriptors duplicated from the connected socket,
@@ -396,8 +397,8 @@ fn dup_socket(fd: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
 /// locally as the delta base — and, for `extra`, the parent — of the next push.
 ///
 /// A force create-or-overwrite, mirroring the scratch-ref transaction `encode`
-/// uses for `code`. Called once per chain (`gfs_common::sent_ref` /
-/// `gfs_common::sent_extra_ref`) only after a successful [`push_refs`].
+/// uses for `code`. Called once per chain (`git_full_send_common::sent_ref` /
+/// `git_full_send_common::sent_extra_ref`) only after a successful [`push_refs`].
 pub(crate) fn retain_pushed_tip(
     repo_dir: &Path,
     sent_ref: &str,
@@ -436,11 +437,14 @@ pub(crate) fn retain_pushed_tip(
 
 #[cfg(test)]
 mod tests {
-    use gfs_common::StreamId;
+    use git_full_send_common::StreamId;
 
     #[test]
     fn sent_ref_is_under_the_namespace() {
         let stream = StreamId::new("test").unwrap();
-        assert!(gfs_common::sent_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
+        assert!(
+            git_full_send_common::sent_ref(&stream)
+                .starts_with(git_full_send_common::REF_NAMESPACE)
+        );
     }
 }

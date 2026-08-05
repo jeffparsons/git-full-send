@@ -11,9 +11,9 @@ repository = "https://github.com/jeffparsons/git-full-send"
 
 [workspace.dependencies]
 # Internal crates.
-gfs-common = { path = "crates/common" }
-gfs-client = { path = "crates/client" }
-gfs-server = { path = "crates/server" }
+git-full-send-common = { path = "crates/common" }
+git-full-send-client = { path = "crates/client" }
+git-full-send-server = { path = "crates/server" }
 test-support = { path = "crates/test-support" }
 
 # External crates. Versions are pinned here once and inherited by members via
@@ -39,7 +39,7 @@ tracing-subscriber = "0.3.23"
 
 # Compile external dependencies with optimisations even in debug builds. The
 # "*" glob matches only non-path (registry/git) packages, so our own workspace
-# crates (gfs-common, gfs-client, gfs-server, test-support) stay at opt-level 0
+# crates (git-full-send-common, git-full-send-client, git-full-send-server, test-support) stay at opt-level 0
 # for fast, debuggable iterative builds. The test profile inherits from dev, so
 # test builds benefit too; release is already optimised.
 [profile.dev.package."*"]

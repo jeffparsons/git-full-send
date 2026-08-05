@@ -1,6 +1,6 @@
 //! Integration tests for the client `encode` step (issue #17).
 //!
-//! Each test builds a temp repo with the `git` CLI, runs [`gfs_client::encode`]
+//! Each test builds a temp repo with the `git` CLI, runs [`git_full_send_client::encode`]
 //! under a fixed stream, and inspects the resulting `code` commit — again via the
 //! `git` CLI, to keep the assertions independent of the implementation's own
 //! library (`gix`).
@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use gfs_client::encode;
-use gfs_common::{StreamId, code_ref};
+use git_full_send_client::encode;
+use git_full_send_common::{StreamId, code_ref};
 use test_support::{commit_all, git, init_temp_repo, write_file};
 
 /// A fixed stream id so each test's `code` ref is deterministic.

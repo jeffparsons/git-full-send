@@ -86,7 +86,7 @@ impl Check {
 pub struct DoctorReport {
     /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
     #[serde(flatten)]
-    pub envelope: gfs_common::metrics::Envelope,
+    pub envelope: git_full_send_common::metrics::Envelope,
     /// The repository examined.
     pub repo: String,
     /// The worktree examined, if one was given.
@@ -133,7 +133,7 @@ pub fn doctor(repo: &Path, worktree: Option<&Path>) -> Result<DoctorReport, Serv
     }
 
     Ok(DoctorReport {
-        envelope: gfs_common::metrics::Envelope::new("doctor"),
+        envelope: git_full_send_common::metrics::Envelope::new("doctor"),
         repo: repo.display().to_string(),
         worktree: worktree.map(|w| w.display().to_string()),
         checks,
@@ -160,7 +160,7 @@ fn check_refs(repo: &gix::Repository) -> Check {
         let name = reference.name().as_bstr().to_string();
         total += 1;
         bytes += REF_ADVERTISEMENT_OVERHEAD + name.len() as u64;
-        if name.starts_with(gfs_common::REF_NAMESPACE) {
+        if name.starts_with(git_full_send_common::REF_NAMESPACE) {
             ours += 1;
         }
     }

@@ -2,14 +2,14 @@
 //!
 //! A single binary exposing every command: the client `sync`, and the server
 //! `listen` and `update-worktree` (see ADR-0003). Each subcommand is a thin
-//! wrapper that dispatches into the [`gfs_client`] / [`gfs_server`] libraries.
+//! wrapper that dispatches into the [`git_full_send_client`] / [`git_full_send_server`] libraries.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use gfs_common::StreamId;
+use git_full_send_common::StreamId;
 
 /// Sync a developer's Git working state to a remote workstation.
 #[derive(Debug, Parser)]
@@ -141,15 +141,15 @@ struct ListenArgs {
     #[arg(long, conflicts_with = "token_file")]
     allow_anonymous: bool,
     /// Address to bind. Localhost only by default (ADR-0006).
-    #[arg(long, value_name = "IP:PORT", default_value = gfs_common::DEFAULT_LISTEN_ADDR)]
+    #[arg(long, value_name = "IP:PORT", default_value = git_full_send_common::DEFAULT_LISTEN_ADDR)]
     addr: SocketAddr,
     /// Maximum number of connections served concurrently; further connections
     /// wait for a slot (issue #47).
-    #[arg(long, value_name = "N", default_value_t = gfs_common::DEFAULT_MAX_CONNECTIONS)]
+    #[arg(long, value_name = "N", default_value_t = git_full_send_common::DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
     /// Per-connection wall-clock timeout in seconds; a handler that overruns it
     /// is aborted so a stuck client can't pin a slot (issue #47).
-    #[arg(long, value_name = "SECS", default_value_t = gfs_common::DEFAULT_CONNECTION_TIMEOUT_SECS)]
+    #[arg(long, value_name = "SECS", default_value_t = git_full_send_common::DEFAULT_CONNECTION_TIMEOUT_SECS)]
     connection_timeout: u64,
 }
 
@@ -244,8 +244,8 @@ async fn main() -> Result<()> {
                 Some(path) => path,
                 None => std::env::current_dir()?,
             };
-            let auth = gfs_common::auth::Token::resolve(args.token_file.as_deref())?;
-            let summary = gfs_client::sync(
+            let auth = git_full_send_common::auth::Token::resolve(args.token_file.as_deref())?;
+            let summary = git_full_send_client::sync(
                 repo,
                 args.remote,
                 args.stream_id,
@@ -264,8 +264,8 @@ async fn main() -> Result<()> {
             // Blocking, and deliberately so: a probe is one short exchange, and
             // it must work identically whether an orchestrator runs it standalone
             // or a script pipes it into `jq`.
-            let auth = gfs_common::auth::Token::resolve(args.token_file.as_deref())?;
-            let report = gfs_client::probe(&args.remote, auth.as_ref())?;
+            let auth = git_full_send_common::auth::Token::resolve(args.token_file.as_deref())?;
+            let report = git_full_send_client::probe(&args.remote, auth.as_ref())?;
             if args.json {
                 print_json(&report);
             } else {
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Listen(args) => {
-            let config = gfs_server::ListenConfig {
+            let config = git_full_send_server::ListenConfig {
                 max_connections: args.max_connections,
                 connection_timeout: std::time::Duration::from_secs(args.connection_timeout),
                 auth: std::sync::Arc::new(listen_auth(
@@ -282,25 +282,29 @@ async fn main() -> Result<()> {
                 )?),
                 ..Default::default()
             };
-            gfs_server::listen(args.addr, args.repo, config).await?
+            git_full_send_server::listen(args.addr, args.repo, config).await?
         }
         Command::UpdateWorktree(args) => {
             // `--timeout` is gated on `--wait` by clap (`requires = "wait"`), so
             // a timeout only ever reaches the `Wait` arm.
             let lock = if args.wait {
-                gfs_server::LockMode::Wait {
+                git_full_send_server::LockMode::Wait {
                     timeout: args.timeout.map(std::time::Duration::from_secs),
                 }
             } else {
-                gfs_server::LockMode::FailFast
+                git_full_send_server::LockMode::FailFast
             };
-            let options = gfs_server::UpdateOptions {
+            let options = git_full_send_server::UpdateOptions {
                 lock,
                 measure_worktree: args.measure_worktree,
             };
-            let report =
-                gfs_server::update_worktree(args.repo, args.worktree, args.stream_id, options)
-                    .await?;
+            let report = git_full_send_server::update_worktree(
+                args.repo,
+                args.worktree,
+                args.stream_id,
+                options,
+            )
+            .await?;
             if args.json {
                 print_json(&report);
             } else {
@@ -308,12 +312,12 @@ async fn main() -> Result<()> {
             }
         }
         Command::ListStreams(args) => {
-            for stream in gfs_server::list_streams(&args.repo)? {
+            for stream in git_full_send_server::list_streams(&args.repo)? {
                 println!("{stream}");
             }
         }
         Command::ForgetStream(args) => {
-            let removed = gfs_server::forget_stream(&args.repo, &args.stream_id)?;
+            let removed = git_full_send_server::forget_stream(&args.repo, &args.stream_id)?;
             if removed == 0 {
                 println!("no refs for stream `{}`; nothing to forget", args.stream_id);
             } else {
@@ -329,11 +333,11 @@ async fn main() -> Result<()> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let cutoff = now_unix - (args.older_than_days as i64) * SECONDS_PER_DAY;
-            let outcome = gfs_server::reap_streams(&args.repo, cutoff, args.dry_run)?;
+            let outcome = git_full_send_server::reap_streams(&args.repo, cutoff, args.dry_run)?;
             print_reap_outcome(&outcome, args.older_than_days, now_unix);
         }
         Command::Doctor(args) => {
-            let mut report = gfs_server::doctor(&args.repo, args.worktree.as_deref())?;
+            let mut report = git_full_send_server::doctor(&args.repo, args.worktree.as_deref())?;
             // The force-include check belongs with the selection walk that pays
             // for it, on the client side, so it is composed in here rather than
             // duplicated in the server's `doctor`.
@@ -351,8 +355,9 @@ async fn main() -> Result<()> {
             }
         }
         Command::Metrics(args) => {
-            let git_dir = gfs_server::git_dir(&args.repo)?;
-            let stats = gfs_common::metrics::aggregate(&git_dir, args.kind.as_deref(), args.last);
+            let git_dir = git_full_send_server::git_dir(&args.repo)?;
+            let stats =
+                git_full_send_common::metrics::aggregate(&git_dir, args.kind.as_deref(), args.last);
             if args.json {
                 print_json(&stats);
             } else {
@@ -378,20 +383,20 @@ async fn main() -> Result<()> {
 fn listen_auth(
     token_file: Option<&std::path::Path>,
     allow_anonymous: bool,
-) -> Result<gfs_server::Auth> {
+) -> Result<git_full_send_server::Auth> {
     // `--allow-anonymous` conflicts with `--token-file` in clap, but not with the
     // environment variable — and an explicit flag beats an ambient one.
     if allow_anonymous {
-        return Ok(gfs_server::Auth::Anonymous);
+        return Ok(git_full_send_server::Auth::Anonymous);
     }
-    match gfs_common::auth::Token::resolve(token_file)? {
-        Some(token) => Ok(gfs_server::Auth::Token(token)),
+    match git_full_send_common::auth::Token::resolve(token_file)? {
+        Some(token) => Ok(git_full_send_server::Auth::Token(token)),
         None => anyhow::bail!(
             "`listen` needs to know who may push: pass `--token-file <PATH>` (or set \
              `{}`) so pushes must present a shared secret, or `--allow-anonymous` to \
              accept unauthenticated pushes from anything that can reach the port. \
              See ADR-0019.",
-            gfs_common::auth::TOKEN_ENV,
+            git_full_send_common::auth::TOKEN_ENV,
         ),
     }
 }
@@ -399,40 +404,40 @@ fn listen_auth(
 /// Check the repo's force-include patterns for unanchored ones, which disable
 /// the selection walk's pruning entirely (ADR-0007, ADR-0018).
 ///
-/// Lives here rather than in `gfs_server::doctor` because the patterns and the
-/// walk that pays for them are the *client's* (`gfs_client::select`), and the CLI
+/// Lives here rather than in `git_full_send_server::doctor` because the patterns and the
+/// walk that pays for them are the *client's* (`git_full_send_client::select`), and the CLI
 /// is the one place that sees both sides.
 fn include_pattern_check(
     repo: &std::path::Path,
     worktree: Option<&std::path::Path>,
-) -> gfs_server::Check {
+) -> git_full_send_server::Check {
     // Patterns live at the root of a working tree: the repo's own if it has one,
     // otherwise the checked-out worktree we were pointed at.
-    let looked_at = match gfs_client::select::unanchored_patterns(repo) {
+    let looked_at = match git_full_send_client::select::unanchored_patterns(repo) {
         // A bare repo has no working tree of its own, so fall back to the
         // worktree — that is where a server-side operator's patterns are.
         Ok(patterns) if patterns.is_empty() && worktree.is_some() => {
-            gfs_client::select::unanchored_patterns(worktree.expect("checked above"))
+            git_full_send_client::select::unanchored_patterns(worktree.expect("checked above"))
         }
         other => other,
     };
 
     match looked_at {
-        Err(error) => gfs_server::Check::new(
+        Err(error) => git_full_send_server::Check::new(
             "include_patterns",
-            gfs_server::doctor::WARN,
+            git_full_send_server::doctor::WARN,
             format!("could not read the force-include patterns: {error}"),
             None,
         ),
-        Ok(patterns) if patterns.is_empty() => gfs_server::Check::new(
+        Ok(patterns) if patterns.is_empty() => git_full_send_server::Check::new(
             "include_patterns",
-            gfs_server::doctor::OK,
+            git_full_send_server::doctor::OK,
             "no unanchored force-include patterns",
             None,
         ),
-        Ok(patterns) => gfs_server::Check::new(
+        Ok(patterns) => git_full_send_server::Check::new(
             "include_patterns",
-            gfs_server::doctor::WARN,
+            git_full_send_server::doctor::WARN,
             format!(
                 "{} unanchored force-include pattern(s): {}",
                 patterns.len(),
@@ -457,7 +462,11 @@ const SECONDS_PER_DAY: i64 = 86_400;
 ///
 /// One line per stale stream (with its age and the ref count it shed, or would
 /// shed in a dry run) plus a summary, mirroring `forget-stream`'s plain style.
-fn print_reap_outcome(outcome: &gfs_server::ReapOutcome, older_than_days: u64, now_unix: i64) {
+fn print_reap_outcome(
+    outcome: &git_full_send_server::ReapOutcome,
+    older_than_days: u64,
+    now_unix: i64,
+) {
     if outcome.reaped.is_empty() {
         println!(
             "no streams older than {older_than_days} day(s); nothing to reap \
@@ -510,7 +519,7 @@ fn print_json(record: &impl serde::Serialize) {
 /// progress lines (stderr) and the durable JSONL metrics record (ADR-0013): the
 /// numbers come from the same `sync` computation, formatted for a glance —
 /// binary byte units and second/millisecond durations.
-fn print_sync_summary(summary: &gfs_client::SyncSummary) {
+fn print_sync_summary(summary: &git_full_send_client::SyncSummary) {
     println!(
         "Synced stream {} to {} in {}",
         summary.stream,
@@ -584,7 +593,7 @@ fn print_sync_summary(summary: &gfs_client::SyncSummary) {
 /// The block is arranged so the *explanation* sits next to the duration it
 /// explains: how much had to change, what the index looked like, and where
 /// `read-tree`'s time actually went.
-fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
+fn print_update_worktree_summary(report: &git_full_send_server::UpdateWorktreeReport) {
     println!(
         "Updated worktree {} from stream {} in {}",
         report.worktree,
@@ -665,7 +674,7 @@ fn print_update_worktree_summary(report: &gfs_server::UpdateWorktreeReport) {
 ///
 /// The advertisement figure is the point: it is what *every* connection pays
 /// before any of the developer's data moves, and a sync makes two of them.
-fn print_probe_report(report: &gfs_client::ProbeReport) {
+fn print_probe_report(report: &git_full_send_client::ProbeReport) {
     println!("{} is up ({})", report.remote, human_ms(report.total_ms),);
     println!(
         "  ref advertisement: {} for {} ref(s) ({} git-full-send's), on every connection",
@@ -688,7 +697,7 @@ fn print_probe_report(report: &gfs_client::ProbeReport) {
 /// Each finding leads with its verdict and is followed by its remedy, because a
 /// diagnostic that only states a number leaves the operator exactly where they
 /// started.
-fn print_doctor_report(report: &gfs_server::DoctorReport) {
+fn print_doctor_report(report: &git_full_send_server::DoctorReport) {
     println!("Checked {}", report.repo);
     if let Some(worktree) = &report.worktree {
         println!("  worktree {worktree}");
@@ -696,8 +705,8 @@ fn print_doctor_report(report: &gfs_server::DoctorReport) {
     println!();
     for check in &report.checks {
         let mark = match check.status {
-            gfs_server::doctor::ERROR => "ERROR",
-            gfs_server::doctor::WARN => " WARN",
+            git_full_send_server::doctor::ERROR => "ERROR",
+            git_full_send_server::doctor::WARN => " WARN",
             _ => "   ok",
         };
         println!("{mark}  {:<16} {}", check.name, check.summary);
@@ -717,7 +726,7 @@ fn print_doctor_report(report: &gfs_server::DoctorReport) {
 }
 
 /// Print the aggregated metrics summary to stdout.
-fn print_metrics(stats: &[gfs_common::metrics::KindStats]) {
+fn print_metrics(stats: &[git_full_send_common::metrics::KindStats]) {
     if stats.is_empty() {
         println!("no metrics recorded yet");
         return;

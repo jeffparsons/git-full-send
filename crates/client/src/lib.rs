@@ -32,8 +32,8 @@ pub use encode::{
     CodeEncodePhases, CodeLayerStats, EncodeError, EncodeOutcome, ExtraEncodePhases,
     ExtraLayerStats, ExtraOutcome, encode, encode_extra,
 };
-pub use gfs_common::auth::{AuthError, Token};
-pub use gfs_common::{StreamId, StreamIdError};
+pub use git_full_send_common::auth::{AuthError, Token};
+pub use git_full_send_common::{StreamId, StreamIdError};
 pub use probe::{ProbeError, ProbeReport, probe};
 pub use push::{DeltaPolicy, PushError, PushWire, push_ref, push_refs};
 pub use select::{
@@ -61,7 +61,7 @@ pub use stream::StreamResolveError;
 pub struct SyncSummary {
     /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
     #[serde(flatten)]
-    pub envelope: gfs_common::metrics::Envelope,
+    pub envelope: git_full_send_common::metrics::Envelope,
     /// The stream the state was synced under.
     pub stream: StreamId,
     /// The server endpoint pushed to (`HOST:PORT`).
@@ -120,7 +120,7 @@ pub struct ExtraLayer {
 pub enum ClientError {
     /// An underlying protocol error.
     #[error(transparent)]
-    Protocol(#[from] gfs_common::ProtocolError),
+    Protocol(#[from] git_full_send_common::ProtocolError),
     /// Resolving (or persisting) the stream id failed.
     #[error(transparent)]
     Stream(#[from] StreamResolveError),
@@ -194,7 +194,11 @@ pub async fn sync(
     .await?;
     let code_push_ms = elapsed_ms(t);
     let t = Instant::now();
-    push::retain_pushed_tip(&repo_dir, &gfs_common::sent_ref(&stream), code.commit)?;
+    push::retain_pushed_tip(
+        &repo_dir,
+        &git_full_send_common::sent_ref(&stream),
+        code.commit,
+    )?;
     let mut retain_ms = elapsed_ms(t);
 
     let t = Instant::now();
@@ -210,7 +214,7 @@ pub async fn sync(
     let t = Instant::now();
     push::retain_pushed_tip(
         &repo_dir,
-        &gfs_common::sent_extra_ref(&stream),
+        &git_full_send_common::sent_extra_ref(&stream),
         extra.commit,
     )?;
     retain_ms += elapsed_ms(t);
@@ -219,7 +223,7 @@ pub async fn sync(
     // returned to the caller for the human summary, and printed verbatim by
     // `sync --json`.
     let summary = SyncSummary {
-        envelope: gfs_common::metrics::Envelope::new("sync"),
+        envelope: git_full_send_common::metrics::Envelope::new("sync"),
         stream,
         remote,
         total_ms: elapsed_ms(t_total),

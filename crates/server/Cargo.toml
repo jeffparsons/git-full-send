@@ -1,5 +1,5 @@
 [package]
-name = "gfs-server"
+name = "git-full-send-server"
 description = "Server-side library for git-full-send: receive synced objects and update the worktree."
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-gfs-common.workspace = true
+git-full-send-common.workspace = true
 # `tree-editor` (overlaying the `extra` tree onto `code` without a scratch index)
 # is not in gix's default feature set; object access arrives via its defaults.
 # See ADR-0002.

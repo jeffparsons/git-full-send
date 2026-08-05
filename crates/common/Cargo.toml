@@ -1,5 +1,5 @@
 [package]
-name = "gfs-common"
+name = "git-full-send-common"
 description = "Shared protocol types and constants for git-full-send."
 version.workspace = true
 edition.workspace = true

@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use gfs_common::auth::Token;
+use git_full_send_common::auth::Token;
 use thiserror::Error;
 
 /// A flush-pkt: the whole of what a probe sends.
@@ -74,7 +74,7 @@ pub enum ProbeError {
 pub struct ProbeReport {
     /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
     #[serde(flatten)]
-    pub envelope: gfs_common::metrics::Envelope,
+    pub envelope: git_full_send_common::metrics::Envelope,
     /// The endpoint probed.
     pub remote: String,
     /// Round trip for the whole exchange, in milliseconds.
@@ -115,7 +115,7 @@ pub fn probe(remote: &str, auth: Option<&Token>) -> Result<ProbeReport, ProbeErr
     // the preamble before spawning the `receive-pack` whose advertisement we are
     // about to measure.
     if let Some(token) = auth {
-        sock.write_all(&gfs_common::auth::auth_pkt(token))
+        sock.write_all(&git_full_send_common::auth::auth_pkt(token))
             .and_then(|()| sock.flush())
             .map_err(|source| ProbeError::Exchange {
                 remote: remote.to_string(),
@@ -157,10 +157,10 @@ pub fn probe(remote: &str, auth: Option<&Token>) -> Result<ProbeReport, ProbeErr
     let refs_ours = advertisement
         .refs
         .iter()
-        .filter(|name| name.starts_with(gfs_common::REF_NAMESPACE))
+        .filter(|name| name.starts_with(git_full_send_common::REF_NAMESPACE))
         .count() as u64;
     Ok(ProbeReport {
-        envelope: gfs_common::metrics::Envelope::new("probe"),
+        envelope: git_full_send_common::metrics::Envelope::new("probe"),
         remote: remote.to_string(),
         total_ms: started.elapsed().as_secs_f64() * 1000.0,
         advertisement_bytes: advertisement.bytes,
@@ -182,7 +182,7 @@ struct Advertisement {
 
 /// Read pkt-lines until the flush-pkt that ends the ref advertisement.
 ///
-/// Parsed here rather than counted with [`gfs_common::pktline`] because a probe
+/// Parsed here rather than counted with [`git_full_send_common::pktline`] because a probe
 /// wants the ref *names* too — enough to tell `git-full-send`'s own refs from the
 /// repository's, to drop git's placeholder line for a repo with no refs, and to
 /// notice an `ERR` line where the advertisement should have been (what `git` does

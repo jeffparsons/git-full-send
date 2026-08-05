@@ -1,7 +1,7 @@
 //! Integration tests for the `extra` (force-included) encode step (issue #20).
 //!
 //! Each test builds a temp repo with the `git` CLI, runs
-//! [`gfs_client::encode_extra`] under a fixed stream, and inspects the resulting
+//! [`git_full_send_client::encode_extra`] under a fixed stream, and inspects the resulting
 //! `extra` commit/tree via the `git` CLI — keeping the assertions independent of
 //! the implementation's own `gix`.
 //!
@@ -13,8 +13,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use gfs_client::encode_extra;
-use gfs_common::{StreamId, extra_ref, sent_extra_ref};
+use git_full_send_client::encode_extra;
+use git_full_send_common::{StreamId, extra_ref, sent_extra_ref};
 use test_support::{commit_all, git, init_temp_repo, write_file};
 
 /// Git's canonical empty-tree object id.
