@@ -2,17 +2,20 @@
 //!
 //! `git-full-send` deliberately syncs a controlled set of files that are
 //! normally gitignored — CPU-intensive web-client build outputs, per-user config
-//! — declared as **gitignore-syntax allow-list patterns** across two layers:
+//! — declared as **gitignore-syntax allow-list patterns** across layers:
 //!
 //! * a committed, project-level file at the repo root ([`PROJECT_INCLUDE_FILE`]),
-//!   shared and version-controlled; and
+//!   shared and version-controlled;
 //! * an optional per-user file outside the repo ([`user_include_path`]), mirroring
-//!   Git's `core.excludesFile`, read on the client only.
+//!   Git's `core.excludesFile`, read on the client only; and
+//! * any number of caller-supplied extra files (the `--extra-include` CLI flag,
+//!   issue #80), for tooling that drives a sync and wants to contribute patterns
+//!   without replacing the per-user lookup.
 //!
-//! The two layers are evaluated **`[project, then user]` with last-match-wins**:
-//! both may add includes, and a per-user `!` can carve out a project include.
-//! Note the **inverted polarity** versus `.gitignore` — here a bare pattern
-//! *includes* and `!` *carves out*.
+//! The layers are evaluated **`[project, user, extra…]` with last-match-wins**:
+//! each may add includes, and a later layer's `!` can carve out an earlier
+//! layer's include. Note the **inverted polarity** versus `.gitignore` — here a
+//! bare pattern *includes* and `!` *carves out*.
 //!
 //! ## Why an independent filesystem walk
 //!
@@ -84,6 +87,16 @@ pub enum SelectError {
         path: PathBuf,
         /// The underlying I/O error.
         source: std::io::Error,
+    },
+    /// A caller-supplied extra include file does not exist. Unlike the other
+    /// pattern files, a missing extra file is an error: the flag exists for
+    /// tooling passing a file it just wrote, so a missing path is always a bug,
+    /// and treating it as an empty layer would silently drop the caller's
+    /// patterns.
+    #[error("extra include pattern file `{path}` does not exist")]
+    MissingExtraInclude {
+        /// The extra include file that was not found.
+        path: PathBuf,
     },
     /// Listing a worktree directory failed.
     #[error("could not read worktree directory `{path}`")]
@@ -162,21 +175,30 @@ pub fn select_extra_paths_with(
     workdir: &Path,
     user_include_override: Option<&Path>,
 ) -> Result<Vec<BString>, SelectError> {
-    select_extra_paths_measured(workdir, user_include_override).map(|selection| selection.paths)
+    select_extra_paths_measured(workdir, user_include_override, &[])
+        .map(|selection| selection.paths)
 }
 
-/// As [`select_extra_paths_with`], but also returning what the walk cost
-/// ([`SelectStats`], ADR-0017).
+/// As [`select_extra_paths_with`], but also layering caller-supplied extra
+/// include files on top and returning what the walk cost ([`SelectStats`],
+/// ADR-0017).
+///
+/// `extra_includes` (the repeatable `--extra-include` CLI flag, issue #80) are
+/// evaluated after the per-user layer in the order given, so a caller's
+/// patterns win over the user's and a later extra file wins over an earlier
+/// one. Unlike the other pattern files, an extra file that does not exist is an
+/// error ([`SelectError::MissingExtraInclude`]), not an empty layer.
 ///
 /// This is what `sync` calls; the plainer forms above stay for callers (and
 /// tests) that only want the paths.
 pub fn select_extra_paths_measured(
     workdir: &Path,
     user_include_override: Option<&Path>,
+    extra_includes: &[PathBuf],
 ) -> Result<Selection, SelectError> {
     match user_include_override {
-        Some(path) => select_in(workdir, Some(path)),
-        None => select_in(workdir, user_include_path().as_deref()),
+        Some(path) => select_in(workdir, Some(path), extra_includes),
+        None => select_in(workdir, user_include_path().as_deref(), extra_includes),
     }
 }
 
@@ -202,7 +224,7 @@ pub fn unanchored_patterns(repo_dir: &Path) -> Result<Vec<String>, SelectError> 
         // against a checked-out worktree that has no git dir of its own.
         Err(_) => repo_dir.to_path_buf(),
     };
-    let search = load_search(&workdir, user_include_path().as_deref())?;
+    let search = load_search(&workdir, user_include_path().as_deref(), &[])?;
     let mut out: Vec<String> = Vec::new();
     for list in &search.patterns {
         for mapping in &list.patterns {
@@ -222,9 +244,13 @@ pub fn unanchored_patterns(repo_dir: &Path) -> Result<Vec<String>, SelectError> 
 
 /// The core of [`select_extra_paths`] with the per-user file path supplied
 /// explicitly (rather than resolved from the environment), so tests can exercise
-/// the two-layer semantics without mutating process-global environment.
-fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Selection, SelectError> {
-    let search = load_search(workdir, user_include)?;
+/// the layer semantics without mutating process-global environment.
+fn select_in(
+    workdir: &Path,
+    user_include: Option<&Path>,
+    extra_includes: &[PathBuf],
+) -> Result<Selection, SelectError> {
+    let search = load_search(workdir, user_include, extra_includes)?;
     let prune = build_prune_info(&search);
 
     let mut walk = Walk {
@@ -248,14 +274,18 @@ fn select_in(workdir: &Path, user_include: Option<&Path>) -> Result<Selection, S
     })
 }
 
-/// Build the combined allow-list. The project layer is added first and the user
-/// layer second; because [`gix::ignore::Search`] matches pattern lists in
-/// reverse, this realises `[project, then user]` last-match-wins (a user match
-/// always wins over a project match, and within a layer the last matching line
-/// wins).
+/// Build the combined allow-list. The project layer is added first, the user
+/// layer second, and the extra layers last in the order given; because
+/// [`gix::ignore::Search`] matches pattern lists in reverse, this realises
+/// `[project, user, extra…]` last-match-wins (a later layer's match always wins
+/// over an earlier layer's, and within a layer the last matching line wins).
+///
+/// Extra files are read with [`read_required`]: a missing one is an error, not
+/// an empty layer (see [`SelectError::MissingExtraInclude`]).
 fn load_search(
     workdir: &Path,
     user_include: Option<&Path>,
+    extra_includes: &[PathBuf],
 ) -> Result<gix::ignore::Search, SelectError> {
     let mut search = gix::ignore::Search::default();
     let parse = gix::ignore::search::Ignore::default();
@@ -268,6 +298,10 @@ fn load_search(
         && let Some(bytes) = read_optional(user)?
     {
         search.add_patterns_buffer(&bytes, user, None, parse);
+    }
+    for extra in extra_includes {
+        let bytes = read_required(extra)?;
+        search.add_patterns_buffer(&bytes, extra.clone(), None, parse);
     }
     Ok(search)
 }
@@ -296,6 +330,23 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SelectError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(SelectError::ReadPatternFile {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Read a caller-supplied extra pattern file, where a non-existent file *is* an
+/// error ([`SelectError::MissingExtraInclude`]).
+fn read_required(path: &Path) -> Result<Vec<u8>, SelectError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(SelectError::MissingExtraInclude {
+                path: path.to_path_buf(),
+            })
+        }
         Err(source) => Err(SelectError::ReadPatternFile {
             path: path.to_path_buf(),
             source,
@@ -548,7 +599,13 @@ mod tests {
 
     /// Run selection and return the matches as sorted `String`s.
     fn select(root: &Path, user: Option<&Path>) -> Vec<String> {
-        select_in(root, user)
+        select_layered(root, user, &[])
+    }
+
+    /// As [`select`], but with caller-supplied extra include files layered on
+    /// top (issue #80).
+    fn select_layered(root: &Path, user: Option<&Path>, extras: &[PathBuf]) -> Vec<String> {
+        select_in(root, user, extras)
             .unwrap()
             .paths
             .iter()
@@ -565,7 +622,7 @@ mod tests {
         user: Option<&Path>,
         prune: &PruneInfo,
     ) -> (Vec<String>, Vec<String>) {
-        let search = load_search(root, user).unwrap();
+        let search = load_search(root, user, &[]).unwrap();
         let mut walk = Walk {
             search: &search,
             prune,
@@ -585,7 +642,7 @@ mod tests {
     /// the walk descended into, so a test can assert the prune skipped a subtree
     /// rather than merely failing to match anything inside it.
     fn select_recording(root: &Path, user: Option<&Path>) -> (Vec<String>, Vec<String>) {
-        let search = load_search(root, user).unwrap();
+        let search = load_search(root, user, &[]).unwrap();
         let prune = build_prune_info(&search);
         walk_under(root, user, &prune)
     }
@@ -605,7 +662,7 @@ mod tests {
 
         // Anchored: `node_modules/` can't contain a match, so it is never entered.
         write(root, PROJECT_INCLUDE_FILE, "/dist/\n");
-        let anchored = select_in(root, None).unwrap();
+        let anchored = select_in(root, None, &[]).unwrap();
         assert_eq!(anchored.paths.len(), 1);
         assert_eq!(anchored.stats.unanchored_patterns, 0);
         assert!(
@@ -616,7 +673,7 @@ mod tests {
 
         // Unanchored: the same selection, reached the expensive way.
         write(root, PROJECT_INCLUDE_FILE, "dist/\n");
-        let unanchored = select_in(root, None).unwrap();
+        let unanchored = select_in(root, None, &[]).unwrap();
         assert_eq!(
             unanchored.paths, anchored.paths,
             "the prune never changes what is selected",
@@ -712,6 +769,79 @@ mod tests {
             select(dir.path(), Some(&user)),
             ["config/local.toml", "dist/app.js"],
         );
+    }
+
+    #[test]
+    fn extra_layer_adds_on_top_of_project_and_user(/* issue #80 */) {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), PROJECT_INCLUDE_FILE, "dist/\n");
+        write(dir.path(), "dist/app.js", "j");
+        write(dir.path(), "config/local.toml", "x");
+        write(dir.path(), "out/artifact.bin", "a");
+        let aux = tempfile::tempdir().unwrap();
+        let user = aux.path().join("user-include");
+        fs::write(&user, "config/local.toml\n").unwrap();
+        let extra = aux.path().join("extra-include");
+        fs::write(&extra, "out/artifact.bin\n").unwrap();
+        // All three layers contribute: the extra file layers on, it does not
+        // replace the user file.
+        assert_eq!(
+            select_layered(dir.path(), Some(&user), &[extra]),
+            ["config/local.toml", "dist/app.js", "out/artifact.bin"],
+        );
+    }
+
+    #[test]
+    fn extra_layer_wins_over_the_user_layer(/* issue #80 */) {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), PROJECT_INCLUDE_FILE, "dist/\n");
+        write(dir.path(), "dist/app.js", "j");
+        write(dir.path(), "dist/big-cache.bin", "b");
+        let aux = tempfile::tempdir().unwrap();
+        // The user carves a file out; the extra layer, evaluated later,
+        // re-includes it — last-match-wins across all layers.
+        let user = aux.path().join("user-include");
+        fs::write(&user, "!dist/big-cache.bin\n").unwrap();
+        let extra = aux.path().join("extra-include");
+        fs::write(&extra, "dist/big-cache.bin\n").unwrap();
+        assert_eq!(
+            select_layered(dir.path(), Some(&user), &[extra]),
+            ["dist/app.js", "dist/big-cache.bin"],
+        );
+    }
+
+    #[test]
+    fn later_extra_layer_wins_over_an_earlier_one(/* issue #80 */) {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), PROJECT_INCLUDE_FILE, "dist/\n");
+        write(dir.path(), "dist/app.js", "j");
+        write(dir.path(), "dist/secret.txt", "s");
+        let aux = tempfile::tempdir().unwrap();
+        let first = aux.path().join("first");
+        fs::write(&first, "!dist/secret.txt\n").unwrap();
+        let second = aux.path().join("second");
+        fs::write(&second, "dist/secret.txt\n").unwrap();
+        assert_eq!(
+            select_layered(dir.path(), None, &[first.clone(), second.clone()]),
+            ["dist/app.js", "dist/secret.txt"],
+        );
+        // And the mirror image: whichever file comes last wins.
+        assert_eq!(
+            select_layered(dir.path(), None, &[second, first]),
+            ["dist/app.js"],
+        );
+    }
+
+    #[test]
+    fn missing_extra_include_is_an_error(/* issue #80 */) {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "dist/app.js", "j");
+        let missing = dir.path().join("no-such-include");
+        let error = select_in(dir.path(), None, std::slice::from_ref(&missing)).unwrap_err();
+        match error {
+            SelectError::MissingExtraInclude { path } => assert_eq!(path, missing),
+            other => panic!("expected MissingExtraInclude, got {other:?}"),
+        }
     }
 
     #[test]
@@ -924,7 +1054,7 @@ mod tests {
                 let include: String = patterns.iter().map(|p| format!("{p}\n")).collect();
                 write(root, PROJECT_INCLUDE_FILE, &include);
 
-                let search = load_search(root, None).unwrap();
+                let search = load_search(root, None, &[]).unwrap();
                 let pruned = build_prune_info(&search);
                 // An always-descend prune is exactly the exhaustive walk: every
                 // directory (bar `.git`) is entered, nothing is skipped.

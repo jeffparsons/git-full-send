@@ -113,6 +113,7 @@ async fn push_lands_code_ref_and_objects() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -161,6 +162,7 @@ async fn push_lands_extra_ref_alongside_code() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -210,6 +212,7 @@ async fn retains_pushed_tip_on_the_client() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -330,6 +333,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -344,6 +348,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -382,6 +387,7 @@ async fn second_sync_advances_the_server() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -395,6 +401,7 @@ async fn second_sync_advances_the_server() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -525,6 +532,7 @@ async fn probing_is_reported_as_a_probe_not_a_failure() {
         addr.to_string(),
         Some(test_stream()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -614,6 +622,7 @@ async fn update_worktree_reports_what_made_it_expensive() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -750,6 +759,7 @@ async fn update_worktree_makes_worktree_match_code() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -805,6 +815,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -832,6 +843,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -876,6 +888,7 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -931,6 +944,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -958,6 +972,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1016,6 +1031,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1044,6 +1060,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1091,6 +1108,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1118,6 +1136,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1161,6 +1180,7 @@ async fn two_streams_do_not_clobber_each_other() {
         addr.to_string(),
         Some(alice_stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1175,6 +1195,7 @@ async fn two_streams_do_not_clobber_each_other() {
         addr.to_string(),
         Some(bob_stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1258,6 +1279,7 @@ async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
             addr.to_string(),
             Some(StreamId::new(who).unwrap()),
             None,
+            Vec::new(),
             None,
         )
         .await
@@ -1296,6 +1318,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1335,6 +1358,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1368,6 +1392,7 @@ async fn branch_shaped_stream_id_round_trips() {
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1404,9 +1429,16 @@ async fn default_stream_is_generated_persisted_and_reused() {
     commit_all(c, "baseline");
 
     // No explicit stream: one is generated and persisted to the repo config.
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None, None)
-        .await
-        .expect("first sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        None,
+        None,
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("first sync");
     let id = git(
         c,
         &["config", "--local", "--get", "git-full-send.stream-id"],
@@ -1422,9 +1454,16 @@ async fn default_stream_is_generated_persisted_and_reused() {
     // A second default sync reuses the same stream (the server ref advances in
     // place rather than spawning a second stream).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(c.to_path_buf(), addr.to_string(), None, None, None)
-        .await
-        .expect("second sync");
+    gfs_client::sync(
+        c.to_path_buf(),
+        addr.to_string(),
+        None,
+        None,
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("second sync");
     let second = git(server.path(), &["rev-parse", &code]);
     assert_ne!(first.trim(), second.trim(), "same stream ref advanced");
     assert_eq!(
@@ -1472,6 +1511,7 @@ async fn server_with_synced_stream() -> (tempfile::TempDir, SocketAddr, StreamId
         addr.to_string(),
         Some(stream.clone()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1674,6 +1714,7 @@ async fn sync_stream(addr: &SocketAddr, who: &str) {
         addr.to_string(),
         Some(StreamId::new(who).unwrap()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1803,6 +1844,7 @@ async fn an_authenticated_server_accepts_the_configured_secret(/* issue #81 */) 
         addr.to_string(),
         Some(test_stream()),
         None,
+        Vec::new(),
         Some(test_token("the-shared-secret-value")),
     )
     .await
@@ -1830,6 +1872,7 @@ async fn an_authenticated_server_refuses_the_wrong_secret(/* issue #81 */) {
         addr.to_string(),
         Some(test_stream()),
         None,
+        Vec::new(),
         Some(test_token("not-the-shared-secret")),
     )
     .await
@@ -1867,6 +1910,7 @@ async fn an_authenticated_server_refuses_a_client_that_presents_nothing(/* issue
         addr.to_string(),
         Some(test_stream()),
         None,
+        Vec::new(),
         None,
     )
     .await
@@ -1895,6 +1939,7 @@ async fn a_probe_authenticates_like_any_other_connection(/* issue #81 */) {
         addr.to_string(),
         Some(test_stream()),
         None,
+        Vec::new(),
         Some(test_token("the-shared-secret-value")),
     )
     .await

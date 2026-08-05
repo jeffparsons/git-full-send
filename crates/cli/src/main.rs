@@ -91,6 +91,12 @@ struct SyncArgs {
     /// project file (`.git-full-send-include`) is always consulted as well.
     #[arg(long, value_name = "PATH")]
     user_include: Option<PathBuf>,
+    /// Additional force-include pattern file, layered after the per-user file
+    /// (last-match-wins, so its patterns win). Additive — the normal per-user
+    /// lookup still applies, unlike `--user-include`. The file must exist.
+    /// Repeatable; later files win over earlier ones.
+    #[arg(long, value_name = "PATH")]
+    extra_include: Vec<PathBuf>,
     /// File holding the shared secret the server requires (ADR-0019). Defaults to
     /// `GIT_FULL_SEND_TOKEN` if set; with neither, nothing is presented — which
     /// only a `listen --allow-anonymous` server will accept.
@@ -239,9 +245,15 @@ async fn main() -> Result<()> {
                 None => std::env::current_dir()?,
             };
             let auth = gfs_common::auth::Token::resolve(args.token_file.as_deref())?;
-            let summary =
-                gfs_client::sync(repo, args.remote, args.stream_id, args.user_include, auth)
-                    .await?;
+            let summary = gfs_client::sync(
+                repo,
+                args.remote,
+                args.stream_id,
+                args.user_include,
+                args.extra_include,
+                auth,
+            )
+            .await?;
             if args.json {
                 print_json(&summary);
             } else {
