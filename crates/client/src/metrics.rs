@@ -20,5 +20,5 @@ pub(crate) fn record_sync(repo_dir: &Path, summary: &crate::SyncSummary) {
             return;
         }
     };
-    gfs_common::metrics::record(&git_dir, summary);
+    git_full_send_common::metrics::record(&git_dir, summary);
 }

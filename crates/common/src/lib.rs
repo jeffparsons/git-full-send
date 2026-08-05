@@ -1,11 +1,11 @@
 //! Shared protocol types and constants for `git-full-send`.
 //!
-//! This crate holds the pieces both the client ([`gfs_client`]) and the server
-//! ([`gfs_server`]) need to agree on — wire/protocol constants and shared error
+//! This crate holds the pieces both the client ([`git_full_send_client`]) and the server
+//! ([`git_full_send_server`]) need to agree on — wire/protocol constants and shared error
 //! types. It is intentionally tiny for now and grows as the protocol does.
 //!
-//! [`gfs_client`]: https://docs.rs/gfs-client
-//! [`gfs_server`]: https://docs.rs/gfs-server
+//! [`git_full_send_client`]: https://docs.rs/git-full-send-client
+//! [`git_full_send_server`]: https://docs.rs/git-full-send-server
 
 use bstr::ByteSlice;
 use thiserror::Error;

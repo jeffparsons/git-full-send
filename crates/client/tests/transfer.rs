@@ -1,6 +1,6 @@
 //! Loopback integration tests for the transfer leg (issue #18).
 //!
-//! Each test stands up a `gfs_server` listener against a temp bare "remote"
+//! Each test stands up a `git_full_send_server` listener against a temp bare "remote"
 //! repo on an ephemeral localhost port, runs the client `sync` (or a raw push)
 //! from a temp "client" repo, and inspects the result via the `git` CLI — keeping
 //! the assertions independent of the implementation's own `gix`/transport code.
@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 
-use gfs_common::{StreamId, code_ref, extra_ref, sent_extra_ref, sent_ref};
+use git_full_send_common::{StreamId, code_ref, extra_ref, sent_extra_ref, sent_ref};
 use test_support::{commit_all, git, init_bare_repo, init_temp_repo, write_file};
 
 /// A fixed stream id for tests that only need one stream, so the produced refs
@@ -27,13 +27,13 @@ fn test_stream() -> StreamId {
 /// interleaves the two. The task is detached and stops when the test process
 /// exits — the same fire-and-forget lifecycle the old `std::thread` helper had.
 fn start_server(repo: &Path) -> SocketAddr {
-    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
+    let listener = git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        let _ = gfs_server::serve_async(
+        let _ = git_full_send_server::serve_async(
             listener,
-            gfs_server::ListenConfig::default(),
+            git_full_send_server::ListenConfig::default(),
             std::future::pending::<()>(),
         )
         .await;
@@ -108,7 +108,7 @@ async fn push_lands_code_ref_and_objects() {
 
     let stream = test_stream();
     let code = code_ref(&stream);
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -157,7 +157,7 @@ async fn push_lands_extra_ref_alongside_code() {
     write_file(c, "dist/app.js", "built");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -207,7 +207,7 @@ async fn retains_pushed_tip_on_the_client() {
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -240,16 +240,22 @@ async fn rejects_refs_outside_the_namespace() {
     let remote = addr.to_string();
 
     // A namespaced ref is accepted…
-    gfs_client::push_ref(c, &remote, &code, gfs_client::DeltaPolicy::default(), None)
-        .await
-        .expect("a refs/git-full-send/* push is accepted");
+    git_full_send_client::push_ref(
+        c,
+        &remote,
+        &code,
+        git_full_send_client::DeltaPolicy::default(),
+        None,
+    )
+    .await
+    .expect("a refs/git-full-send/* push is accepted");
     // …but anything outside the namespace is declined by the pre-receive hook.
     assert!(
-        gfs_client::push_ref(
+        git_full_send_client::push_ref(
             c,
             &remote,
             "refs/heads/main",
-            gfs_client::DeltaPolicy::default(),
+            git_full_send_client::DeltaPolicy::default(),
             None
         )
         .await
@@ -289,11 +295,11 @@ async fn push_refs_whole_object_lands_objects() {
     let extra = extra_ref(&test_stream());
     git(c, &["update-ref", &extra, "HEAD"]);
 
-    gfs_client::push_ref(
+    git_full_send_client::push_ref(
         c,
         &addr.to_string(),
         &extra,
-        gfs_client::DeltaPolicy::WholeObject,
+        git_full_send_client::DeltaPolicy::WholeObject,
         None,
     )
     .await
@@ -328,7 +334,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
     write_file(c, "dist/app.js", "built-v1");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -343,7 +349,7 @@ async fn extra_chain_second_sync_lands_changed_output() {
 
     // Change the build output and sync again (the retained extra tip is the base).
     write_file(c, "dist/app.js", "built-v2");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -382,7 +388,7 @@ async fn second_sync_advances_the_server() {
     commit_all(c, "baseline");
     let stream = test_stream();
     let code = code_ref(&stream);
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -396,7 +402,7 @@ async fn second_sync_advances_the_server() {
 
     // Change the working tree and sync again (the retained tip is the base).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -437,11 +443,11 @@ async fn a_push_separates_ref_advertisement_from_pack_data() {
     git(c, &["update-ref", &code, "HEAD"]);
 
     // --- Against a nearly-empty repo the advertisement is negligible.
-    let first = gfs_client::push_ref(
+    let first = git_full_send_client::push_ref(
         c,
         &addr.to_string(),
         &code,
-        gfs_client::DeltaPolicy::default(),
+        git_full_send_client::DeltaPolicy::default(),
         None,
     )
     .await
@@ -470,11 +476,11 @@ async fn a_push_separates_ref_advertisement_from_pack_data() {
     write_file(c, "b.txt", "b");
     commit_all(c, "second");
     git(c, &["update-ref", &code, "HEAD"]);
-    let second = gfs_client::push_ref(
+    let second = git_full_send_client::push_ref(
         c,
         &addr.to_string(),
         &code,
-        gfs_client::DeltaPolicy::default(),
+        git_full_send_client::DeltaPolicy::default(),
         None,
     )
     .await
@@ -527,7 +533,7 @@ async fn probing_is_reported_as_a_probe_not_a_failure() {
     let c = client.path();
     write_file(c, "a.txt", "a");
     commit_all(c, "baseline");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(test_stream()),
@@ -541,7 +547,7 @@ async fn probing_is_reported_as_a_probe_not_a_failure() {
 
     // --- The well-behaved probe.
     let remote = addr.to_string();
-    let report = tokio::task::spawn_blocking(move || gfs_client::probe(&remote, None))
+    let report = tokio::task::spawn_blocking(move || git_full_send_client::probe(&remote, None))
         .await
         .expect("probe task")
         .expect("the server is up");
@@ -617,7 +623,7 @@ async fn update_worktree_reports_what_made_it_expensive() {
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -638,12 +644,12 @@ async fn update_worktree_reports_what_made_it_expensive() {
         let wt = wt.to_path_buf();
         let stream = stream.clone();
         async move {
-            gfs_server::update_worktree(
+            git_full_send_server::update_worktree(
                 repo,
                 wt,
                 stream,
-                gfs_server::UpdateOptions {
-                    lock: gfs_server::LockMode::default(),
+                git_full_send_server::UpdateOptions {
+                    lock: git_full_send_server::LockMode::default(),
                     measure_worktree,
                 },
             )
@@ -754,7 +760,7 @@ async fn update_worktree_makes_worktree_match_code() {
     write_file(c, "new.txt", "v1");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -772,11 +778,11 @@ async fn update_worktree_makes_worktree_match_code() {
     write_file(wt, "keep.txt", "REMOTE-EDIT");
     write_file(wt, "stale.txt", "junk");
 
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -810,7 +816,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
 
     // First sync + checkout: the worktree gains gone.txt.
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -822,11 +828,11 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -838,7 +844,7 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     // Delete gone.txt on the client and sync again; the same worktree updates.
     std::fs::remove_file(c.join("gone.txt")).expect("remove gone.txt");
     commit_all(c, "drop gone.txt");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -848,11 +854,11 @@ async fn update_worktree_removes_files_dropped_between_syncs() {
     )
     .await
     .expect("second sync");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -883,7 +889,7 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
     write_file(c, "dist/app.js", "built");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -896,11 +902,11 @@ async fn update_worktree_overlays_extra_at_identity_paths() {
 
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -939,7 +945,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
 
     // First sync + checkout: both force-included files land in the worktree.
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -951,11 +957,11 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
     .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -967,7 +973,7 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
 
     // Drop one force-included file from the selection and re-sync the same worktree.
     std::fs::remove_file(c.join("dist/vendor.js")).expect("remove vendor.js");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -977,11 +983,11 @@ async fn update_worktree_removes_extra_dropped_between_syncs() {
     )
     .await
     .expect("second sync");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -1026,7 +1032,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1038,11 +1044,11 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
     .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -1055,7 +1061,7 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
     // A second sync + update of the same worktree must leave them alone.
     write_file(c, "keep.txt", "v2");
     commit_all(c, "edit keep.txt");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1065,11 +1071,11 @@ async fn update_worktree_leaves_undelivered_gitignored_files_alone(/* issue #73 
     )
     .await
     .expect("second sync");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -1103,7 +1109,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1115,11 +1121,11 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
     .expect("first sync");
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("first update-worktree");
@@ -1131,7 +1137,7 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
 
     write_file(c, "keep.txt", "v2");
     commit_all(c, "edit keep.txt");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1141,11 +1147,11 @@ async fn update_worktree_still_removes_untracked_cruft(/* issue #73 */) {
     )
     .await
     .expect("second sync");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("second update-worktree");
@@ -1175,7 +1181,7 @@ async fn two_streams_do_not_clobber_each_other() {
     write_file(alice.path(), "who.txt", "alice");
     commit_all(alice.path(), "alice baseline");
     let alice_stream = StreamId::new("alice").unwrap();
-    gfs_client::sync(
+    git_full_send_client::sync(
         alice.path().to_path_buf(),
         addr.to_string(),
         Some(alice_stream.clone()),
@@ -1190,7 +1196,7 @@ async fn two_streams_do_not_clobber_each_other() {
     write_file(bob.path(), "who.txt", "bob");
     commit_all(bob.path(), "bob baseline");
     let bob_stream = StreamId::new("bob").unwrap();
-    gfs_client::sync(
+    git_full_send_client::sync(
         bob.path().to_path_buf(),
         addr.to_string(),
         Some(bob_stream.clone()),
@@ -1228,11 +1234,11 @@ async fn two_streams_do_not_clobber_each_other() {
     // And each stream checks out independently into its own worktree.
     for (stream, expected) in [(&alice_stream, "alice"), (&bob_stream, "bob")] {
         let wt = tempfile::tempdir().expect("worktree dir");
-        gfs_server::update_worktree(
+        git_full_send_server::update_worktree(
             server.path().to_path_buf(),
             wt.path().to_path_buf(),
             stream.clone(),
-            gfs_server::LockMode::default(),
+            git_full_send_server::LockMode::default(),
         )
         .await
         .expect("update-worktree");
@@ -1243,7 +1249,7 @@ async fn two_streams_do_not_clobber_each_other() {
     }
 
     // `list_streams` reports exactly the two synced streams.
-    let mut listed: Vec<String> = gfs_server::list_streams(server.path())
+    let mut listed: Vec<String> = git_full_send_server::list_streams(server.path())
         .expect("list streams")
         .iter()
         .map(|s| s.as_str().to_string())
@@ -1274,7 +1280,7 @@ async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
         let client = init_temp_repo();
         write_file(client.path(), "who.txt", who);
         commit_all(client.path(), "baseline");
-        gfs_client::sync(
+        git_full_send_client::sync(
             client.path().to_path_buf(),
             addr.to_string(),
             Some(StreamId::new(who).unwrap()),
@@ -1289,7 +1295,7 @@ async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
     let bob = StreamId::new("bob").unwrap();
 
     // Forgetting `alice` removes its `code` and `extra` refs (2) and nothing else.
-    let removed = gfs_server::forget_stream(server.path(), &alice).expect("forget alice");
+    let removed = git_full_send_server::forget_stream(server.path(), &alice).expect("forget alice");
     assert_eq!(removed, 2, "alice's code + extra refs were removed");
     assert!(!ref_exists(server.path(), &code_ref(&alice)));
     assert!(!ref_exists(server.path(), &extra_ref(&alice)));
@@ -1297,7 +1303,7 @@ async fn forget_stream_removes_a_streams_server_refs_only(/* issue #48 */) {
     // `bob` is untouched and is now the only stream the server lists.
     assert!(ref_exists(server.path(), &code_ref(&bob)));
     assert_eq!(
-        gfs_server::list_streams(server.path()).unwrap(),
+        git_full_send_server::list_streams(server.path()).unwrap(),
         vec![bob],
         "only bob remains after forgetting alice",
     );
@@ -1313,7 +1319,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
     write_file(c, "f.txt", "v1");
     commit_all(c, "baseline");
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1337,7 +1343,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
 
     // Forgetting the stream *in the client repo* drops all of them — there is no
     // local footprint of the stream left behind.
-    let removed = gfs_server::forget_stream(c, &stream).expect("forget on client");
+    let removed = git_full_send_server::forget_stream(c, &stream).expect("forget on client");
     assert_eq!(
         removed, 4,
         "code + extra + sent/code + sent/extra were removed"
@@ -1353,7 +1359,7 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
 
     // Forgetting locally is safe: a subsequent sync regenerates them and succeeds.
     write_file(c, "f.txt", "v2");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1370,8 +1376,9 @@ async fn forget_stream_drops_client_local_sent_refs(/* issue #48 */) {
 async fn forget_stream_is_idempotent_for_an_unknown_stream(/* issue #48 */) {
     let server = init_bare_repo();
     // Never synced: forgetting it removes nothing and is not an error.
-    let removed = gfs_server::forget_stream(server.path(), &StreamId::new("ghost").unwrap())
-        .expect("forget unknown stream");
+    let removed =
+        git_full_send_server::forget_stream(server.path(), &StreamId::new("ghost").unwrap())
+            .expect("forget unknown stream");
     assert_eq!(removed, 0);
 }
 
@@ -1387,7 +1394,7 @@ async fn branch_shaped_stream_id_round_trips() {
 
     // A slash-containing (branch-shaped) id must survive encode → push → checkout.
     let stream = StreamId::new("feature/foo").unwrap();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1399,11 +1406,11 @@ async fn branch_shaped_stream_id_round_trips() {
     .expect("sync succeeds");
 
     let wt = tempfile::tempdir().expect("worktree dir");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.path().to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect("update-worktree succeeds");
@@ -1412,7 +1419,7 @@ async fn branch_shaped_stream_id_round_trips() {
         "v1",
     );
     assert_eq!(
-        gfs_server::list_streams(server.path()).unwrap(),
+        git_full_send_server::list_streams(server.path()).unwrap(),
         vec![stream],
         "the slash-shaped id is recovered intact",
     );
@@ -1429,7 +1436,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     commit_all(c, "baseline");
 
     // No explicit stream: one is generated and persisted to the repo config.
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         None,
@@ -1454,7 +1461,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     // A second default sync reuses the same stream (the server ref advances in
     // place rather than spawning a second stream).
     write_file(c, "a.txt", "two");
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         None,
@@ -1467,7 +1474,7 @@ async fn default_stream_is_generated_persisted_and_reused() {
     let second = git(server.path(), &["rev-parse", &code]);
     assert_ne!(first.trim(), second.trim(), "same stream ref advanced");
     assert_eq!(
-        gfs_server::list_streams(server.path()).unwrap(),
+        git_full_send_server::list_streams(server.path()).unwrap(),
         vec![stream],
         "only one stream exists after two default syncs",
     );
@@ -1478,16 +1485,19 @@ async fn update_worktree_without_a_synced_stream_errors() {
     let server = init_bare_repo();
 
     let wt = tempfile::tempdir().expect("worktree dir");
-    let err = gfs_server::update_worktree(
+    let err = git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.path().to_path_buf(),
         StreamId::new("never-synced").unwrap(),
-        gfs_server::LockMode::default(),
+        git_full_send_server::LockMode::default(),
     )
     .await
     .expect_err("checking out a never-synced stream fails");
     assert!(
-        matches!(err, gfs_server::ServerError::MissingCodeRef { .. }),
+        matches!(
+            err,
+            git_full_send_server::ServerError::MissingCodeRef { .. }
+        ),
         "got {err:?}",
     );
 }
@@ -1506,7 +1516,7 @@ async fn server_with_synced_stream() -> (tempfile::TempDir, SocketAddr, StreamId
     commit_all(c, "baseline");
 
     let stream = test_stream();
-    gfs_client::sync(
+    git_full_send_client::sync(
         c.to_path_buf(),
         addr.to_string(),
         Some(stream.clone()),
@@ -1524,7 +1534,7 @@ async fn server_with_synced_stream() -> (tempfile::TempDir, SocketAddr, StreamId
 /// the caller can simulate a concurrent `update-worktree` holding it. Dropping
 /// (or `unlock`ing) the returned handle releases the lock.
 fn hold_worktree_lock(repo: &Path, worktree: &Path) -> std::fs::File {
-    let path = gfs_server::worktree_lock_path(repo, worktree).expect("lock path");
+    let path = git_full_send_server::worktree_lock_path(repo, worktree).expect("lock path");
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1543,11 +1553,11 @@ async fn update_worktree_fails_fast_when_locked() {
     // A first update establishes the worktree (and its lock file).
     let worktree = tempfile::tempdir().expect("worktree dir");
     let wt = worktree.path();
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::FailFast,
+        git_full_send_server::LockMode::FailFast,
     )
     .await
     .expect("first update succeeds");
@@ -1555,16 +1565,16 @@ async fn update_worktree_fails_fast_when_locked() {
     // Simulate a concurrent run by holding the lock, then a default (fail-fast)
     // update must bounce off it rather than interleave its git steps.
     let _held = hold_worktree_lock(server.path(), wt);
-    let err = gfs_server::update_worktree(
+    let err = git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::FailFast,
+        git_full_send_server::LockMode::FailFast,
     )
     .await
     .expect_err("a busy worktree fails fast");
     assert!(
-        matches!(err, gfs_server::ServerError::WorktreeBusy { .. }),
+        matches!(err, git_full_send_server::ServerError::WorktreeBusy { .. }),
         "got {err:?}",
     );
 }
@@ -1579,18 +1589,18 @@ async fn update_worktree_wait_times_out_when_held() {
 
     let timeout = std::time::Duration::from_millis(250);
     let start = std::time::Instant::now();
-    let err = gfs_server::update_worktree(
+    let err = git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         wt.to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::Wait {
+        git_full_send_server::LockMode::Wait {
             timeout: Some(timeout),
         },
     )
     .await
     .expect_err("waiting past the deadline fails");
     assert!(
-        matches!(err, gfs_server::ServerError::LockTimeout { .. }),
+        matches!(err, git_full_send_server::ServerError::LockTimeout { .. }),
         "got {err:?}",
     );
     assert!(
@@ -1614,11 +1624,11 @@ async fn update_worktree_wait_proceeds_once_lock_is_released() {
     let wt_for_update = wt.clone();
     let stream_for_update = stream.clone();
     let update = tokio::spawn(async move {
-        gfs_server::update_worktree(
+        git_full_send_server::update_worktree(
             repo,
             wt_for_update,
             stream_for_update,
-            gfs_server::LockMode::Wait { timeout: None },
+            git_full_send_server::LockMode::Wait { timeout: None },
         )
         .await
     });
@@ -1649,11 +1659,11 @@ async fn distinct_worktrees_do_not_contend() {
 
     // …a fail-fast update of a *different* worktree B is unaffected.
     let b = tempfile::tempdir().expect("worktree B");
-    gfs_server::update_worktree(
+    git_full_send_server::update_worktree(
         server.path().to_path_buf(),
         b.path().to_path_buf(),
         stream.clone(),
-        gfs_server::LockMode::FailFast,
+        git_full_send_server::LockMode::FailFast,
     )
     .await
     .expect("a distinct worktree is independent of A's lock");
@@ -1709,7 +1719,7 @@ async fn sync_stream(addr: &SocketAddr, who: &str) {
     let client = init_temp_repo();
     write_file(client.path(), "who.txt", who);
     commit_all(client.path(), "baseline");
-    gfs_client::sync(
+    git_full_send_client::sync(
         client.path().to_path_buf(),
         addr.to_string(),
         Some(StreamId::new(who).unwrap()),
@@ -1735,7 +1745,8 @@ async fn reap_forgets_only_streams_older_than_the_cutoff(/* issue #63 */) {
     backdate_code_ref(server.path(), &old, now - 100 * 86_400);
 
     // A 30-day cutoff makes only `old` stale.
-    let outcome = gfs_server::reap_streams(server.path(), now - 30 * 86_400, false).expect("reap");
+    let outcome =
+        git_full_send_server::reap_streams(server.path(), now - 30 * 86_400, false).expect("reap");
     assert_eq!(outcome.scanned, 2, "both streams were scanned");
     assert_eq!(outcome.reaped.len(), 1, "only the stale stream is reaped");
     assert_eq!(outcome.reaped[0].stream, old);
@@ -1750,13 +1761,14 @@ async fn reap_forgets_only_streams_older_than_the_cutoff(/* issue #63 */) {
     assert!(!ref_exists(server.path(), &extra_ref(&old)));
     assert!(ref_exists(server.path(), &code_ref(&fresh)));
     assert_eq!(
-        gfs_server::list_streams(server.path()).unwrap(),
+        git_full_send_server::list_streams(server.path()).unwrap(),
         vec![fresh],
         "only fresh remains after reaping old",
     );
 
     // Re-reaping with the same cutoff finds nothing new — reaping is idempotent.
-    let again = gfs_server::reap_streams(server.path(), now - 30 * 86_400, false).expect("re-reap");
+    let again = git_full_send_server::reap_streams(server.path(), now - 30 * 86_400, false)
+        .expect("re-reap");
     assert_eq!(again.scanned, 1);
     assert!(again.reaped.is_empty());
 }
@@ -1771,8 +1783,8 @@ async fn reap_dry_run_reports_without_deleting(/* issue #63 */) {
     let now = now_unix();
     backdate_code_ref(server.path(), &old, now - 100 * 86_400);
 
-    let outcome =
-        gfs_server::reap_streams(server.path(), now - 30 * 86_400, true).expect("dry run");
+    let outcome = git_full_send_server::reap_streams(server.path(), now - 30 * 86_400, true)
+        .expect("dry run");
     assert!(outcome.dry_run);
     assert_eq!(outcome.reaped.len(), 1);
     assert_eq!(outcome.reaped[0].stream, old);
@@ -1784,13 +1796,17 @@ async fn reap_dry_run_reports_without_deleting(/* issue #63 */) {
     // Nothing was actually deleted.
     assert!(ref_exists(server.path(), &code_ref(&old)));
     assert!(ref_exists(server.path(), &extra_ref(&old)));
-    assert_eq!(gfs_server::list_streams(server.path()).unwrap(), vec![old]);
+    assert_eq!(
+        git_full_send_server::list_streams(server.path()).unwrap(),
+        vec![old]
+    );
 }
 
 #[tokio::test]
 async fn reap_on_a_repo_with_no_streams_is_a_noop(/* issue #63 */) {
     let server = init_bare_repo();
-    let outcome = gfs_server::reap_streams(server.path(), now_unix(), false).expect("reap");
+    let outcome =
+        git_full_send_server::reap_streams(server.path(), now_unix(), false).expect("reap");
     assert_eq!(outcome.scanned, 0);
     assert!(outcome.reaped.is_empty());
 }
@@ -1803,24 +1819,25 @@ async fn reap_on_a_repo_with_no_streams_is_a_noop(/* issue #63 */) {
 // through and refuse everything else *before* `receive-pack` exists.
 
 /// A shared secret for the tests. Long enough not to trip the short-token warning.
-fn test_token(value: &str) -> gfs_client::Token {
-    gfs_client::Token::new(value, "the test").expect("a valid token")
+fn test_token(value: &str) -> git_full_send_client::Token {
+    git_full_send_client::Token::new(value, "the test").expect("a valid token")
 }
 
 /// As [`start_server`], but requiring `token` — and with a short authentication
 /// deadline, so the "client presents nothing" case is a fast test rather than a
 /// ten-second one.
-fn start_server_with_auth(repo: &Path, token: gfs_client::Token) -> SocketAddr {
-    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
+fn start_server_with_auth(repo: &Path, token: git_full_send_client::Token) -> SocketAddr {
+    let listener = git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
-    let config = gfs_server::ListenConfig {
-        auth: std::sync::Arc::new(gfs_server::Auth::Token(token)),
+    let config = git_full_send_server::ListenConfig {
+        auth: std::sync::Arc::new(git_full_send_server::Auth::Token(token)),
         auth_timeout: std::time::Duration::from_millis(300),
         ..Default::default()
     };
     tokio::spawn(async move {
-        let _ = gfs_server::serve_async(listener, config, std::future::pending::<()>()).await;
+        let _ =
+            git_full_send_server::serve_async(listener, config, std::future::pending::<()>()).await;
     });
     addr
 }
@@ -1839,7 +1856,7 @@ async fn an_authenticated_server_accepts_the_configured_secret(/* issue #81 */) 
     let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
     let client = client_with_a_commit();
 
-    gfs_client::sync(
+    git_full_send_client::sync(
         client.path().to_path_buf(),
         addr.to_string(),
         Some(test_stream()),
@@ -1867,7 +1884,7 @@ async fn an_authenticated_server_refuses_the_wrong_secret(/* issue #81 */) {
     let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
     let client = client_with_a_commit();
 
-    let error = gfs_client::sync(
+    let error = git_full_send_client::sync(
         client.path().to_path_buf(),
         addr.to_string(),
         Some(test_stream()),
@@ -1905,7 +1922,7 @@ async fn an_authenticated_server_refuses_a_client_that_presents_nothing(/* issue
     let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
     let client = client_with_a_commit();
 
-    let error = gfs_client::sync(
+    let error = git_full_send_client::sync(
         client.path().to_path_buf(),
         addr.to_string(),
         Some(test_stream()),
@@ -1934,7 +1951,7 @@ async fn a_probe_authenticates_like_any_other_connection(/* issue #81 */) {
     let server = init_bare_repo();
     let addr = start_server_with_auth(server.path(), test_token("the-shared-secret-value"));
     let client = client_with_a_commit();
-    gfs_client::sync(
+    git_full_send_client::sync(
         client.path().to_path_buf(),
         addr.to_string(),
         Some(test_stream()),
@@ -1947,7 +1964,7 @@ async fn a_probe_authenticates_like_any_other_connection(/* issue #81 */) {
 
     let remote = addr.to_string();
     let report = tokio::task::spawn_blocking(move || {
-        gfs_client::probe(&remote, Some(&test_token("the-shared-secret-value")))
+        git_full_send_client::probe(&remote, Some(&test_token("the-shared-secret-value")))
     })
     .await
     .expect("probe task")
@@ -1955,12 +1972,12 @@ async fn a_probe_authenticates_like_any_other_connection(/* issue #81 */) {
     assert!(report.refs_advertised >= 2, "it measured refs: {report:?}");
 
     let remote = addr.to_string();
-    let error = tokio::task::spawn_blocking(move || gfs_client::probe(&remote, None))
+    let error = tokio::task::spawn_blocking(move || git_full_send_client::probe(&remote, None))
         .await
         .expect("probe task")
         .expect_err("an unauthenticated probe is refused");
     assert!(
-        matches!(error, gfs_client::ProbeError::Refused { .. }),
+        matches!(error, git_full_send_client::ProbeError::Refused { .. }),
         "refused, not merely unanswered: {error:?}",
     );
     assert!(

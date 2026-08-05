@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gfs_common::{StreamId, StreamIdError};
+use git_full_send_common::{StreamId, StreamIdError};
 use thiserror::Error;
 
 /// The Git config key holding a repo's default stream id.

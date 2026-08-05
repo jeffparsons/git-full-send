@@ -1,5 +1,5 @@
 [package]
-name = "gfs-client"
+name = "git-full-send-client"
 description = "Client-side library for git-full-send: synthesise sync state and push it to the server."
 version.workspace = true
 edition.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-gfs-common.workspace = true
+git-full-send-common.workspace = true
 # Random bytes for the auto-generated default stream id (ADR-0012).
 getrandom.workspace = true
 # `tree-editor` (building trees without a scratch index) is not in gix's default
@@ -25,8 +25,8 @@ tokio = { workspace = true, features = ["process"] }
 tracing.workspace = true
 
 [dev-dependencies]
-gfs-common.workspace = true
-gfs-server.workspace = true
+git-full-send-common.workspace = true
+git-full-send-server.workspace = true
 # Property test for the force-include prune invariant (issue #52): generates
 # random trees + pattern sets and asserts pruned-vs-exhaustive selection equality.
 proptest.workspace = true

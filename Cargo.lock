@@ -392,14 +392,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfs-cli"
+name = "git-full-send"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "gfs-client",
- "gfs-common",
- "gfs-server",
+ "git-full-send-client",
+ "git-full-send-common",
+ "git-full-send-server",
  "serde",
  "serde_json",
  "tempfile",
@@ -410,12 +410,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfs-client"
+name = "git-full-send-client"
 version = "0.0.0"
 dependencies = [
  "getrandom 0.4.2",
- "gfs-common",
- "gfs-server",
+ "git-full-send-common",
+ "git-full-send-server",
  "gix",
  "proptest",
  "rustix",
@@ -429,7 +429,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfs-common"
+name = "git-full-send-common"
 version = "0.0.0"
 dependencies = [
  "bstr",
@@ -442,10 +442,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "gfs-server"
+name = "git-full-send-server"
 version = "0.0.0"
 dependencies = [
- "gfs-common",
+ "git-full-send-common",
  "gix",
  "serde",
  "serde_json",

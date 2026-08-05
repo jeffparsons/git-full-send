@@ -11,7 +11,7 @@
 //! connection, spawns `git receive-pack <repo>` with the socket wired to the
 //! child's stdin/stdout — the same hand-off `sshd` and `git daemon` perform
 //! internally (ADR-0005). `git` owns pack ingest; we keep control of the
-//! invocation to confine writable refs to the [`gfs_common::REF_NAMESPACE`]
+//! invocation to confine writable refs to the [`git_full_send_common::REF_NAMESPACE`]
 //! namespace (via a `pre-receive` hook installed under a gfs-managed
 //! `core.hooksPath`) and to disable `receive.autogc` for the receive window so a
 //! post-receive gc cannot prune the delta bases a subsequent push needs
@@ -71,7 +71,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 pub enum ServerError {
     /// An underlying protocol error.
     #[error(transparent)]
-    Protocol(#[from] gfs_common::ProtocolError),
+    Protocol(#[from] git_full_send_common::ProtocolError),
     /// The configured target path is not a Git repository.
     #[error("`{0}` is not a Git repository")]
     NotARepo(PathBuf),
@@ -107,7 +107,7 @@ pub enum ServerError {
     BuildTree(#[source] Box<dyn std::error::Error + Send + Sync>),
     /// An explicitly requested stream id was malformed.
     #[error(transparent)]
-    StreamId(#[from] gfs_common::StreamIdError),
+    StreamId(#[from] git_full_send_common::StreamIdError),
     /// Listing the synced streams failed.
     #[error("could not list streams")]
     ListStreams(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -199,7 +199,7 @@ impl Listener {
 pub enum Auth {
     /// Every push must present this shared secret before `receive-pack` is
     /// spawned.
-    Token(gfs_common::auth::Token),
+    Token(git_full_send_common::auth::Token),
     /// Anything that can reach the port may push. The behaviour before ADR-0019,
     /// kept for setups where the port genuinely cannot be reached by anything
     /// else — and named so that choosing it is deliberate.
@@ -208,7 +208,7 @@ pub enum Auth {
 
 /// Tunables for the [`listen`]/[`serve_async`] accept loop (issue #47).
 ///
-/// [`Default`] sources the `gfs_common::DEFAULT_*` constants; the CLI overrides
+/// [`Default`] sources the `git_full_send_common::DEFAULT_*` constants; the CLI overrides
 /// them from `listen --max-connections` / `--connection-timeout`. Note that the
 /// default `auth` is [`Auth::Anonymous`] — a *library* default, chosen so a
 /// caller that has not thought about authentication behaves as it did before
@@ -228,17 +228,19 @@ pub struct ListenConfig {
     /// is required. Deliberately *not* a CLI flag: an authenticating client sends
     /// the preamble immediately, so the deadline only ever governs how quickly a
     /// client that will never send one is told so
-    /// ([`gfs_common::DEFAULT_AUTH_TIMEOUT_SECS`]).
+    /// ([`git_full_send_common::DEFAULT_AUTH_TIMEOUT_SECS`]).
     pub auth_timeout: Duration,
 }
 
 impl Default for ListenConfig {
     fn default() -> Self {
         Self {
-            max_connections: gfs_common::DEFAULT_MAX_CONNECTIONS,
-            connection_timeout: Duration::from_secs(gfs_common::DEFAULT_CONNECTION_TIMEOUT_SECS),
+            max_connections: git_full_send_common::DEFAULT_MAX_CONNECTIONS,
+            connection_timeout: Duration::from_secs(
+                git_full_send_common::DEFAULT_CONNECTION_TIMEOUT_SECS,
+            ),
             auth: Arc::new(Auth::Anonymous),
-            auth_timeout: Duration::from_secs(gfs_common::DEFAULT_AUTH_TIMEOUT_SECS),
+            auth_timeout: Duration::from_secs(git_full_send_common::DEFAULT_AUTH_TIMEOUT_SECS),
         }
     }
 }
@@ -645,7 +647,7 @@ fn handle_connection(
 /// concerned. The one thing that matters is the returned `false`.
 fn authenticate(
     sock: &TcpStream,
-    expected: &gfs_common::auth::Token,
+    expected: &git_full_send_common::auth::Token,
     deadline: Duration,
     git_dir: &Path,
     started: Instant,
@@ -656,7 +658,7 @@ fn authenticate(
     // `&TcpStream` is itself a `Read`, so the preamble comes off the socket
     // without duplicating the descriptor — and without consuming a byte past it.
     let mut reader = sock;
-    let outcome = gfs_common::auth::read_auth_pkt(&mut reader, expected);
+    let outcome = git_full_send_common::auth::read_auth_pkt(&mut reader, expected);
     // Hand the socket back exactly as it was found: everything after the preamble
     // is `receive-pack`'s, and it must not inherit a read deadline.
     let _ = sock.set_read_timeout(None);
@@ -677,7 +679,7 @@ fn authenticate(
     );
 
     let mut writer = sock;
-    let _ = writer.write_all(&gfs_common::auth::err_pkt(refusal));
+    let _ = writer.write_all(&git_full_send_common::auth::err_pkt(refusal));
     let _ = writer.flush();
     let _ = sock.shutdown(Shutdown::Both);
 
@@ -742,7 +744,7 @@ impl Outcome {
 /// accepted. Classifying on the exit status alone would call that a success.
 fn classify(
     status: &std::process::ExitStatus,
-    inbound: &gfs_common::pktline::WireCounts,
+    inbound: &git_full_send_common::pktline::WireCounts,
     refs_updated: &[String],
     stderr: &str,
 ) -> Outcome {
@@ -765,9 +767,9 @@ fn classify(
     Outcome::Failed
 }
 
-/// The shared counting byte pump ([`gfs_common::pktline::pump_splitting`]),
+/// The shared counting byte pump ([`git_full_send_common::pktline::pump_splitting`]),
 /// which also splits each direction into protocol overhead and payload.
-use gfs_common::pktline::pump_splitting as pump_counting;
+use git_full_send_common::pktline::pump_splitting as pump_counting;
 
 /// Read the hook's accepted-ref file into a deduplicated, order-preserving list
 /// of ref names (one per line). A missing/unreadable file yields no refs.
@@ -808,11 +810,11 @@ fn install_hooks() -> Result<TempDir, ServerError> {
 const HOOK_REFUSAL_MARKER: &str = "git-full-send: refusing ref outside";
 
 /// The `pre-receive` hook body: reject any updated ref outside the
-/// [`gfs_common::REF_NAMESPACE`] namespace (ADR-0005), and append each accepted
+/// [`git_full_send_common::REF_NAMESPACE`] namespace (ADR-0005), and append each accepted
 /// ref to the file named by [`ACCEPTED_REFS_ENV`] so the connection handler can
 /// record which refs the push updated (issue #42).
 fn pre_receive_hook() -> String {
-    let ns = gfs_common::REF_NAMESPACE;
+    let ns = git_full_send_common::REF_NAMESPACE;
     let refs_env = ACCEPTED_REFS_ENV;
     let refusal = HOOK_REFUSAL_MARKER;
     format!(
@@ -865,9 +867,9 @@ pub enum LockMode {
 pub struct UpdateWorktreeReport {
     /// `kind`/`schema`/`ts_unix_ms`/`tool_version`, flattened into the record.
     #[serde(flatten)]
-    pub envelope: gfs_common::metrics::Envelope,
+    pub envelope: git_full_send_common::metrics::Envelope,
     /// The stream that was checked out.
-    pub stream: gfs_common::StreamId,
+    pub stream: git_full_send_common::StreamId,
     /// The worktree directory it was checked out into.
     pub worktree: String,
     /// The combined `code`+`extra` tree that was checked out.
@@ -891,7 +893,7 @@ pub struct UpdateWorktreeReport {
     /// How much of the worktree actually had to change.
     pub changed: ChangedPaths,
     /// `read-tree`'s internals, harvested from git's own instrumentation.
-    /// `None` when trace2 gave us nothing (see [`gfs_common::trace2`]).
+    /// `None` when trace2 gave us nothing (see [`git_full_send_common::trace2`]).
     pub read_tree: Option<ReadTreeBreakdown>,
     /// What the `clean` sweep removed.
     pub clean: CleanStats,
@@ -1020,7 +1022,7 @@ impl From<LockMode> for UpdateOptions {
 /// An authoritative, destructive overwrite of the remote worktree (ADR-0008),
 /// invoked independently of [`listen`] (a build orchestrator triggers it). After
 /// it returns, `worktree` matches `stream`'s synced `code` tree
-/// (`gfs_common::code_ref`) *exactly*: remote-side edits are stomped (even to
+/// (`git_full_send_common::code_ref`) *exactly*: remote-side edits are stomped (even to
 /// files whose blob is unchanged between syncs), files dropped between syncs are
 /// removed, and untracked remote additions are removed.
 ///
@@ -1037,7 +1039,7 @@ impl From<LockMode> for UpdateOptions {
 pub async fn update_worktree(
     repo: PathBuf,
     worktree: PathBuf,
-    stream: gfs_common::StreamId,
+    stream: git_full_send_common::StreamId,
     options: impl Into<UpdateOptions>,
 ) -> Result<UpdateWorktreeReport, ServerError> {
     let options = options.into();
@@ -1050,16 +1052,16 @@ pub async fn update_worktree(
 
 /// List the streams that have a synced `code` ref in `repo`.
 ///
-/// Enumerates refs under [`gfs_common::STREAMS_PREFIX`], recovering each
+/// Enumerates refs under [`git_full_send_common::STREAMS_PREFIX`], recovering each
 /// (possibly slash-containing) stream id from the `…/streams/<id>/code` refs. An
 /// orchestrator uses this to discover which streams are available to check out.
-pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerError> {
+pub fn list_streams(repo: &Path) -> Result<Vec<git_full_send_common::StreamId>, ServerError> {
     let repo = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
     let platform = repo
         .references()
         .map_err(|e| ServerError::ListStreams(Box::new(e)))?;
     let iter = platform
-        .prefixed(gfs_common::STREAMS_PREFIX)
+        .prefixed(git_full_send_common::STREAMS_PREFIX)
         .map_err(|e| ServerError::ListStreams(Box::new(e)))?;
 
     let mut streams = Vec::new();
@@ -1079,15 +1081,15 @@ pub fn list_streams(repo: &Path) -> Result<Vec<gfs_common::StreamId>, ServerErro
 /// Shared by [`list_streams`] and [`reap_streams`] so the layout recovery lives
 /// in one place. The companion `…/extra` ref (and anything else under the
 /// prefix) lacks the `/code` suffix and is left out.
-fn stream_id_from_code_ref(name: &str) -> Option<gfs_common::StreamId> {
-    let rest = name.strip_prefix(gfs_common::STREAMS_PREFIX)?;
+fn stream_id_from_code_ref(name: &str) -> Option<git_full_send_common::StreamId> {
+    let rest = name.strip_prefix(git_full_send_common::STREAMS_PREFIX)?;
     let id = rest.strip_suffix("/code")?;
-    gfs_common::StreamId::new(id).ok()
+    git_full_send_common::StreamId::new(id).ok()
 }
 
 /// Delete every ref of `stream` from `repo`, returning how many were removed.
 ///
-/// Removes everything under [`gfs_common::stream_prefix`] in one transaction —
+/// Removes everything under [`git_full_send_common::stream_prefix`] in one transaction —
 /// the explicit "forget this stream" path ADR-0012 deferred (issue #48). The
 /// command is **symmetric**: run against the server repo it drops the stream's
 /// `code`/`extra`; run against the client repo it drops the local `sent/*`
@@ -1100,11 +1102,14 @@ fn stream_id_from_code_ref(name: &str) -> Option<gfs_common::StreamId> {
 /// worktree path, not stream id, and the worktree is disposable anyway
 /// (ADR-0008). The client's `git-full-send.stream-id` config key is likewise left
 /// alone (see `docs/operating.md`).
-pub fn forget_stream(repo: &Path, stream: &gfs_common::StreamId) -> Result<usize, ServerError> {
+pub fn forget_stream(
+    repo: &Path,
+    stream: &git_full_send_common::StreamId,
+) -> Result<usize, ServerError> {
     use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
 
     let repo = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
-    let prefix = gfs_common::stream_prefix(stream);
+    let prefix = git_full_send_common::stream_prefix(stream);
 
     // Snapshot the matching ref names into owned edits before mutating, so we are
     // not deleting out from under a live iterator borrow.
@@ -1141,7 +1146,7 @@ pub fn forget_stream(repo: &Path, stream: &gfs_common::StreamId) -> Result<usize
 #[derive(Debug, Clone)]
 pub struct ReapedStream {
     /// The stale stream.
-    pub stream: gfs_common::StreamId,
+    pub stream: git_full_send_common::StreamId,
     /// The `code` commit's committer time, in Unix seconds, that made it stale.
     pub committed_unix_secs: i64,
     /// Refs removed forgetting it — `0` under `dry_run`, where the count is the
@@ -1185,13 +1190,13 @@ pub fn reap_streams(
     // First pass: snapshot the stale streams (and the committer time that made
     // each stale) without mutating refs out from under the live iterator.
     let mut scanned = 0usize;
-    let mut stale: Vec<(gfs_common::StreamId, i64)> = Vec::new();
+    let mut stale: Vec<(git_full_send_common::StreamId, i64)> = Vec::new();
     {
         let platform = discovered
             .references()
             .map_err(|e| ServerError::Reap(Box::new(e)))?;
         let iter = platform
-            .prefixed(gfs_common::STREAMS_PREFIX)
+            .prefixed(git_full_send_common::STREAMS_PREFIX)
             .map_err(|e| ServerError::Reap(Box::new(e)))?;
         for reference in iter {
             let mut reference = reference.map_err(ServerError::Reap)?;
@@ -1244,9 +1249,9 @@ pub fn reap_streams(
 /// equivalent of the count [`forget_stream`] returns.
 fn count_stream_refs(
     repo: &gix::Repository,
-    stream: &gfs_common::StreamId,
+    stream: &git_full_send_common::StreamId,
 ) -> Result<usize, ServerError> {
-    let prefix = gfs_common::stream_prefix(stream);
+    let prefix = git_full_send_common::stream_prefix(stream);
     let platform = repo
         .references()
         .map_err(|e| ServerError::Reap(Box::new(e)))?;
@@ -1285,7 +1290,7 @@ fn count_stream_refs(
 fn update_worktree_blocking(
     repo: &Path,
     worktree: &Path,
-    stream: &gfs_common::StreamId,
+    stream: &git_full_send_common::StreamId,
     options: UpdateOptions,
 ) -> Result<UpdateWorktreeReport, ServerError> {
     let discovered = gix::discover(repo).map_err(|_| ServerError::NotARepo(repo.to_path_buf()))?;
@@ -1409,7 +1414,7 @@ fn update_worktree_blocking(
     // One value, three surfaces (ADR-0017): the durable sink, the caller's human
     // summary, and `update-worktree --json`.
     let report = UpdateWorktreeReport {
-        envelope: gfs_common::metrics::Envelope::new("update_worktree"),
+        envelope: git_full_send_common::metrics::Envelope::new("update_worktree"),
         stream: stream.clone(),
         worktree: worktree.display().to_string(),
         tree,
@@ -1434,14 +1439,17 @@ fn update_worktree_blocking(
     Ok(report)
 }
 
-/// Resolve `stream`'s `code` ref (`gfs_common::code_ref`) to its tree id, or
+/// Resolve `stream`'s `code` ref (`git_full_send_common::code_ref`) to its tree id, or
 /// [`ServerError::MissingCodeRef`].
 ///
 /// `rev-parse --verify --quiet` exits non-zero with empty output when the ref is
 /// absent, which we map to the dedicated error rather than a confusing
 /// downstream `read-tree` failure.
-fn resolve_code_tree(git_dir: &Path, stream: &gfs_common::StreamId) -> Result<String, ServerError> {
-    let code_ref = gfs_common::code_ref(stream);
+fn resolve_code_tree(
+    git_dir: &Path,
+    stream: &git_full_send_common::StreamId,
+) -> Result<String, ServerError> {
+    let code_ref = git_full_send_common::code_ref(stream);
     let spec = format!("{code_ref}^{{tree}}");
     let output = Command::new("git")
         .arg("--git-dir")
@@ -1460,7 +1468,7 @@ fn resolve_code_tree(git_dir: &Path, stream: &gfs_common::StreamId) -> Result<St
     Ok(tree)
 }
 
-/// Resolve `stream`'s `extra` ref (`gfs_common::extra_ref`) to its tree id, or
+/// Resolve `stream`'s `extra` ref (`git_full_send_common::extra_ref`) to its tree id, or
 /// `None` when the ref is absent.
 ///
 /// Unlike the `code` ref, a missing `extra` ref is **not** an error: it means
@@ -1470,9 +1478,9 @@ fn resolve_code_tree(git_dir: &Path, stream: &gfs_common::StreamId) -> Result<St
 /// output when the ref is absent.
 fn resolve_extra_tree(
     git_dir: &Path,
-    stream: &gfs_common::StreamId,
+    stream: &git_full_send_common::StreamId,
 ) -> Result<Option<String>, ServerError> {
-    let extra_ref = gfs_common::extra_ref(stream);
+    let extra_ref = git_full_send_common::extra_ref(stream);
     let spec = format!("{extra_ref}^{{tree}}");
     let output = Command::new("git")
         .arg("--git-dir")
@@ -1671,12 +1679,12 @@ struct GitStepOutput {
     /// The step's stdout, for the steps whose output carries a count (`clean`).
     stdout: String,
     /// git's own trace2 stream for the step, when we captured one (ADR-0017).
-    trace: Option<gfs_common::trace2::Trace2>,
+    trace: Option<git_full_send_common::trace2::Trace2>,
 }
 
 impl GitStepOutput {
     /// The harvested trace2 stream, if any.
-    fn as_ref(&self) -> Option<&gfs_common::trace2::Trace2> {
+    fn as_ref(&self) -> Option<&git_full_send_common::trace2::Trace2> {
         self.trace.as_ref()
     }
 }
@@ -1702,7 +1710,7 @@ fn run_git_step(
         .arg(worktree)
         .env("GIT_INDEX_FILE", index)
         .args(args);
-    let capture = gfs_common::trace2::Trace2Capture::new();
+    let capture = git_full_send_common::trace2::Trace2Capture::new();
     if let Some(capture) = &capture {
         capture.apply(&mut command);
     }
@@ -1808,7 +1816,10 @@ fn count_worktree_files(worktree: &Path) -> Option<usize> {
 /// Warmth comes from git itself: `read-tree` emits an `index read/cache_nr`
 /// counter only when it had an index to read, so its presence *is* the warm
 /// signal. Without a trace2 stream we decline to guess.
-fn index_state(bytes: Option<u64>, trace: Option<&gfs_common::trace2::Trace2>) -> IndexState {
+fn index_state(
+    bytes: Option<u64>,
+    trace: Option<&git_full_send_common::trace2::Trace2>,
+) -> IndexState {
     let read = trace.and_then(|t| t.data_i64("index", "read/cache_nr"));
     let wrote = trace.and_then(|t| t.data_i64("index", "write/cache_nr"));
     IndexState {
@@ -1826,7 +1837,7 @@ fn index_state(bytes: Option<u64>, trace: Option<&gfs_common::trace2::Trace2>) -
 ///
 /// `None` when git reported none of them, so the record says "we don't know"
 /// rather than "all zero".
-fn read_tree_breakdown(trace: &gfs_common::trace2::Trace2) -> Option<ReadTreeBreakdown> {
+fn read_tree_breakdown(trace: &git_full_send_common::trace2::Trace2) -> Option<ReadTreeBreakdown> {
     let load_index_ms = trace.region_ms("index", "do_read_index");
     let resolve_tree_ms = trace.region_ms("unpack_trees", "traverse_trees");
     let unpack_ms = trace.region_ms("unpack_trees", "unpack_trees");
@@ -1860,7 +1871,7 @@ mod tests {
     #[test]
     fn hook_guards_the_shared_namespace_constant() {
         let hook = pre_receive_hook();
-        assert!(hook.contains(gfs_common::REF_NAMESPACE));
+        assert!(hook.contains(git_full_send_common::REF_NAMESPACE));
         assert!(hook.starts_with("#!/bin/sh"));
     }
 

@@ -1,7 +1,7 @@
 //! The server's per-operation metrics records (issue #42).
 //!
 //! Shapes the JSON Lines records the server writes to its metrics sink
-//! (`gfs_common::metrics`): one `receive` record per `git receive-pack`
+//! (`git_full_send_common::metrics`): one `receive` record per `git receive-pack`
 //! connection and one `update_worktree` record per checkout. Writing is
 //! best-effort — failures are logged, never propagated (ADR-0013).
 //!
@@ -18,7 +18,7 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub(crate) struct ReceiveRecord {
     #[serde(flatten)]
-    envelope: gfs_common::metrics::Envelope,
+    envelope: git_full_send_common::metrics::Envelope,
     /// Wall time for the whole connection, in milliseconds.
     pub duration_ms: f64,
     /// What this connection actually was — see [`crate::Outcome`]. The field to
@@ -84,13 +84,13 @@ impl ReceiveRecord {
         duration_ms: f64,
         outcome: &'static str,
         status: &std::process::ExitStatus,
-        inbound: gfs_common::pktline::WireCounts,
-        outbound: gfs_common::pktline::WireCounts,
+        inbound: git_full_send_common::pktline::WireCounts,
+        outbound: git_full_send_common::pktline::WireCounts,
         refs_updated: Vec<String>,
     ) -> Self {
         use std::os::unix::process::ExitStatusExt;
         Self {
-            envelope: gfs_common::metrics::Envelope::new("receive"),
+            envelope: git_full_send_common::metrics::Envelope::new("receive"),
             duration_ms,
             outcome,
             auth_failure: None,
@@ -126,7 +126,7 @@ impl ReceiveRecord {
         auth_failure: &'static str,
     ) -> Self {
         Self {
-            envelope: gfs_common::metrics::Envelope::new("receive"),
+            envelope: git_full_send_common::metrics::Envelope::new("receive"),
             duration_ms,
             outcome,
             auth_failure: Some(auth_failure),
@@ -152,5 +152,5 @@ impl ReceiveRecord {
 
 /// Best-effort: write a record to the repo's sink under `git_dir`.
 pub(crate) fn record(git_dir: &Path, record: &impl Serialize) {
-    gfs_common::metrics::record(git_dir, record);
+    git_full_send_common::metrics::record(git_dir, record);
 }

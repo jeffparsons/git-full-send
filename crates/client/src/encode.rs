@@ -24,11 +24,11 @@
 //! working-tree delta, not the repository size. The index snapshot is read
 //! only and never written back, so the user's `.git/index`, branch, and
 //! worktree are left exactly as they were — the only ref we move is the
-//! stream's `code` ref (`gfs_common::code_ref`).
+//! stream's `code` ref (`git_full_send_common::code_ref`).
 
 use std::path::{Path, PathBuf};
 
-use gfs_common::StreamId;
+use git_full_send_common::StreamId;
 use gix::bstr::{BStr, ByteSlice};
 use gix::objs::tree::EntryKind;
 use thiserror::Error;
@@ -48,7 +48,7 @@ pub struct EncodeOutcome {
     pub commit: gix::ObjectId,
     /// The tree that commit holds.
     pub tree: gix::ObjectId,
-    /// The `code` ref that was written (`gfs_common::code_ref` for the stream).
+    /// The `code` ref that was written (`git_full_send_common::code_ref` for the stream).
     pub code_ref: String,
     /// Size metadata for the code layer's working-tree *delta* this sync (issue
     /// #42). It is the delta, not the whole tree: the base is the index, and only
@@ -112,7 +112,7 @@ pub struct ExtraOutcome {
     pub commit: gix::ObjectId,
     /// The tree that commit holds.
     pub tree: gix::ObjectId,
-    /// The `extra` ref that was written (`gfs_common::extra_ref` for the stream).
+    /// The `extra` ref that was written (`git_full_send_common::extra_ref` for the stream).
     pub extra_ref: String,
     /// Size metadata for the extra layer (issue #42). Unlike `code`, this is the
     /// *full* selected set each sync, since the whole force-include set is
@@ -216,7 +216,7 @@ pub enum EncodeError {
 /// into a commit under `stream`'s `code` ref, returning the commit id.
 ///
 /// The user's branch, index, and working tree are left untouched; only the
-/// stream's `code` ref (`gfs_common::code_ref`) is created or force-updated.
+/// stream's `code` ref (`git_full_send_common::code_ref`) is created or force-updated.
 pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, EncodeError> {
     let repo = gix::discover(repo_dir).map_err(|source| EncodeError::OpenRepo {
         path: repo_dir.to_path_buf(),
@@ -353,7 +353,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 
     let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_MESSAGE)?;
 
-    let code_ref = gfs_common::code_ref(stream);
+    let code_ref = git_full_send_common::code_ref(stream);
     update_ref(
         &repo,
         &code_ref,
@@ -376,7 +376,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 ///
 /// The selected set (ADR-0007, [`crate::select`]) becomes the `extra` tree built
 /// with the gix `Editor`; the commit is **parented on the previous sync's
-/// retained `extra` tip** (`gfs_common::sent_extra_ref`) so the prior, often
+/// retained `extra` tip** (`git_full_send_common::sent_extra_ref`) so the prior, often
 /// large, build outputs stay available as delta bases (ADR-0004/ADR-0005), or is
 /// rootless on the first sync. Parenting on the *retained* tip — what the server
 /// is known to have — rather than the local `extra` ref means a failed push never
@@ -385,7 +385,7 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 /// With no patterns / no matches the `extra` tree is empty, but a commit is still
 /// produced so the chain (and the push alongside `code`) stays uniform. The
 /// user's branch, index, and working tree are untouched; only the stream's
-/// `extra` ref (`gfs_common::extra_ref`) is created or force-updated.
+/// `extra` ref (`git_full_send_common::extra_ref`) is created or force-updated.
 ///
 /// `user_include` overrides the per-user include file (the `--user-include` CLI
 /// flag); `None` falls back to the environment-resolved path
@@ -410,7 +410,7 @@ pub fn encode_extra(
         .to_path_buf();
 
     // Parent on the previously-pushed `extra` tip if we have one, else rootless.
-    let sent_extra = gfs_common::sent_extra_ref(stream);
+    let sent_extra = git_full_send_common::sent_extra_ref(stream);
     let parent = match repo
         .try_find_reference(sent_extra.as_str())
         .map_err(|e| EncodeError::ExtraParent(Box::new(e)))?
@@ -459,7 +459,7 @@ pub fn encode_extra(
     let t_phase = std::time::Instant::now();
     let commit_id = write_synth_commit(&repo, tree_id, parent, SYNTH_EXTRA_MESSAGE)?;
 
-    let extra_ref = gfs_common::extra_ref(stream);
+    let extra_ref = git_full_send_common::extra_ref(stream);
     update_ref(
         &repo,
         &extra_ref,
@@ -621,12 +621,18 @@ mod tests {
     #[test]
     fn code_ref_is_under_the_namespace() {
         let stream = StreamId::new("test").unwrap();
-        assert!(gfs_common::code_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
+        assert!(
+            git_full_send_common::code_ref(&stream)
+                .starts_with(git_full_send_common::REF_NAMESPACE)
+        );
     }
 
     #[test]
     fn extra_ref_is_under_the_namespace() {
         let stream = StreamId::new("test").unwrap();
-        assert!(gfs_common::extra_ref(&stream).starts_with(gfs_common::REF_NAMESPACE));
+        assert!(
+            git_full_send_common::extra_ref(&stream)
+                .starts_with(git_full_send_common::REF_NAMESPACE)
+        );
     }
 }

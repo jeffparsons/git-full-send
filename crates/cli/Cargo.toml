@@ -1,5 +1,5 @@
 [package]
-name = "gfs-cli"
+name = "git-full-send"
 description = "Command-line interface for git-full-send, exposing the client and server commands."
 version.workspace = true
 edition.workspace = true
@@ -12,9 +12,9 @@ name = "git-full-send"
 path = "src/main.rs"
 
 [dependencies]
-gfs-common.workspace = true
-gfs-client.workspace = true
-gfs-server.workspace = true
+git-full-send-common.workspace = true
+git-full-send-client.workspace = true
+git-full-send-server.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 # `--json` prints an operation's record verbatim on stdout (ADR-0017); `serde`
@@ -28,7 +28,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 # The end-to-end test stands up an in-process server and temp repos, then drives
 # the built `git-full-send` binary as a subprocess.
-gfs-server.workspace = true
+git-full-send-server.workspace = true
 # Parse the per-operation metrics records the round-trip writes (issue #42).
 serde_json.workspace = true
 tempfile.workspace = true

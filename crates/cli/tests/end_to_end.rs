@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 
-use gfs_common::{StreamId, code_ref, extra_ref};
+use git_full_send_common::{StreamId, code_ref, extra_ref};
 use test_support::{commit_all, git, init_bare_repo, init_temp_repo, write_file};
 
 /// Path to the built `git-full-send` binary (Cargo sets this for integration
@@ -41,13 +41,13 @@ fn test_stream() -> StreamId {
 /// test process exits (the same fire-and-forget lifecycle the old `std::thread`
 /// helper had).
 fn start_server(repo: &Path) -> SocketAddr {
-    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
+    let listener = git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        let _ = gfs_server::serve_async(
+        let _ = git_full_send_server::serve_async(
             listener,
-            gfs_server::ListenConfig::default(),
+            git_full_send_server::ListenConfig::default(),
             std::future::pending::<()>(),
         )
         .await;
@@ -473,7 +473,10 @@ async fn json_output_is_the_same_record_that_lands_in_the_sink() {
 
     // It is self-describing, and carries every number the human summary shows.
     assert_eq!(printed["kind"], "sync");
-    assert_eq!(printed["schema"], gfs_common::metrics::SCHEMA_VERSION);
+    assert_eq!(
+        printed["schema"],
+        git_full_send_common::metrics::SCHEMA_VERSION
+    );
     assert_eq!(printed["stream"], stream_arg);
     assert_eq!(printed["remote"], remote);
     for field in ["total_ms", "retain_ms"] {
@@ -1128,19 +1131,21 @@ async fn listen_refuses_to_start_without_an_authentication_choice(/* issue #81 *
 #[tokio::test]
 async fn a_token_file_sync_round_trips_through_the_binary(/* issue #81 */) {
     let server = init_bare_repo();
-    let listener = gfs_server::bind("127.0.0.1:0".parse().unwrap(), server.path().to_path_buf())
-        .expect("bind listener");
+    let listener =
+        git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), server.path().to_path_buf())
+            .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     let secret = "the-shared-secret-value";
-    let config = gfs_server::ListenConfig {
-        auth: std::sync::Arc::new(gfs_server::Auth::Token(
-            gfs_common::auth::Token::new(secret, "the test").expect("a valid token"),
+    let config = git_full_send_server::ListenConfig {
+        auth: std::sync::Arc::new(git_full_send_server::Auth::Token(
+            git_full_send_common::auth::Token::new(secret, "the test").expect("a valid token"),
         )),
         auth_timeout: std::time::Duration::from_millis(300),
         ..Default::default()
     };
     tokio::spawn(async move {
-        let _ = gfs_server::serve_async(listener, config, std::future::pending::<()>()).await;
+        let _ =
+            git_full_send_server::serve_async(listener, config, std::future::pending::<()>()).await;
     });
 
     let client = init_temp_repo();
