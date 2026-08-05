@@ -391,10 +391,14 @@ pub fn encode(repo_dir: &Path, stream: &StreamId) -> Result<EncodeOutcome, Encod
 /// flag); `None` falls back to the environment-resolved path
 /// ([`crate::select::user_include_path`]). The committed project-level file
 /// ([`crate::select::PROJECT_INCLUDE_FILE`]) is always consulted regardless.
+/// `extra_includes` (the repeatable `--extra-include` CLI flag, issue #80) are
+/// further pattern files layered after the per-user layer, last-match-wins; a
+/// missing one is an error, not an empty layer.
 pub fn encode_extra(
     repo_dir: &Path,
     stream: &StreamId,
     user_include: Option<&Path>,
+    extra_includes: &[PathBuf],
 ) -> Result<ExtraOutcome, EncodeError> {
     let repo = gix::discover(repo_dir).map_err(|source| EncodeError::OpenRepo {
         path: repo_dir.to_path_buf(),
@@ -423,7 +427,8 @@ pub fn encode_extra(
     // Build the `extra` tree from the selected paths, seeded from the empty tree.
     // The walk reports what it cost as well as what it found (ADR-0017).
     let t_phase = std::time::Instant::now();
-    let selection = crate::select::select_extra_paths_measured(&workdir, user_include)?;
+    let selection =
+        crate::select::select_extra_paths_measured(&workdir, user_include, extra_includes)?;
     let mut stats = ExtraLayerStats {
         files: selection.paths.len(),
         bytes: 0,

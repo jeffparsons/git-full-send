@@ -304,7 +304,7 @@ declare them as **allow-list patterns**
 
 ### Where the patterns live
 
-Two layers, both optional:
+Three layers, all optional:
 
 - **Project file** — `.git-full-send-include` at the repo root. Committed and
   shared with the team; this is the primary place to declare force-includes.
@@ -314,9 +314,17 @@ Two layers, both optional:
   2. the `GIT_FULL_SEND_USER_INCLUDE` environment variable, or
   3. `$XDG_CONFIG_HOME/git-full-send/include` (falling back to
      `$HOME/.config/git-full-send/include`).
+- **Extra files** — `sync --extra-include <path>`, repeatable, for tooling that
+  drives a sync and wants to contribute its own patterns. Unlike
+  `--user-include`, this is **additive**: the per-user lookup above still
+  applies, with the extra files layered after it. And unlike the other pattern
+  files, a missing `--extra-include` path is an **error** rather than an empty
+  layer — the flag exists for callers passing a file they just wrote, so a
+  missing one is always a bug.
 
-The two layers are evaluated `[project, then user]` with **last-match-wins**, so
-a per-user pattern can override a project one.
+The layers are evaluated `[project, user, extra…]` with **last-match-wins**, so
+a per-user pattern can override a project one, and an extra-file pattern can
+override both (extra files apply in the order given).
 
 ### Syntax
 

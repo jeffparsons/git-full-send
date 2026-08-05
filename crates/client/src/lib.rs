@@ -149,15 +149,19 @@ pub enum ClientError {
 /// the repo's configured `git-full-send.stream-id`, generating and persisting
 /// one on first use. `user_include` overrides the per-user force-include pattern
 /// file (the `--user-include` flag); `None` resolves it from the environment
-/// (`GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` / `$HOME`) as usual. `auth`
-/// is the shared secret the server may require (ADR-0019), presented by both
-/// pushes; `None` presents nothing, which is what an `--allow-anonymous` server
-/// expects.
+/// (`GIT_FULL_SEND_USER_INCLUDE` / `$XDG_CONFIG_HOME` / `$HOME`) as usual.
+/// `extra_includes` (the repeatable `--extra-include` flag, issue #80) are
+/// further pattern files layered *after* the per-user layer, last-match-wins —
+/// additive, unlike `user_include`'s replacing override — and a missing one is
+/// an error, not an empty layer. `auth` is the shared secret the server may
+/// require (ADR-0019), presented by both pushes; `None` presents nothing, which
+/// is what an `--allow-anonymous` server expects.
 pub async fn sync(
     repo_dir: PathBuf,
     remote: String,
     stream: Option<StreamId>,
     user_include: Option<PathBuf>,
+    extra_includes: Vec<PathBuf>,
     auth: Option<Token>,
 ) -> Result<SyncSummary, ClientError> {
     let stream = stream::resolve_stream(&repo_dir, stream)?;
@@ -171,7 +175,7 @@ pub async fn sync(
     tracing::info!(commit = %code.commit, stream = %stream, ref_ = %code.code_ref, "encoded code state");
 
     let t = Instant::now();
-    let extra = encode_extra(&repo_dir, &stream, user_include.as_deref())?;
+    let extra = encode_extra(&repo_dir, &stream, user_include.as_deref(), &extra_includes)?;
     let extra_encode_ms = elapsed_ms(t);
     tracing::info!(commit = %extra.commit, stream = %stream, ref_ = %extra.extra_ref, "encoded extra state");
 

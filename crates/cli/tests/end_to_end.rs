@@ -754,7 +754,12 @@ fn command_line_surface_is_wired_up() {
         );
     }
     let sync_help = help(&["sync", "--help"]);
-    for flag in ["--user-include", "--json", "--token-file"] {
+    for flag in [
+        "--user-include",
+        "--extra-include",
+        "--json",
+        "--token-file",
+    ] {
         assert!(
             sync_help.contains(flag),
             "sync exposes {flag}:\n{sync_help}"
@@ -902,6 +907,96 @@ async fn reap_through_the_cli_dry_run_then_deletes() {
     assert!(
         listed.trim().is_empty(),
         "no streams remain after reaping:\n{listed}",
+    );
+}
+
+// --- Additive extra includes (issue #80) -------------------------------------
+
+/// `--extra-include` layers on top of the per-user lookup instead of replacing
+/// it: a sync given a real per-user file (via `GIT_FULL_SEND_USER_INCLUDE`)
+/// *and* an `--extra-include` file delivers force-includes from both layers —
+/// the anti-replacement guarantee the flag exists for.
+#[tokio::test]
+async fn extra_include_layers_on_top_of_the_user_lookup(/* issue #80 */) {
+    let server = init_bare_repo();
+    let addr = start_server(server.path());
+
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    write_file(c, ".gitignore", "dist/\nconfig/\nout/\n");
+    write_file(c, ".git-full-send-include", "/dist/\n");
+    commit_all(c, "baseline");
+    // One gitignored file per layer: project, user, extra.
+    write_file(c, "dist/app.js", "app");
+    write_file(c, "config/local.toml", "cfg");
+    write_file(c, "out/artifact.bin", "bin");
+
+    let aux = tempfile::tempdir().expect("aux dir");
+    let user = aux.path().join("user-include");
+    std::fs::write(&user, "/config/local.toml\n").expect("write user include");
+    let extra = aux.path().join("extra-include");
+    std::fs::write(&extra, "/out/artifact.bin\n").expect("write extra include");
+
+    let stream = test_stream();
+    let mut command = cli_command(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+        "--extra-include",
+        extra.to_str().unwrap(),
+    ]);
+    // Point the pinned env var at the real per-user file for this one test.
+    command.env("GIT_FULL_SEND_USER_INCLUDE", &user);
+    let output = command.output().await.expect("spawn sync");
+    assert!(
+        output.status.success(),
+        "sync with --extra-include failed ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let synced = tree_paths(server.path(), &extra_ref(&stream));
+    for path in ["dist/app.js", "config/local.toml", "out/artifact.bin"] {
+        assert!(
+            synced.contains(path),
+            "`{path}` was force-included (all three layers contribute): {synced:?}",
+        );
+    }
+}
+
+/// A missing `--extra-include` file fails the sync, naming the path. Unlike the
+/// other pattern files it is never an empty layer: the flag exists for tooling
+/// passing a file it just wrote, and silently dropping its patterns is the
+/// failure mode the flag was added to eliminate.
+#[tokio::test]
+async fn sync_fails_when_an_extra_include_file_is_missing(/* issue #80 */) {
+    let client = init_temp_repo();
+    let c = client.path();
+    write_file(c, "src/main.rs", "fn main() {}");
+    commit_all(c, "baseline");
+
+    // The failure comes from reading the pattern file, before any connection —
+    // the unroutable remote proves it as well as documenting it.
+    let stderr = run_cli_expecting_failure(&[
+        "sync",
+        "--repo",
+        c.to_str().unwrap(),
+        "--remote",
+        "127.0.0.1:1",
+        "--stream-id",
+        test_stream().as_str(),
+        "--extra-include",
+        "/nonexistent/extra-include",
+    ])
+    .await;
+    assert!(
+        stderr.contains("/nonexistent/extra-include"),
+        "the error names the missing file:\n{stderr}",
     );
 }
 
