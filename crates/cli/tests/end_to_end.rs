@@ -41,16 +41,18 @@ fn test_stream() -> StreamId {
 /// test process exits (the same fire-and-forget lifecycle the old `std::thread`
 /// helper had).
 fn start_server(repo: &Path) -> SocketAddr {
+    start_server_with(repo, git_full_send_server::ListenConfig::default())
+}
+
+/// [`start_server`], with the listener's configuration chosen by the test —
+/// how the advertisement-curation variants (issue #79) are exercised.
+fn start_server_with(repo: &Path, config: git_full_send_server::ListenConfig) -> SocketAddr {
     let listener = git_full_send_server::bind("127.0.0.1:0".parse().unwrap(), repo.to_path_buf())
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        let _ = git_full_send_server::serve_async(
-            listener,
-            git_full_send_server::ListenConfig::default(),
-            std::future::pending::<()>(),
-        )
-        .await;
+        let _ =
+            git_full_send_server::serve_async(listener, config, std::future::pending::<()>()).await;
     });
     addr
 }
@@ -794,12 +796,116 @@ fn command_line_surface_is_wired_up() {
         );
     }
     let listen_help = help(&["listen", "--help"]);
-    for flag in ["--addr", "--max-connections", "--connection-timeout"] {
+    for flag in [
+        "--addr",
+        "--max-connections",
+        "--connection-timeout",
+        "--no-hide-refs",
+        "--advertise-ref",
+    ] {
         assert!(
             listen_help.contains(flag),
             "listen exposes {flag}:\n{listen_help}",
         );
     }
+}
+
+/// Issue #79 / ADR-0020: a listener collapses each connection's ref
+/// advertisement to the curated anchor set by default, `advertise` widens the
+/// set, and turning `hide_refs` off restores the full advertisement — and a
+/// sync still round-trips through the curated listener.
+#[tokio::test]
+async fn listen_collapses_the_ref_advertisement_to_the_anchor_set(/* issue #79 */) {
+    let server = init_temp_repo();
+    let s = server.path();
+    write_file(s, "seed.txt", "s");
+    commit_all(s, "seed");
+    // The workstation-clone shape: a crowd of remote-tracking refs is what
+    // makes the full advertisement expensive.
+    git(
+        s,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+    );
+    for i in 0..40 {
+        let name = format!("refs/remotes/origin/branch-{i}");
+        git(s, &["update-ref", &name, "HEAD"]);
+    }
+    git(
+        s,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/branch-0",
+        ],
+    );
+    git(s, &["update-ref", "refs/pull/1/head", "HEAD"]);
+
+    async fn probe(addr: SocketAddr) -> serde_json::Value {
+        let out = run_cli_capture(&["probe", "--remote", &addr.to_string(), "--json"]).await;
+        serde_json::from_str(&out).expect("probe emits one JSON object")
+    }
+
+    // Default: `refs/heads/main` plus the derived origin anchor — not the crowd.
+    let curated = probe(start_server(s)).await;
+    assert_eq!(
+        curated["refs_advertised"], 2,
+        "the curated advertisement is the anchor set: {curated}",
+    );
+
+    // Extra advertise patterns widen the set.
+    let widened = probe(start_server_with(
+        s,
+        git_full_send_server::ListenConfig {
+            advertise: vec!["refs/pull/".into()],
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert_eq!(
+        widened["refs_advertised"], 3,
+        "an advertise pattern unhides its refs: {widened}",
+    );
+
+    // Hiding off restores the full advertisement.
+    let full = probe(start_server_with(
+        s,
+        git_full_send_server::ListenConfig {
+            hide_refs: false,
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(
+        full["refs_advertised"].as_u64().unwrap() >= 42,
+        "hide_refs off advertises everything: {full}",
+    );
+
+    // The curated listener still receives a sync: the namespace stays writable
+    // and advertised.
+    let client = init_temp_repo();
+    write_file(client.path(), "src/main.rs", "fn main() {}");
+    commit_all(client.path(), "code");
+    let addr = start_server(s);
+    let stream = test_stream();
+    run_cli(&[
+        "sync",
+        "--repo",
+        client.path().to_str().unwrap(),
+        "--remote",
+        &addr.to_string(),
+        "--stream-id",
+        stream.as_str(),
+    ])
+    .await;
+    assert!(
+        ref_exists(s, &code_ref(&stream)),
+        "the synced code ref landed through the curated listener",
+    );
 }
 
 /// Seconds since the Unix epoch, for back-dating a stream's `code` ref.

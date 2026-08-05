@@ -65,6 +65,23 @@ git-full-send listen --repo /path/to/target-repo \
 Leave it running. It serves each connection independently and stays up across
 syncs.
 
+By default each connection's ref advertisement is collapsed to a curated
+anchor set — `refs/heads/*`, the gfs namespace, and each remote's default
+branch — instead of every ref in the repo, which on a workstation clone can
+mean megabytes of advertisement per connection
+([ADR-0020](adr/0020-curating-the-ref-advertisement.md)). Two flags adjust it:
+
+- `--advertise-ref <ref-or-prefix/>` — advertise something extra alongside the
+  anchor set (repeatable), for a repo whose useful delta base lives somewhere
+  unusual.
+- `--no-hide-refs` — advertise everything, as before ADR-0020.
+
+`doctor`'s `anchors` check shows what the curated advertisement will offer and
+warns when a remote contributes no anchor (fix:
+`git remote set-head <remote> --auto`) or when every anchor is stale (fix:
+fetch — a cold sync's pack size is governed by the freshness of the best
+advertised ref).
+
 ## 2b. The shared secret
 
 `listen` hands what it receives to `git receive-pack`, and `update-worktree` then
@@ -471,7 +488,12 @@ git-full-send doctor --repo /path/to/target-repo [--worktree /path/to/worktree]
 Reports the conditions that predictably make syncs slow — and, unlike a bare
 number, what to do about each ([ADR-0018](adr/0018-liveness-and-repo-health-surfaces.md)):
 
-- **ref count**, and the ref advertisement it implies on *every* connection;
+- **ref count**, and the ref advertisement it implies on *every* connection
+  (largely defused by the curated advertisement `listen` applies by default —
+  [ADR-0020](adr/0020-curating-the-ref-advertisement.md));
+- **advertisement anchors**: what the curated advertisement will offer, whether
+  every remote contributes its default branch, and whether the anchors are
+  fresh enough to serve as a cold sync's delta base;
 - **`alternates`** entries that don't resolve (git prints `unable to normalize
   alternate object path` for these and carries on regardless, so they go
   unnoticed);

@@ -164,6 +164,17 @@ struct ListenArgs {
     /// is aborted so a stuck client can't pin a slot (issue #47).
     #[arg(long, value_name = "SECS", default_value_t = git_full_send_common::DEFAULT_CONNECTION_TIMEOUT_SECS)]
     connection_timeout: u64,
+    /// Advertise every ref instead of collapsing the advertisement to the
+    /// curated anchor set (ADR-0020). On a many-ref repo the full advertisement
+    /// can dwarf the push itself, so this is mainly an escape hatch for a repo
+    /// whose useful delta base is somewhere the anchor derivation does not look
+    /// (see also `--advertise-ref`).
+    #[arg(long)]
+    no_hide_refs: bool,
+    /// Extra ref (or ref-prefix, with a trailing `/`) to advertise alongside
+    /// the curated anchor set. Repeatable. Has no effect with `--no-hide-refs`.
+    #[arg(long, value_name = "REF", conflicts_with = "no_hide_refs")]
+    advertise_ref: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -293,6 +304,8 @@ async fn main() -> Result<()> {
                     args.token_file.as_deref(),
                     args.allow_anonymous,
                 )?),
+                hide_refs: !args.no_hide_refs,
+                advertise: args.advertise_ref,
                 ..Default::default()
             };
             git_full_send_server::listen(args.addr, args.repo, config).await?
