@@ -124,6 +124,7 @@ pub fn doctor(repo: &Path, worktree: Option<&Path>) -> Result<DoctorReport, Serv
 
     let mut checks = vec![
         check_refs(&discovered),
+        check_anchors(&discovered),
         check_alternates(&objects_dir),
         check_objects(&objects_dir),
         check_autogc(&discovered),
@@ -176,16 +177,152 @@ fn check_refs(repo: &gix::Repository) -> Check {
          on every connection"
     );
     let remedy = (status == WARN).then(|| {
-        "Every push connection pays this before any of your data moves, and a sync makes \
-         two. Sync into a dedicated repository whose objects/info/alternates points at \
-         this one's object store: it keeps the delta bases that make pushes small while \
-         advertising only a handful of refs."
+        "`listen` collapses this advertisement to a curated anchor set by default \
+         (ADR-0020), so git-full-send connections do not pay it unless \
+         `--no-hide-refs` is given — see the `anchors` check for what gets \
+         advertised instead. For the cost every *other* git client of this repo \
+         still pays, sync into a dedicated repository whose objects/info/alternates \
+         points at this one's object store."
             .to_string()
     });
     Check::new("refs", status, summary, remedy)
         .with("refs", total)
         .with("refs_ours", ours)
         .with("advertisement_bytes_estimate", bytes)
+}
+
+/// A curated-advertisement anchor older than this makes a cold sync pay
+/// real pack bytes for the staleness — on the measured repo, an eleven-day-old
+/// anchor meant a 13.6 MB cold pack where a fresh one meant 196 B.
+const ANCHOR_STALE_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// The anchor set the curated advertisement will offer (ADR-0020), and whether
+/// it is any good: every remote should contribute its default branch, and the
+/// freshest anchor is what a cold sync's pack size is governed by.
+fn check_anchors(repo: &gix::Repository) -> Check {
+    let advertised = crate::advertised_refs(repo);
+
+    let remotes: Vec<String> = repo
+        .remote_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    let missing: Vec<String> = remotes
+        .iter()
+        .filter(|remote| crate::remote_anchor(repo, remote).is_none())
+        .cloned()
+        .collect();
+
+    // The freshest anchor commit, across the per-remote anchors *and*
+    // `refs/heads/*` — on a dedicated sync repo the local branches are the
+    // anchors.
+    let freshest = freshest_advertised_secs(repo, &advertised);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let age_days = freshest.map(|secs| (now - secs).max(0) / (24 * 60 * 60));
+
+    let check = |status, summary: String, remedy: Option<String>| {
+        Check::new("anchors", status, summary, remedy)
+            .with("advertised", advertised.clone())
+            .with(
+                "freshest_anchor_age_days",
+                age_days
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .with("remotes_without_anchor", missing.clone())
+    };
+
+    if !missing.is_empty() {
+        return check(
+            WARN,
+            format!(
+                "remote(s) contribute no advertisement anchor: {}",
+                missing.join(", "),
+            ),
+            Some(format!(
+                "without an anchor the curated advertisement (ADR-0020) offers a cold \
+                 sync no fresh delta base, so its first push sends a near-full pack. \
+                 Run {} to record the remote's default branch",
+                missing
+                    .iter()
+                    .map(|r| format!("`git remote set-head {r} --auto`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        );
+    }
+    match age_days {
+        Some(days) if now > 0 && days * 24 * 60 * 60 >= ANCHOR_STALE_SECS => check(
+            WARN,
+            format!(
+                "the freshest advertised anchor is {days} day(s) old — a cold sync will \
+                 delta against a stale base"
+            ),
+            Some(
+                "the cold-sync pack size is governed by how fresh the best advertised \
+                 ref is; `git fetch` in this repo to freshen its anchors"
+                    .to_string(),
+            ),
+        ),
+        Some(days) => check(
+            OK,
+            format!(
+                "advertising {} pattern(s); freshest anchor {days} day(s) old",
+                advertised.len(),
+            ),
+            None,
+        ),
+        None => check(
+            OK,
+            format!(
+                "advertising {} pattern(s); no anchor commits yet to judge freshness by",
+                advertised.len(),
+            ),
+            None,
+        ),
+    }
+}
+
+/// The most recent committer time, in Unix seconds, among the advertised
+/// anchors: the exact per-remote anchor refs, plus every branch under an
+/// advertised `refs/heads/` pattern.
+fn freshest_advertised_secs(repo: &gix::Repository, advertised: &[String]) -> Option<i64> {
+    let mut freshest: Option<i64> = None;
+    let mut consider = |secs: Option<i64>| {
+        if let Some(secs) = secs {
+            freshest = Some(freshest.map_or(secs, |f| f.max(secs)));
+        }
+    };
+    for name in advertised {
+        // The gfs namespace holds synced scratch commits, not delta-base
+        // anchors a *first* sync could use.
+        if name.starts_with(git_full_send_common::REF_NAMESPACE) {
+            continue;
+        }
+        if let Some(prefix) = name.strip_suffix('/') {
+            let Ok(platform) = repo.references() else {
+                continue;
+            };
+            let Ok(iter) = platform.prefixed(format!("{prefix}/").as_str()) else {
+                continue;
+            };
+            for reference in iter.flatten() {
+                consider(committer_secs(repo, reference));
+            }
+        } else if let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) {
+            consider(committer_secs(repo, reference));
+        }
+    }
+    freshest
+}
+
+/// `reference`'s tip committer time, in Unix seconds, if it peels to a commit.
+fn committer_secs(repo: &gix::Repository, mut reference: gix::Reference<'_>) -> Option<i64> {
+    let id = reference.peel_to_id().ok()?.detach();
+    repo.find_commit(id).ok()?.time().ok().map(|t| t.seconds)
 }
 
 /// A repository whose refs cannot be enumerated at all.
@@ -512,5 +649,87 @@ mod tests {
     fn bytes_format_with_binary_units() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    /// Seed a repo with one commit whose committer date is `date` (any format
+    /// `git` accepts), so anchor-freshness verdicts are deterministic.
+    fn seeded_repo(date: &str) -> tempfile::TempDir {
+        let dir = test_support::init_temp_repo();
+        let path = dir.path();
+        test_support::write_file(path, "f", "x");
+        test_support::git(path, &["add", "-A"]);
+        let output = std::process::Command::new("git")
+            .args(["commit", "--quiet", "--message", "seed"])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .current_dir(path)
+            .output()
+            .expect("spawn git commit");
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        dir
+    }
+
+    /// A remote with no `HEAD` symref and no conventionally-named branch gives
+    /// the curated advertisement nothing to anchor a cold sync's delta base on
+    /// (ADR-0020) — worth an operator's attention, with the one-line fix named.
+    #[test]
+    fn a_remote_without_an_anchor_warns_with_a_set_head_remedy() {
+        let dir = seeded_repo("2026-01-01T00:00:00 +0000");
+        test_support::git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+
+        let repo = gix::discover(dir.path()).expect("open repo");
+        let check = check_anchors(&repo);
+        assert_eq!(check.status, WARN, "{}", check.summary);
+        assert!(
+            check
+                .remedy
+                .as_deref()
+                .unwrap()
+                .contains("git remote set-head origin --auto"),
+            "the remedy names the fix: {:?}",
+            check.remedy,
+        );
+    }
+
+    /// Every anchor stale: the cold-sync pack will be governed by that
+    /// staleness, so the check says to fetch.
+    #[test]
+    fn a_stale_anchor_warns_that_a_cold_sync_will_pay_for_it() {
+        let dir = seeded_repo("2020-01-01T00:00:00 +0000");
+
+        let repo = gix::discover(dir.path()).expect("open repo");
+        let check = check_anchors(&repo);
+        assert_eq!(check.status, WARN, "{}", check.summary);
+        assert!(
+            check.remedy.as_deref().unwrap().contains("git fetch"),
+            "the remedy is to freshen: {:?}",
+            check.remedy,
+        );
+    }
+
+    /// A fresh local branch (the dedicated-repo shape has no remotes at all) is
+    /// a healthy anchor set.
+    #[test]
+    fn a_fresh_anchor_and_no_remotes_is_ok() {
+        let dir = test_support::init_temp_repo();
+        let path = dir.path();
+        test_support::write_file(path, "f", "x");
+        test_support::commit_all(path, "seed");
+
+        let repo = gix::discover(path).expect("open repo");
+        let check = check_anchors(&repo);
+        assert_eq!(check.status, OK, "{}", check.summary);
     }
 }

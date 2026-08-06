@@ -29,6 +29,7 @@ Statuses: `proposed` (constraints/options recorded, decision deferred),
 | [0017](0017-making-operation-cost-self-explaining.md) | Making operation cost self-explaining | accepted |
 | [0018](0018-liveness-and-repo-health-surfaces.md) | Liveness and repo-health surfaces | accepted |
 | [0019](0019-authenticating-the-receive-pack-connection.md) | Authenticating the `receive-pack` connection | accepted |
+| [0020](0020-curating-the-ref-advertisement.md) | Curating the ref advertisement with `receive.hideRefs` | accepted |
 
 ## Open research tasks
 

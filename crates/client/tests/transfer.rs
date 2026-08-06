@@ -463,12 +463,13 @@ async fn a_push_separates_ref_advertisement_from_pack_data() {
     let small_advertisement = first.received.pre_flush;
 
     // --- Now give the server a pile of refs and push again. Nothing about the
-    // *data* changed; only the advertisement did.
+    // *data* changed; only the advertisement did. Branches, because the curated
+    // advertisement (ADR-0020) keeps `refs/heads/*` visible.
     // (Pointed at the ref we just pushed: the bare server repo has no HEAD.)
     for i in 0..200 {
         git(
             server.path(),
-            &["update-ref", &format!("refs/noise/r{i}"), &code],
+            &["update-ref", &format!("refs/heads/noise-{i}"), &code],
         );
     }
     // Something genuinely new to push, so this is a real update and not git

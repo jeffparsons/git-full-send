@@ -230,6 +230,14 @@ pub struct ListenConfig {
     /// client that will never send one is told so
     /// ([`git_full_send_common::DEFAULT_AUTH_TIMEOUT_SECS`]).
     pub auth_timeout: Duration,
+    /// Whether to collapse each connection's ref advertisement to a curated
+    /// anchor set via `receive.hideRefs` (ADR-0020). On by default: measured
+    /// steady-state packs are byte-identical with and without hiding, and the
+    /// derived anchors keep the cold case's delta base advertised.
+    pub hide_refs: bool,
+    /// Extra unhide patterns appended to the derived anchor set, for repos whose
+    /// useful delta base lives somewhere [`advertised_refs`] does not look.
+    pub advertise: Vec<String>,
 }
 
 impl Default for ListenConfig {
@@ -241,8 +249,93 @@ impl Default for ListenConfig {
             ),
             auth: Arc::new(Auth::Anonymous),
             auth_timeout: Duration::from_secs(git_full_send_common::DEFAULT_AUTH_TIMEOUT_SECS),
+            hide_refs: true,
+            advertise: Vec::new(),
         }
     }
+}
+
+/// The ref patterns a connection advertises when hiding is on (ADR-0020): the
+/// `receive.hideRefs` *unhide* set.
+///
+/// Always `refs/git-full-send/` (a client that lost its `sent/*` pin can still
+/// delta against its previous pushes) and `refs/heads/` (few refs on every repo
+/// shape, and on a dedicated sync repo they may be all there is), plus one
+/// derived **anchor** per configured remote: the remote's default branch, the
+/// ref most likely to be both fresh and known to the client. The cold-sync pack
+/// is governed by the freshness of the best advertised ref — one current anchor
+/// measured 196 B of pack where hiding without it measured 14 MB.
+///
+/// A remote that yields no anchor contributes nothing here; `doctor` reports it
+/// rather than this path guessing harder.
+pub fn advertised_refs(repo: &gix::Repository) -> Vec<String> {
+    let mut advertised = vec![
+        git_full_send_common::REF_NAMESPACE.to_string(),
+        "refs/heads/".to_string(),
+    ];
+    let names: Vec<String> = repo
+        .remote_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    for remote in names {
+        if let Some(anchor) = remote_anchor(repo, &remote)
+            && !advertised.contains(&anchor)
+        {
+            advertised.push(anchor);
+        }
+    }
+    advertised
+}
+
+/// The anchor ref for one remote: the target of its `HEAD` symref (which only
+/// cloned or `git remote set-head` repos have), else whichever conventional
+/// default-branch name exists.
+///
+/// The *repo's* own `HEAD` is deliberately not consulted: on the
+/// workstation-clone shape it is routinely detached (a checkout is what put it
+/// there), while the remote-tracking default branch is exactly the ref a
+/// regularly-fetching clone keeps fresh.
+pub(crate) fn remote_anchor(repo: &gix::Repository, remote: &str) -> Option<String> {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    if let Ok(Some(reference)) = repo.try_find_reference(head.as_str())
+        && let gix::refs::TargetRef::Symbolic(target) = reference.target()
+    {
+        return Some(target.as_bstr().to_string());
+    }
+    ["main", "master"]
+        .iter()
+        .map(|branch| format!("refs/remotes/{remote}/{branch}"))
+        .find(|name| matches!(repo.try_find_reference(name.as_str()), Ok(Some(_))))
+}
+
+/// The full `receive.hideRefs` value list for one connection: hide everything,
+/// then unhide the derived anchor set and any operator-supplied extras.
+///
+/// Derived per connection — a handful of ref reads — so a `git fetch` or
+/// `git remote set-head` between syncs is picked up immediately, with no cache
+/// to invalidate. If the repo cannot be opened the derivation degrades to the
+/// static patterns; the spawned `receive-pack` will surface anything truly
+/// wrong with the repo itself.
+fn hide_refs_values(git_dir: &Path, extra: &[String]) -> Vec<String> {
+    let advertised = match gix::open(git_dir) {
+        Ok(repo) => advertised_refs(&repo),
+        Err(error) => {
+            tracing::debug!(%error, "could not derive advertisement anchors; using static set");
+            vec![
+                git_full_send_common::REF_NAMESPACE.to_string(),
+                "refs/heads/".to_string(),
+            ]
+        }
+    };
+    std::iter::once("refs/".to_string())
+        .chain(
+            advertised
+                .into_iter()
+                .chain(extra.iter().cloned())
+                .map(|pattern| format!("!{pattern}")),
+        )
+        .collect()
 }
 
 /// Bind a localhost TCP listener for `addr` that will serve `repo`.
@@ -311,15 +404,23 @@ pub async fn serve_async(
              this port can push code that this machine will check out and run",
         ),
     }
+    // Say what a connection will be offered (ADR-0020), once — the per-connection
+    // derivation may drift as the repo fetches, but the shape is set here.
+    if config.hide_refs {
+        tracing::info!(
+            patterns = ?hide_refs_values(&git_dir, &config.advertise),
+            "collapsing each connection's ref advertisement to the anchor set \
+             (`--no-hide-refs` to advertise everything)",
+        );
+    }
 
-    let timeout = config.connection_timeout;
-    let auth_timeout = config.auth_timeout;
-    let auth = config.auth.clone();
-    accept_loop(listener, config.max_connections, shutdown, move |sock| {
+    let max_connections = config.max_connections;
+    let config = Arc::new(config);
+    accept_loop(listener, max_connections, shutdown, move |sock| {
         let repo = repo.clone();
         let git_dir = git_dir.clone();
         let hooks_dir = hooks_dir.clone();
-        let auth = auth.clone();
+        let config = config.clone();
         async move {
             // Hand the socket to the blocking handler as a plain blocking std
             // socket (`into_std` leaves it non-blocking, which the byte-pump
@@ -335,15 +436,7 @@ pub async fn serve_async(
                 }
             };
             match tokio::task::spawn_blocking(move || {
-                handle_connection(
-                    sock,
-                    &repo,
-                    &git_dir,
-                    &hooks_dir,
-                    timeout,
-                    &auth,
-                    auth_timeout,
-                )
+                handle_connection(sock, &repo, &git_dir, &hooks_dir, &config)
             })
             .await
             {
@@ -464,15 +557,14 @@ fn handle_connection(
     repo: &Path,
     git_dir: &Path,
     hooks_dir: &Path,
-    timeout: Duration,
-    auth: &Auth,
-    auth_timeout: Duration,
+    config: &ListenConfig,
 ) -> Result<(), ServerError> {
     use std::io::Read;
 
+    let timeout = config.connection_timeout;
     let started = Instant::now();
-    if let Auth::Token(expected) = auth
-        && !authenticate(&sock, expected, auth_timeout, git_dir, started)
+    if let Auth::Token(expected) = &*config.auth
+        && !authenticate(&sock, expected, config.auth_timeout, git_dir, started)
     {
         return Ok(());
     }
@@ -484,6 +576,15 @@ fn handle_connection(
     let accepted_refs = tempfile::NamedTempFile::new().ok();
 
     let mut command = Command::new("git");
+    // Collapse the advertisement to the anchor set (ADR-0020). The `-c` values
+    // append after the repo's own config, and `receive.hideRefs` is
+    // last-match-wins, so these unhide patterns override an operator's own
+    // hiding where they overlap.
+    if config.hide_refs {
+        for value in hide_refs_values(git_dir, &config.advertise) {
+            command.arg("-c").arg(format!("receive.hideRefs={value}"));
+        }
+    }
     command
         .arg("-c")
         .arg("receive.autogc=false")
@@ -1881,6 +1982,96 @@ mod tests {
         // Accepted refs are appended to the file named by the env var so the
         // connection handler can report which refs a push updated (issue #42).
         assert!(hook.contains(ACCEPTED_REFS_ENV));
+    }
+
+    /// The anchor is the remote's *actual* default branch (the `HEAD` symref
+    /// target), not a conventional-name guess — hence a branch called `trunk`.
+    #[test]
+    fn the_remote_head_symref_target_is_the_anchor() {
+        let dir = test_support::init_temp_repo();
+        let path = dir.path();
+        test_support::write_file(path, "f", "x");
+        test_support::commit_all(path, "seed");
+        test_support::git(
+            path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        test_support::git(path, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        test_support::git(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+
+        let repo = gix::discover(path).expect("open repo");
+        let advertised = advertised_refs(&repo);
+        assert!(advertised.contains(&git_full_send_common::REF_NAMESPACE.to_string()));
+        assert!(advertised.contains(&"refs/heads/".to_string()));
+        assert!(
+            advertised.contains(&"refs/remotes/origin/trunk".to_string()),
+            "the symref target anchors the remote: {advertised:?}",
+        );
+    }
+
+    /// Only cloned (or `git remote set-head`) repos have the `HEAD` symref, so
+    /// a conventional default-branch name that exists is the fallback — and a
+    /// remote where nothing resolves contributes no anchor at all.
+    #[test]
+    fn a_remote_without_a_head_symref_falls_back_to_a_conventional_branch() {
+        let dir = test_support::init_temp_repo();
+        let path = dir.path();
+        test_support::write_file(path, "f", "x");
+        test_support::commit_all(path, "seed");
+        for remote in ["fetched", "bare-config"] {
+            test_support::git(
+                path,
+                &["remote", "add", remote, "https://example.invalid/repo.git"],
+            );
+        }
+        test_support::git(path, &["update-ref", "refs/remotes/fetched/master", "HEAD"]);
+
+        let repo = gix::discover(path).expect("open repo");
+        let advertised = advertised_refs(&repo);
+        assert!(
+            advertised.contains(&"refs/remotes/fetched/master".to_string()),
+            "an existing conventional branch anchors the remote: {advertised:?}",
+        );
+        assert!(
+            !advertised.iter().any(|a| a.contains("bare-config")),
+            "a remote with no refs contributes nothing: {advertised:?}",
+        );
+    }
+
+    /// The composed `receive.hideRefs` values hide everything first, then
+    /// unhide the anchor set and any operator-supplied extras.
+    #[test]
+    fn hide_refs_values_hide_everything_then_unhide_the_anchors() {
+        let dir = test_support::init_temp_repo();
+        let path = dir.path();
+        test_support::write_file(path, "f", "x");
+        test_support::commit_all(path, "seed");
+        let git_dir = gix::discover(path)
+            .expect("open repo")
+            .git_dir()
+            .to_path_buf();
+
+        let values = hide_refs_values(&git_dir, &["refs/pull/".to_string()]);
+        assert_eq!(values[0], "refs/");
+        assert!(
+            values[1..].iter().all(|v| v.starts_with('!')),
+            "everything after the hide is an unhide: {values:?}",
+        );
+        assert!(values.contains(&"!refs/heads/".to_string()));
+        assert!(values.contains(&format!("!{}", git_full_send_common::REF_NAMESPACE)));
+        assert!(values.contains(&"!refs/pull/".to_string()));
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
